@@ -1,0 +1,166 @@
+================================================================================
+期刊栏目更新失败报告
+生成时间: 2026-03-24 15:25:27
+================================================================================
+
+总计: 37 个期刊已处理但未获取到期刊代码
+
+按运行时间分类:
+--------------------------------------------------------------------------------
+today_auto_run (2026-03-24 15:00+): 14 个
+concurrent_run (2026-03-24 14:00-15:00): 8 个
+old_single_process (2026-03-24 12:00-14:00): 14 个
+very_old (before 2026-03-24 12:00): 1 个
+
+================================================================================
+失败期刊列表:
+================================================================================
+
+1. ID:   716 | 更新时间: 2026-03-24 15:22:36
+   名称: 艺术探索
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbR5oiazvb45UQ0EfAnkttoYy0tA1g5fQ9e...
+
+2. ID:   720 | 更新时间: 2026-03-24 15:22:14
+   名称: 编辑学刊
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbS_FeipmnJ66Yh0uukJqK9BuMhd6WENP39...
+
+3. ID:   718 | 更新时间: 2026-03-24 15:20:17
+   名称: 戏剧艺术
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbSsX5DarwSDutVxu7SNChwCoP_bBkTpFWK...
+
+4. ID:   690 | 更新时间: 2026-03-24 15:18:05
+   名称: 历史教学问题
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbTZoSZrf0GUIRvbFCOxcVKvdqvabWxBrNM...
+
+5. ID:   701 | 更新时间: 2026-03-24 15:17:24
+   名称: 财经法学
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbTDctkgQyGAeOBhInLFZ-HgI-OhU_NVbEb...
+
+6. ID:   667 | 更新时间: 2026-03-24 15:15:54
+   名称: 四川轻化工大学学报(社会科学版)
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbSQsMSBQPQFOxQd7Zn_DITM2RGrH0Ub7lH...
+
+7. ID:   671 | 更新时间: 2026-03-24 15:13:35
+   名称: 国际观察
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbT2fvAx5f6BQR66I7jM8xvhKAvK5fVUIZb...
+
+8. ID:   665 | 更新时间: 2026-03-24 15:12:48
+   名称: 天津行政学院学报
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbS9yE76v7idZbOxFE20h7UTsw7WbPMjxu1...
+
+9. ID:   668 | 更新时间: 2026-03-24 15:11:23
+   名称: 宗教学研究
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbS7jAakCU63p7ch8ZCHjc8NICxv8Y8NLbe...
+
+10. ID:   683 | 更新时间: 2026-03-24 15:10:39
+   名称: 中国哲学史
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbTevhLh3QxxGveF6tWKdsnt5MPFTtUqFvk...
+
+11. ID:   685 | 更新时间: 2026-03-24 15:08:57
+   名称: 新美术
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbRNzlwRZbB32uSgiT8Zp5cD9_cmyx6zWPr...
+
+12. ID:   676 | 更新时间: 2026-03-24 15:08:20
+   名称: 文艺评论
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbSGGzhg4Kv904uBCzutGbqj0qaU06JFfSy...
+
+13. ID:   648 | 更新时间: 2026-03-24 15:01:16
+   名称: 南京财经大学学报
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbSI4_U7tGDxzls1n9K4JsJpHCuOI71eiKU...
+
+14. ID:   645 | 更新时间: 2026-03-24 15:00:01
+   名称: 中国国家博物馆馆刊
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbTS9_wLQPe_dyeazmmu7jNDpRBzVMt-fra...
+
+15. ID:   644 | 更新时间: 2026-03-24 14:59:02
+   名称: 安徽史学
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbTZoSZrf0GUIRvbFCOxcVKvdqvabWxBrNM...
+
+16. ID:   626 | 更新时间: 2026-03-24 14:55:13
+   名称: 扬州大学学报(人文社会科学版)
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbQVov2e4DGyBdk_LE8DWK3gHL4jPwxSn1M...
+
+17. ID:   639 | 更新时间: 2026-03-24 14:54:37
+   名称: 党建
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbTVRM96n1cnNI8UCw_uzkvZ71LHZvcLFIe...
+
+18. ID:   669 | 更新时间: 2026-03-24 14:50:49
+   名称: 青海民族研究
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbQlCb1NWYby5Zf7gEfdIHEDkWZRvOKRkLC...
+
+19. ID:   642 | 更新时间: 2026-03-24 14:48:41
+   名称: 烟台大学学报(哲学社会科学版)
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbTIDSAqMMNMUoIsJY46KdHIFXDjesoOB_m...
+
+20. ID:   620 | 更新时间: 2026-03-24 14:46:24
+   名称: 传媒观察
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbSIb47Jc2F5eA7XGO6lVox6StcJFVPVS5o...
+
+21. ID:   564 | 更新时间: 2026-03-24 14:45:45
+   名称: 北京交通大学学报(社会科学版)
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbSOz6-m3tCn2B3vS3NBokwntSBm3KQTARB...
+
+22. ID:   598 | 更新时间: 2026-03-24 14:41:05
+   名称: 中国编辑
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbRq5ujAfuNhMO1SyJO0QsaQVjkLRq4-Cui...
+
+23. ID:   297 | 更新时间: 2026-03-24 13:05:46
+   名称: 东方法学
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbRoBaGQPnGg19VWCsmbLOs79bZ1CiKeB6h...
+
+24. ID:   418 | 更新时间: 2026-03-24 13:05:46
+   名称: 人口与发展
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbSOz6-m3tCn2B3vS3NBokwntSBm3KQTARB...
+
+25. ID:   420 | 更新时间: 2026-03-24 13:05:46
+   名称: 文学遗产
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbTzj-ul16sKosLEI6q7AsmwZLGAb1glHHn...
+
+26. ID:   376 | 更新时间: 2026-03-24 13:05:10
+   名称: 国际贸易
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbRnuHd9AKODIDPT1J-lyI4vwMYJrERqM1-...
+
+27. ID:   413 | 更新时间: 2026-03-24 13:03:35
+   名称: 中国人民公安大学学报(社会科学版)
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbSGbVWAJBZvp8QlZ9sf8lOJuma5JfB4m9P...
+
+28. ID:   411 | 更新时间: 2026-03-24 13:03:35
+   名称: 中央民族大学学报(哲学社会科学版)
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbQFarNYAqXAk17Vnu-gJiN7K18zpfQhDlC...
+
+29. ID:   412 | 更新时间: 2026-03-24 13:03:35
+   名称: 出版广角
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbQ62WZC03p6JHiI9VeMG2occBUPxguOrI4...
+
+30. ID:   321 | 更新时间: 2026-03-24 13:03:19
+   名称: 社会主义研究
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbR45k0qGK3Wv3dZeHcRc33jOVEj3WTXUWT...
+
+31. ID:   406 | 更新时间: 2026-03-24 13:01:25
+   名称: 图书馆理论与实践
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbS9yE76v7idZbOxFE20h7UTsw7WbPMjxu1...
+
+32. ID:   407 | 更新时间: 2026-03-24 13:01:25
+   名称: 中国音乐
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbTBlEigAHCIXUpjJgeLcKds2FDbyd6Mbeb...
+
+33. ID:   289 | 更新时间: 2026-03-24 13:01:24
+   名称: 理论探讨
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbT-Dy-nQjLdkPGSm-eF37n8EPIsa37cXc0...
+
+34. ID:    28 | 更新时间: 2026-03-24 12:33:12
+   名称: 世界经济
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbRJG4SSulEthcheG2UbZOFF1EuOcsFbrYA...
+
+35. ID:   160 | 更新时间: 2026-03-24 12:30:40
+   名称: 数学教育学报
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbRnuHd9AKODIDPT1J-lyI4vwMYJrERqM1-...
+
+36. ID:    12 | 更新时间: 2026-03-24 12:30:40
+   名称: 中国人口·资源与环境
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbSbzySrO9htG8JKNVMKulDF0vYLJIcjod0...
+
+37. ID:  6786 | 更新时间: 2026-03-24 09:24:49
+   名称: 21世纪中学生作文(初中教师适用)
+   URL: https://navi.cnki.net/knavi/detail?p=mK1ZVKSnEbQkJEUAL0o_TcbIq_KwTDI3v3DuPEZXVGY...
+

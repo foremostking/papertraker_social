@@ -1,0 +1,136 @@
+version: '3.8'
+
+services:
+  # Redis 缓存/消息队列
+  redis:
+    image: redis:7-alpine
+    container_name: papertracker_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # PostgreSQL 数据库 (使用bitnami镜像)
+  postgres:
+    image: bitnami/postgresql:latest
+    container_name: papertracker_postgres
+    environment:
+      POSTGRESQL_USERNAME: papertracker
+      POSTGRESQL_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRESQL_DATABASE: papertracker_social
+    # 使用不同端口避免 Windows 端口冲突
+    ports:
+      - "15432:5432"
+    volumes:
+      - postgres_data:/bitnami/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U papertracker"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # FastAPI 后端
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: papertracker_api
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://papertracker:${POSTGRES_PASSWORD:-changeme}@postgres:5432/papertracker_social
+      - CELERY_BROKER_URL=redis://papertracker_redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://papertracker_redis:6379/1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    restart: unless-stopped
+
+  # Celery Worker
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: papertracker_celery_worker
+    environment:
+      - DATABASE_URL=postgresql://papertracker:${POSTGRES_PASSWORD:-changeme}@postgres:5432/papertracker_social
+      - CELERY_BROKER_URL=redis://papertracker_redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://papertracker_redis:6379/1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=2
+    restart: unless-stopped
+
+  # Celery Beat (定时任务)
+  celery-beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: papertracker_celery_beat
+    environment:
+      - CELERY_BROKER_URL=redis://papertracker_redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    command: celery -A app.tasks.celery_app beat --loglevel=info
+    restart: unless-stopped
+
+  # Flower (Celery 监控)
+  flower:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: papertracker_flower
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://papertracker_redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://papertracker_redis:6379/1
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    command: celery -A app.tasks.celery_app flower --port=5555 --broker=redis://papertracker_redis:6379/0
+    restart: unless-stopped
+
+  # 前端
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    container_name: papertracker_web
+    ports:
+      - "5173:5173"
+    depends_on:
+      - api
+    volumes:
+      - ./web:/app
+      - /app/node_modules  # 防止 Windows node_modules 覆盖 Linux 原生模块
+    command: npm run dev -- --host 0.0.0.0
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
