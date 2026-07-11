@@ -268,6 +268,9 @@ class ScholarAgent:
                 "[dim]已将本篇论文记录写入研究者画像（跨论文长期记忆）[/dim]"
             )
 
+            # Phase 8 增强：显示质量报告 + 导出建议 + 实证工具提示
+            self._phase8_post_completion()
+
         except Exception as e:
             logger.error(f"Scholar Agent error: {e}", exc_info=True)
             self.console.print(f"[red]错误: {e}[/red]")
@@ -1130,6 +1133,13 @@ class ScholarAgent:
         # Phase 7b: 引用管理（提取→验证→格式化→附加参考文献+AI声明）
         await self._phase7b_citation_management()
 
+        # Phase 7c: 实证表格模板生成（仅实证论文）
+        await self._phase7c_generate_table_templates()
+
+        # 质量报告：写完后立即反馈达标情况
+        report = self.generate_quality_report()
+        self._display_quality_report(report)
+
     async def _phase6_5_data_collection(self) -> bool:
         """Phase 6.5: 数据采集协作（仅实证论文）.
 
@@ -1644,7 +1654,19 @@ class ScholarAgent:
         if not sections:
             return
 
-        merged = "# 论文草稿\n\n"
+        # 从 outline.json 获取实际论文标题
+        paper_title = "论文草稿"
+        outline_path = self.project_dir / "outline.json"
+        if outline_path.exists():
+            try:
+                outline_json = json.loads(outline_path.read_text(encoding="utf-8"))
+                title = outline_json.get("title", "")
+                if title:
+                    paper_title = title
+            except Exception:
+                pass
+
+        merged = f"# {paper_title}\n\n"
         for section_name in sections:
             content = self.file_manager.load_section(self.project_dir, section_name)
             if content:
@@ -1796,6 +1818,652 @@ class ScholarAgent:
                 pass
 
         return None
+
+    # ===== 实证表格模板生成 =====
+
+    async def _phase7c_generate_table_templates(self) -> None:
+        """Phase 7c: 为实证论文生成统计表格空模板.
+
+        科研场景：实证论文需要描述性统计表、回归结果表、相关系数矩阵。
+        这些表格的框架（变量名、行列结构）应该根据 SPEC 自动生成，
+        研究者只需填入真实数字——而不是从零开始排版。
+        """
+        # 读取 SPEC 判断是否实证论文
+        spec_path = self.project_dir / "SPEC.md"
+        spec_text = ""
+        if spec_path.exists():
+            spec_text = spec_path.read_text(encoding="utf-8")
+        else:
+            spec_json_path = self.project_dir / "SPEC.json"
+            if spec_json_path.exists():
+                try:
+                    spec_data = json.loads(spec_json_path.read_text(encoding="utf-8"))
+                    spec_text = json.dumps(spec_data, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+
+        if not spec_text:
+            return
+
+        # 判断是否实证论文
+        empirical_keywords = ["实证", "empirical", "回归", "面板数据", "计量模型", "假设检验"]
+        is_empirical = any(kw in spec_text for kw in empirical_keywords)
+        if not is_empirical:
+            return
+
+        self.console.print("\n[bold cyan]━━━ Phase 7c: 实证表格模板生成 ━━━[/bold cyan]")
+        self.console.print("[dim]📊 正在从 SPEC 提取变量定义...[/dim]")
+
+        # 从 SPEC 提取变量和模型信息
+        variables, model_specs = self._extract_variables_from_spec(spec_text)
+
+        if not variables:
+            self.console.print("[yellow]未能从 SPEC 提取变量，跳过表格生成[/yellow]")
+            self.console.print("[dim]可手动运行: scholarpilot tables <项目>[/dim]")
+            return
+
+        # 生成表格
+        from scholarpilot.tools.table_generator import (
+            generate_descriptive_stats_table,
+            generate_regression_table,
+            generate_correlation_table,
+        )
+
+        self.console.print(f"  [green]提取到 {len(variables)} 个变量[/green]")
+
+        tables_parts: list[str] = []
+        tables_parts.append("# 实证表格模板\n")
+        tables_parts.append("> 以下表格由 ScholarPilot 根据 SPEC 自动生成，数据单元格留空供研究者填写。\n")
+
+        # 1. 描述性统计表
+        self.console.print("[dim]  生成描述性统计表...[/dim]")
+        desc_table = generate_descriptive_stats_table(variables)
+        tables_parts.append("## 表1 描述性统计\n")
+        tables_parts.append(desc_table)
+        tables_parts.append("")
+
+        # 2. 回归结果表
+        if model_specs:
+            self.console.print(f"[dim]  生成回归结果表（{len(model_specs)}个模型）...[/dim]")
+            reg_table = generate_regression_table(model_specs)
+            tables_parts.append("## 表2 回归结果\n")
+            tables_parts.append(reg_table)
+            tables_parts.append("")
+        else:
+            # 默认生成一个基准回归模型
+            self.console.print("[dim]  生成回归结果表（默认模型）...[/dim]")
+            all_var_names = [v["name"] for v in variables]
+            default_model = {
+                "name": "基准回归",
+                "variables": all_var_names[:5],  # 取前5个变量
+                "has_fixed_effects": True,
+                "has_cluster_se": True,
+            }
+            reg_table = generate_regression_table([default_model])
+            tables_parts.append("## 表2 回归结果\n")
+            tables_parts.append(reg_table)
+            tables_parts.append("")
+
+        # 3. 相关系数矩阵
+        var_names = [v["name"] for v in variables if v.get("type") != "虚拟变量"]
+        if len(var_names) >= 2:
+            self.console.print("[dim]  生成相关系数矩阵...[/dim]")
+            corr_table = generate_correlation_table(var_names[:8])  # 最多8个变量
+            tables_parts.append("## 表3 相关系数矩阵\n")
+            tables_parts.append(corr_table)
+            tables_parts.append("")
+
+        # 保存
+        tables_path = self.project_dir / "draft" / "tables_template.md"
+        tables_path.write_text("\n".join(tables_parts), encoding="utf-8")
+        self.console.print(f"  [green]表格模板已保存: {tables_path}[/green]")
+        self.console.print("[dim]请研究者填入真实数据后替换草稿中的占位符[/dim]")
+
+        self.memory.add("table_templates", {
+            "variables": len(variables),
+            "models": len(model_specs) if model_specs else 1,
+        })
+
+    def _extract_variables_from_spec(
+        self, spec_text: str
+    ) -> tuple[list[dict], list[dict]]:
+        """从 SPEC 文本中提取变量定义和模型设定.
+
+        解析策略：
+        1. 查找"变量设计"/"变量定义"段落
+        2. 用正则匹配变量名和描述
+        3. 查找"模型设定"段落提取模型信息
+
+        Args:
+            spec_text: SPEC 文本（Markdown 或 JSON 字符串）。
+
+        Returns:
+            (variables, model_specs) 元组。
+            variables: [{"name": "debt_ratio", "description": "地方政府债务率", "type": "continuous"}, ...]
+            model_specs: [{"name": "基准回归", "variables": [...], "has_fixed_effects": True}, ...]
+        """
+        variables: list[dict] = []
+        model_specs: list[dict] = []
+
+        # 提取变量定义段落
+        # 匹配 "## 变量设计\n..." 或 "变量设计：..." 后面的内容
+        var_section_patterns = [
+            r"变量设计[：:\s\n]+(.*?)(?=模型设定|稳健性|预期结果|研究方法|$)",
+            r"变量定义[：:\s\n]+(.*?)(?=模型设定|稳健性|预期结果|研究方法|$)",
+            r"核心变量[：:\s\n]+(.*?)(?=模型设定|稳健性|预期结果|研究方法|$)",
+            r"变量设计(.*?)(?=模型设定|稳健性|预期结果|研究方法|$)",
+            r"变量定义(.*?)(?=模型设定|稳健性|预期结果|研究方法|$)",
+        ]
+
+        var_section = ""
+        for pattern in var_section_patterns:
+            match = re.search(pattern, spec_text, re.DOTALL | re.IGNORECASE)
+            if match:
+                var_section = match.group(1)
+                break
+
+        if var_section:
+            # 提取变量：匹配 "变量名：描述" 或 "- 变量名（描述）" 等格式
+            # 中文格式：被解释变量：GDP增长率
+            # 英文格式：debt_ratio: Debt to GDP ratio
+            var_patterns = [
+                # "- 被解释变量：debt_ratio（地方政府债务率）"
+                r"[-•]\s*(?:被解释变量|核心解释变量|控制变量)[：:]\s*(\w+)\s*[（(]([^）)]+)",
+                # "- debt_ratio：地方政府债务率"
+                r"[-•]\s*(\w+)[：:]\s*([^\n]{2,30})",
+                # "debt_ratio (地方政府债务率)"
+                r"(\w+)\s*[（(]([^）)]{2,30})",
+            ]
+
+            seen_names: set[str] = set()
+            for pattern in var_patterns:
+                for match in re.finditer(pattern, var_section):
+                    name = match.group(1).strip()
+                    desc = match.group(2).strip()
+                    if name and len(name) <= 30 and name not in seen_names:
+                        # 判断变量类型
+                        var_type = "continuous"
+                        if any(kw in desc for kw in ["虚拟", "dummy", "是否", "0-1", "二分"]):
+                            var_type = "虚拟变量"
+                        variables.append({
+                            "name": name,
+                            "description": desc,
+                            "type": var_type,
+                        })
+                        seen_names.add(name)
+
+        # 如果正则没提取到变量，尝试从 SPEC JSON 中提取
+        if not variables:
+            try:
+                spec_json_path = self.project_dir / "SPEC.json"
+                if spec_json_path.exists():
+                    spec_data = json.loads(spec_json_path.read_text(encoding="utf-8"))
+                    # 尝试从 JSON 中提取变量
+                    for key in ["variables", "key_variables", "variable_design"]:
+                        if key in spec_data and isinstance(spec_data[key], list):
+                            for v in spec_data[key]:
+                                if isinstance(v, dict) and v.get("name"):
+                                    variables.append({
+                                        "name": v["name"],
+                                        "description": v.get("description", ""),
+                                        "type": v.get("type", "continuous"),
+                                    })
+                                elif isinstance(v, str):
+                                    variables.append({
+                                        "name": v,
+                                        "description": "",
+                                        "type": "continuous",
+                                    })
+            except Exception:
+                pass
+
+        # 提取模型设定
+        model_section_patterns = [
+            r"模型设定[：:\s\n]+(.*?)(?=预期结果|数据需求|$)",
+            r"计量模型[：:\s\n]+(.*?)(?=预期结果|数据需求|$)",
+            r"模型设定(.*?)(?=预期结果|数据需求|$)",
+            r"计量模型(.*?)(?=预期结果|数据需求|$)",
+        ]
+
+        model_section = ""
+        for pattern in model_section_patterns:
+            match = re.search(pattern, spec_text, re.DOTALL | re.IGNORECASE)
+            if match:
+                model_section = match.group(1)
+                break
+
+        if model_section:
+            # 检测是否有固定效应、聚类标准误
+            has_fe = any(kw in model_section for kw in ["固定效应", "fixed effect", "个体效应", "时间效应"])
+            has_cluster = any(kw in model_section for kw in ["聚类", "cluster", "稳健标准误"])
+
+            # 生成模型规格
+            var_names = [v["name"] for v in variables]
+            model_specs = [
+                {
+                    "name": "基准回归",
+                    "variables": var_names[:5] if var_names else [],
+                    "has_fixed_effects": has_fe,
+                    "has_cluster_se": has_cluster,
+                }
+            ]
+
+            # 如果提到稳健性检验，添加一个模型
+            if any(kw in model_section for kw in ["稳健性", "robustness"]):
+                model_specs.append({
+                    "name": "稳健性检验",
+                    "variables": var_names[:5] if var_names else [],
+                    "has_fixed_effects": has_fe,
+                    "has_cluster_se": has_cluster,
+                })
+
+        return variables, model_specs
+
+    async def generate_tables(self) -> dict[str, Any]:
+        """独立生成实证表格模板（用户编辑 SPEC 后可重新生成）.
+
+        Returns:
+            包含生成结果的字典。
+        """
+        spec_path = self.project_dir / "SPEC.md"
+        spec_text = ""
+        if spec_path.exists():
+            spec_text = spec_path.read_text(encoding="utf-8")
+        else:
+            spec_json_path = self.project_dir / "SPEC.json"
+            if spec_json_path.exists():
+                try:
+                    spec_data = json.loads(spec_json_path.read_text(encoding="utf-8"))
+                    spec_text = json.dumps(spec_data, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+
+        if not spec_text:
+            self.console.print("[red]SPEC 文件不存在，请先运行写作流程[/red]")
+            return {}
+
+        result = await self._phase7c_generate_table_templates()
+        # _phase7c 内部已处理输出，这里返回状态
+        tables_path = self.project_dir / "draft" / "tables_template.md"
+        return {"generated": tables_path.exists(), "path": str(tables_path)}
+
+    # ===== 独立定稿（用户手动编辑后重新处理） =====
+
+    async def finalize(
+        self,
+        abstract: bool = True,
+        citations: bool = True,
+    ) -> dict[str, Any]:
+        """独立定稿流程：在用户手动编辑草稿后重新生成摘要和参考文献.
+
+        科研场景：研究者用 ScholarPilot 生成初稿后，必然会手动改写以降低 AI 率。
+        改写后正文内容变了，原来的摘要和参考文献不再准确。此时不需要重跑整个
+        chat 工作流，只需用 finalize 重新生成摘要 + 重新提取验证引用。
+
+        Args:
+            abstract: 是否重新生成摘要。
+            citations: 是否重新提取和管理引用。
+
+        Returns:
+            质量报告字典。
+        """
+        draft_path = self.project_dir / "draft" / "full_draft.md"
+        if not draft_path.exists():
+            self.console.print("[red]草稿文件不存在，请先运行写作流程[/red]")
+            return {}
+
+        self.console.print(
+            Panel(
+                f"项目: {self.project_dir.name}\n"
+                f"摘要: {'生成' if abstract else '跳过'}\n"
+                f"引用: {'管理' if citations else '跳过'}",
+                title="📝 定稿处理",
+            )
+        )
+
+        # 如果两者都跳过，只做质量检查
+        if not abstract and not citations:
+            self.console.print("[yellow]未选择任何操作，仅显示质量报告[/yellow]")
+        else:
+            if abstract:
+                await self._phase7a_generate_abstract()
+            if citations:
+                await self._phase7b_citation_management()
+
+        # 质量报告
+        report = self.generate_quality_report()
+        self._display_quality_report(report)
+        return report
+
+    def generate_quality_report(self) -> dict[str, Any]:
+        """生成论文质量报告：字数、引用数、结构完整性等.
+
+        帮助研究者快速判断初稿是否达到目标期刊的投稿门槛。
+        不需要 API 调用，纯本地分析。
+
+        Returns:
+            质量报告字典，包含:
+            - word_count: 正文中文字数
+            - reference_count: 参考文献数量
+            - verified_count: 已验证引用数
+            - unverified_count: 未验证引用数
+            - chapter_count: 章节数
+            - has_abstract: 是否有摘要
+            - has_keywords: 是否有关键词
+            - has_jel: 是否有JEL分类号
+            - structure_complete: 结构是否完整
+            - missing_parts: 缺失部分列表
+        """
+        import re
+        report: dict[str, Any] = {}
+
+        draft_path = self.project_dir / "draft" / "full_draft.md"
+        full_text = draft_path.read_text(encoding="utf-8") if draft_path.exists() else ""
+
+        # 1. 字数统计（中文字符 + 英文单词）
+        # 移除 markdown 标记和参考文献部分
+        body_text = full_text
+        # 去掉参考文献和AI声明部分
+        for separator in ["\n---\n## 参考文献", "\n---\n\n## 参考文献", "\n## 参考文献"]:
+            if separator in body_text:
+                body_text = body_text.split(separator)[0]
+        # 去掉 markdown 标记
+        clean_text = re.sub(r"#+\s*", "", body_text)
+        clean_text = re.sub(r"\*+|`+|>+|\|", "", clean_text)
+        clean_text = re.sub(r"\n+", "\n", clean_text)
+        # 中文字符数
+        chinese_chars = len(re.findall(r"[\u4e00-\u9fff]", clean_text))
+        # 英文单词数
+        english_words = len(re.findall(r"[a-zA-Z]+", clean_text))
+        # 综合字数：中文字 + 英文词（英文每词约等于2个中文字）
+        report["word_count"] = chinese_chars + english_words
+        report["chinese_chars"] = chinese_chars
+        report["english_words"] = english_words
+
+        # 2. 章节统计
+        sections = self.file_manager.list_sections(self.project_dir)
+        report["chapter_count"] = len(sections)
+        report["chapters"] = sections
+
+        # 3. 参考文献统计
+        ref_path = self.project_dir / "draft" / "references.md"
+        if ref_path.exists():
+            ref_text = ref_path.read_text(encoding="utf-8")
+            # 按行计算参考文献条目（排除标题和空行）
+            ref_lines = [
+                line.strip() for line in ref_text.split("\n")
+                if line.strip()
+                and not line.strip().startswith("#")
+                and not line.strip().startswith("---")
+                and not line.strip().startswith("【")
+                and not line.strip().startswith("AI")
+                and not line.strip().startswith("本文")
+                and len(line.strip()) > 10
+            ]
+            report["reference_count"] = len(ref_lines)
+        else:
+            report["reference_count"] = 0
+
+        # 从记忆中获取验证信息
+        citation_mem = self.memory.get("citation_management", {})
+        report["verified_count"] = citation_mem.get("verified", 0)
+        report["unverified_count"] = citation_mem.get("unverified", 0)
+
+        # 4. 摘要和关键词检查
+        report["has_abstract"] = "摘要" in full_text or "Abstract" in full_text
+        report["has_keywords"] = "关键词" in full_text or "Keywords" in full_text
+        report["has_jel"] = "JEL" in full_text or "中图分类号" in full_text
+
+        # 4b. 实证表格模板检查
+        tables_path = self.project_dir / "draft" / "tables_template.md"
+        report["has_tables_template"] = tables_path.exists()
+        if report["has_tables_template"]:
+            tables_text = tables_path.read_text(encoding="utf-8")
+            report["table_count"] = tables_text.count("## 表")
+        else:
+            report["table_count"] = 0
+
+        # 4c. 是否实证论文
+        report["is_empirical"] = any(
+            kw in full_text for kw in ["实证", "回归", "面板数据"]
+        )
+
+        # 5. 结构完整性检查
+        # 典型论文结构：引言/绪论 + 文献综述 + 理论分析/研究设计 + 实证分析 + 结论
+        structure_keywords = {
+            "引言/绪论": ["引言", "绪论", "导论", "Introduction"],
+            "文献综述": ["文献综述", "文献回顾", "Literature Review", "文献述评"],
+            "理论分析/研究设计": ["理论分析", "研究设计", "理论框架", "模型设定", "Research Design"],
+            "实证分析": ["实证分析", "实证研究", "实证结果", "Empirical", "回归结果"],
+            "结论": ["结论", "结语", "Conclusion", "总结"],
+        }
+        found_structure: dict[str, bool] = {}
+        for part, keywords in structure_keywords.items():
+            found_structure[part] = any(kw in full_text for kw in keywords)
+        report["structure"] = found_structure
+        report["structure_complete"] = all(found_structure.values())
+        report["missing_parts"] = [
+            part for part, found in found_structure.items() if not found
+        ]
+
+        # 6. 期刊达标评估
+        report["assessment"] = self._assess_journal_readiness(report)
+
+        return report
+
+    def _assess_journal_readiness(self, report: dict[str, Any]) -> dict[str, str]:
+        """评估论文是否达到常见期刊投稿标准.
+
+        Args:
+            report: 质量报告。
+
+        Returns:
+            各项评估结果字典。
+        """
+        assessment: dict[str, str] = {}
+
+        # 字数评估
+        wc = report.get("word_count", 0)
+        if wc >= 15000:
+            assessment["word_count"] = f"充足（{wc}字，达到CSSCI核心期刊标准）"
+        elif wc >= 10000:
+            assessment["word_count"] = f"基本达标（{wc}字，建议补充至1.5万字）"
+        elif wc >= 5000:
+            assessment["word_count"] = f"偏少（{wc}字，核心期刊通常需要1.5-2万字）"
+        else:
+            assessment["word_count"] = f"不足（{wc}字，需要大幅扩充）"
+
+        # 参考文献评估
+        ref_count = report.get("reference_count", 0)
+        if ref_count >= 25:
+            assessment["references"] = f"充足（{ref_count}篇，CSSCI标准25-45篇）"
+        elif ref_count >= 15:
+            assessment["references"] = f"偏少（{ref_count}篇，建议补充至25篇以上）"
+        elif ref_count > 0:
+            assessment["references"] = f"不足（{ref_count}篇，核心期刊通常需要25-45篇）"
+        else:
+            assessment["references"] = "缺失（无参考文献，请运行引用管理）"
+
+        # 验证率
+        total_cites = report.get("verified_count", 0) + report.get("unverified_count", 0)
+        if total_cites > 0:
+            verify_rate = report.get("verified_count", 0) / total_cites * 100
+            if verify_rate >= 80:
+                assessment["verification"] = f"良好（{verify_rate:.0f}%已验证）"
+            elif verify_rate >= 50:
+                assessment["verification"] = f"一般（{verify_rate:.0f}%已验证，需核查未验证引用）"
+            else:
+                assessment["verification"] = f"较差（{verify_rate:.0f}%已验证，大量引用需核查）"
+        else:
+            assessment["verification"] = "未验证（请运行引用管理）"
+
+        # 结构完整性
+        if report.get("structure_complete"):
+            assessment["structure"] = "完整（包含全部5个标准章节）"
+        else:
+            missing = report.get("missing_parts", [])
+            assessment["structure"] = f"不完整（缺失: {'、'.join(missing)}）"
+
+        return assessment
+
+    def _display_quality_report(self, report: dict[str, Any]) -> None:
+        """以表格形式展示质量报告."""
+        from rich.table import Table
+
+        self.console.print("\n[bold cyan]━━━ 质量报告 ━━━[/bold cyan]\n")
+
+        # 基本指标表
+        table = Table(title="📊 论文质量指标")
+        table.add_column("指标", style="cyan", width=15)
+        table.add_column("数值", style="white", width=15)
+        table.add_column("评估", style="yellow")
+
+        assessment = report.get("assessment", {})
+
+        table.add_row(
+            "总字数",
+            f"{report.get('word_count', 0)}",
+            assessment.get("word_count", ""),
+        )
+        table.add_row(
+            "参考文献",
+            f"{report.get('reference_count', 0)} 篇",
+            assessment.get("references", ""),
+        )
+        table.add_row(
+            "引用验证",
+            f"{report.get('verified_count', 0)}/{report.get('verified_count', 0) + report.get('unverified_count', 0)}",
+            assessment.get("verification", ""),
+        )
+        table.add_row(
+            "章节数",
+            f"{report.get('chapter_count', 0)}",
+            assessment.get("structure", ""),
+        )
+
+        self.console.print(table)
+
+        # 结构详情
+        structure = report.get("structure", {})
+        if structure:
+            self.console.print("\n[bold]结构检查:[/bold]")
+            for part, found in structure.items():
+                icon = "[green]✓[/green]" if found else "[red]✗[/red]"
+                self.console.print(f"  {icon} {part}")
+
+        # 摘要/关键词/分类号
+        self.console.print("\n[bold]格式要素:[/bold]")
+        items = [
+            ("摘要", report.get("has_abstract", False)),
+            ("关键词", report.get("has_keywords", False)),
+            ("JEL/中图分类号", report.get("has_jel", False)),
+        ]
+        for name, found in items:
+            icon = "[green]✓[/green]" if found else "[red]✗[/red]"
+            self.console.print(f"  {icon} {name}")
+
+        # 实证表格模板
+        if report.get("has_tables_template"):
+            table_count = report.get("table_count", 0)
+            self.console.print(f"  [green]✓[/green] 实证表格模板（{table_count}张）")
+        elif report.get("is_empirical", False):
+            self.console.print("  [yellow]⚠ 实证表格模板未生成（运行: scholarpilot tables <项目>）[/yellow]")
+
+        # 未验证引用警告
+        unverified = report.get("unverified_count", 0)
+        if unverified > 0:
+            self.console.print(
+                f"\n[yellow]⚠️ {unverified} 条引用未通过验证，请手动核查[/yellow]"
+            )
+
+        # 建议
+        self.console.print("\n[bold]下一步建议:[/bold]")
+        wc = report.get("word_count", 0)
+        if wc < 15000:
+            self.console.print("  • 字数不足，建议扩充各章节内容")
+        if report.get("reference_count", 0) < 25:
+            self.console.print("  • 参考文献偏少，建议补充更多高质量文献")
+        if report.get("missing_parts"):
+            self.console.print(f"  • 结构缺失：{', '.join(report['missing_parts'])}")
+        if not report.get("has_abstract"):
+            self.console.print("  • 缺少摘要，运行: scholarpilot finalize <项目> --abstract-only")
+        if report.get("unverified_count", 0) > 0:
+            self.console.print("  • 有未验证引用，建议手动核查或重新运行引用管理")
+
+        if (
+            wc >= 15000
+            and report.get("reference_count", 0) >= 25
+            and report.get("structure_complete")
+            and report.get("has_abstract")
+        ):
+            self.console.print("  [green]• 论文质量达标，可考虑导出投稿[/green]")
+            self.console.print("  [dim]  导出命令: scholarpilot export <项目> -f docx[/dim]")
+
+    def _phase8_post_completion(self) -> None:
+        """Phase 8 后处理：质量报告 + 导出建议 + 实证工具提示."""
+        from rich.panel import Panel
+
+        # 1. 生成并显示质量报告
+        try:
+            report = self.generate_quality_report()
+            self._display_quality_report(report)
+        except Exception as e:
+            logger.warning(f"质量报告生成失败: {e}")
+
+        # 2. 实证论文工具提示
+        is_empirical = (
+            self.topic_info.get("research_type") == "empirical"
+            if hasattr(self, "topic_info") and self.topic_info
+            else False
+        )
+
+        if is_empirical:
+            self.console.print(
+                Panel(
+                    "[bold]实证研究工具提示[/bold]\n\n"
+                    "[cyan]代码模板[/cyan] — 生成 Stata/R/Python 实证分析代码骨架:\n"
+                    f"  scholarpilot code {self.project_dir.name} --lang stata\n\n"
+                    "[cyan]数据预处理[/cyan] — 缺失值检测、缩尾处理、清洗报告:\n"
+                    f"  scholarpilot preprocess {self.project_dir.name} --data data/your_data.csv\n\n"
+                    "[cyan]统计分析[/cyan] — 描述性统计、回归、VIF检验:\n"
+                    f"  scholarpilot stats {self.project_dir.name} --dep <Y> --indep <X1,X2>\n\n"
+                    "[cyan]计量诊断[/cyan] — VIF/Hausman/异方差/单位根检验:\n"
+                    f"  scholarpilot diagnose {self.project_dir.name} --dep <Y> --indep <X1,X2> --entity <id> --time <year>\n\n"
+                    "[cyan]机制分析[/cyan] — 中介效应/调节效应分析:\n"
+                    f"  scholarpilot mechanism {self.project_dir.name} --x <X> --y <Y> --mediator <M>\n\n"
+                    "[cyan]数据源指南[/cyan] — 匹配变量到CSMAR/Wind等数据源:\n"
+                    f"  scholarpilot datasource {self.project_dir.name}\n\n"
+                    "[cyan]科研绘图[/cyan] — 分布图/系数图/热力图:\n"
+                    f"  scholarpilot plot {self.project_dir.name} --type distribution",
+                    title="实证工具",
+                    border_style="blue",
+                )
+            )
+
+        # 3. 检测 data/ 文件夹中的用户数据
+        data_dir = self.project_dir / "data"
+        if data_dir.exists():
+            data_files = list(data_dir.glob("*.csv")) + list(data_dir.glob("*.xlsx"))
+            if data_files:
+                self.console.print(
+                    f"\n[green]✓ 检测到数据文件: {data_files[0].name}[/green]\n"
+                    f"[dim]  运行统计分析: scholarpilot stats {self.project_dir.name}[/dim]"
+                )
+
+        # 4. 导出建议
+        self.console.print(
+            Panel(
+                "[bold]导出选项[/bold]\n\n"
+                f"  scholarpilot export {self.project_dir.name} -f docx   # Word格式\n"
+                f"  scholarpilot export {self.project_dir.name} -f pdf    # PDF格式\n"
+                f"  scholarpilot export {self.project_dir.name} -f latex  # LaTeX格式\n"
+                f"  scholarpilot export {self.project_dir.name} -f md     # Markdown格式\n\n"
+                "[dim]定稿命令（重新生成摘要+引用管理）:[/dim]\n"
+                f"  scholarpilot finalize {self.project_dir.name}",
+                title="下一步",
+                border_style="green",
+            )
+        )
 
 
 # ===== LangGraph 节点函数 =====

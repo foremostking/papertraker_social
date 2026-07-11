@@ -218,8 +218,15 @@ def export_project(
         output_path = final_dir / f"{output_name}.md"
         output_path.write_text(md_content, encoding="utf-8")
         return output_path
+    elif fmt.lower() == "pdf":
+        # 先生成 docx，再转换为 PDF
+        docx_path = final_dir / f"{output_name}.docx"
+        markdown_to_docx(md_content, docx_path, title)
+        output_path = final_dir / f"{output_name}.pdf"
+        _docx_to_pdf(docx_path, output_path)
+        return output_path
     else:
-        raise ValueError(f"不支持的格式: {fmt}")
+        raise ValueError(f"不支持的格式: {fmt}。支持: docx, pdf, latex, md")
 
 
 # ===== 内部辅助函数 =====
@@ -290,19 +297,105 @@ def _escape_latex(text: str) -> str:
     return text
 
 
+def _docx_to_pdf(docx_path: Path, pdf_path: Path) -> Path:
+    """将 Word 文档转换为 PDF.
+
+    优先使用 docx2pdf（Windows 上利用 Word COM 自动化），
+    失败则尝试 LibreOffice 命令行转换。
+
+    Args:
+        docx_path: .docx 文件路径。
+        pdf_path: 输出 .pdf 文件路径。
+
+    Returns:
+        生成的 .pdf 文件路径。
+
+    Raises:
+        RuntimeError: 如果两种转换方式都失败。
+    """
+    import subprocess
+    import sys
+
+    pdf_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 方式1: docx2pdf（Windows 上利用 Word COM）
+    try:
+        from docx2pdf import convert as docx2pdf_convert
+        docx2pdf_convert(str(docx_path), str(pdf_path))
+        if pdf_path.exists():
+            return pdf_path
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # 方式2: LibreOffice 命令行
+    try:
+        result = subprocess.run(
+            ["libreoffice", "--headless", "--convert-to", "pdf",
+             "--outdir", str(pdf_path.parent), str(docx_path)],
+            capture_output=True, text=True, timeout=60,
+        )
+        if pdf_path.exists():
+            return pdf_path
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    except Exception:
+        pass
+
+    # 方式3: Windows 上尝试 soffice（LibreOffice 的 Windows 名称）
+    if sys.platform == "win32":
+        try:
+            result = subprocess.run(
+                ["soffice", "--headless", "--convert-to", "pdf",
+                 "--outdir", str(pdf_path.parent), str(docx_path)],
+                capture_output=True, text=True, timeout=60,
+            )
+            if pdf_path.exists():
+                return pdf_path
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+        except Exception:
+            pass
+
+    raise RuntimeError(
+        "PDF 导出失败。请安装以下任一工具：\n"
+        "  1. pip install docx2pdf（需要 Microsoft Word）\n"
+        "  2. 安装 LibreOffice 并确保 libreoffice/soffice 在 PATH 中"
+    )
+
+
 def _merge_sections(project_dir: Path) -> Path | None:
-    """合并所有章节为完整草稿."""
+    """合并所有章节为完整草稿.
+
+    排除 full_draft.md 自身（避免重复合并）以及辅助文件（abstract/references/tables_template）。
+    标题从 outline.json 读取，如不存在则回退到"论文草稿"。
+    """
     draft_dir = project_dir / "draft"
     if not draft_dir.exists():
         return None
 
+    # 排除 full_draft.md 自身和辅助文件
+    exclude_names = {"full_draft.md", "abstract.md", "references.md", "tables_template.md"}
     sections = sorted(
-        f for f in draft_dir.iterdir() if f.is_file() and f.suffix == ".md"
+        f for f in draft_dir.iterdir()
+        if f.is_file() and f.suffix == ".md" and f.name not in exclude_names
     )
     if not sections:
         return None
 
-    merged = "# 论文草稿\n\n"
+    # 从 outline.json 读取标题
+    title = "论文草稿"
+    outline_path = project_dir / ".scholar" / "outline.json"
+    if outline_path.exists():
+        try:
+            import json
+            outline = json.loads(outline_path.read_text(encoding="utf-8"))
+            title = outline.get("title", "论文草稿")
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    merged = f"# {title}\n\n"
     for section in sections:
         content = section.read_text(encoding="utf-8")
         merged += content + "\n\n---\n\n"

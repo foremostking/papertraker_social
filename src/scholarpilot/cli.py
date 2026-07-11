@@ -697,6 +697,124 @@ def review(
 
 
 @app.command()
+def finalize(
+    project: str = typer.Argument(..., help="项目名称"),
+    abstract_only: bool = typer.Option(False, "--abstract-only", help="仅重新生成摘要"),
+    citations_only: bool = typer.Option(False, "--citations-only", help="仅重新管理引用"),
+    report_only: bool = typer.Option(False, "--report-only", help="仅显示质量报告，不执行任何操作"),
+):
+    """定稿处理——手动编辑草稿后重新生成摘要和参考文献.
+
+    \b
+    科研场景：用 ScholarPilot 生成初稿后，你会手动改写以降低 AI 率。
+    改完后正文变了，摘要和参考文献也需要更新。不用重跑整个 chat 流程，
+    用 finalize 即可独立处理。
+
+    \b
+    用法:
+      scholarpilot finalize debt_paper                      # 重新生成摘要+参考文献
+      scholarpilot finalize debt_paper --abstract-only      # 仅重新生成摘要
+      scholarpilot finalize debt_paper --citations-only     # 仅重新提取验证引用
+      scholarpilot finalize debt_paper --report-only        # 仅查看质量报告
+    """
+    fm = _get_file_manager()
+    project_dir = fm.get_project_dir(project)
+    if not project_dir:
+        console.print(f"[red]项目不存在: {project}[/red]")
+        raise typer.Exit(1)
+
+    draft_path = project_dir / "draft" / "full_draft.md"
+    if not draft_path.exists():
+        console.print("[red]草稿文件不存在，请先运行写作流程 (scholarpilot chat)[/red]")
+        raise typer.Exit(1)
+
+    import asyncio
+    from scholarpilot.agent.scholar import ScholarAgent
+
+    agent = ScholarAgent(project_dir)
+
+    if report_only:
+        report = agent.generate_quality_report()
+        agent._display_quality_report(report)
+        return
+
+    # 确定操作
+    do_abstract = True
+    do_citations = True
+    if abstract_only:
+        do_citations = False
+    if citations_only:
+        do_abstract = False
+
+    asyncio.run(agent.finalize(abstract=do_abstract, citations=do_citations))
+
+
+@app.command()
+def quality(
+    project: str = typer.Argument(..., help="项目名称"),
+):
+    """查看论文质量报告——字数、引用数、结构完整性、期刊达标评估.
+
+    \b
+    不执行任何修改操作，仅分析当前草稿状态。
+    帮你快速判断是否达到目标期刊的投稿门槛。
+
+    \b
+    用法:
+      scholarpilot quality debt_paper
+    """
+    fm = _get_file_manager()
+    project_dir = fm.get_project_dir(project)
+    if not project_dir:
+        console.print(f"[red]项目不存在: {project}[/red]")
+        raise typer.Exit(1)
+
+    draft_path = project_dir / "draft" / "full_draft.md"
+    if not draft_path.exists():
+        console.print("[red]草稿文件不存在，请先运行写作流程[/red]")
+        raise typer.Exit(1)
+
+    from scholarpilot.agent.scholar import ScholarAgent
+
+    agent = ScholarAgent(project_dir)
+    report = agent.generate_quality_report()
+    agent._display_quality_report(report)
+
+
+@app.command()
+def tables(
+    project: str = typer.Argument(..., help="项目名称"),
+):
+    """生成实证表格模板——描述性统计表、回归结果表、相关系数矩阵.
+
+    \b
+    科研场景：实证论文需要标准的统计表格，但手动排版很耗时。
+    本命令从 SPEC 中提取变量定义和模型设定，自动生成空表格模板。
+    研究者只需填入真实数据，无需从零开始排版。
+
+    \b
+    用法:
+      scholarpilot tables debt_paper    # 生成或重新生成表格模板
+    """
+    import asyncio
+    fm = _get_file_manager()
+    project_dir = fm.get_project_dir(project)
+    if not project_dir:
+        console.print(f"[red]项目不存在: {project}[/red]")
+        raise typer.Exit(1)
+
+    spec_path = project_dir / "SPEC.md"
+    if not spec_path.exists() and not (project_dir / "SPEC.json").exists():
+        console.print("[red]SPEC 文件不存在，请先运行写作流程[/red]")
+        raise typer.Exit(1)
+
+    from scholarpilot.agent.scholar import ScholarAgent
+
+    agent = ScholarAgent(project_dir)
+    asyncio.run(agent.generate_tables())
+
+
+@app.command()
 def feed(
     action: str = typer.Argument("run", help="操作: run/seeds/history/save"),
     max_recs: int = typer.Option(0, "--max", "-n", help="最大推荐数（0=用配置默认值20）"),
@@ -1017,7 +1135,709 @@ def _feed_save_action(lib, save_id):
         console.print(f"[green]文献已在库中: {paper.get('title', '')[:50]}[/green]")
     else:
         console.print(f"[red]未找到文献: {save_id}[/red]")
+
+
+@app.command()
+def code(
+    project: str = typer.Argument(..., help="项目名称"),
+    lang: str = typer.Option("stata", "--lang", "-l", help="语言: stata|r|python"),
+    full: bool = typer.Option(True, "--full/--basic", help="生成完整模板（含智能方法追加）"),
+    output: str = typer.Option("", "--output", "-o", help="输出文件路径（默认 analysis/ 目录）"),
+):
+    """生成实证分析代码模板——Stata .do / R / Python.
+
+    \b
+    科研场景：拿到 SPEC 后需要写 Stata/R 代码进行实证分析。
+    从零写极耗时——本命令根据 SPEC 自动生成完整代码骨架，
+    覆盖数据导入→预处理→描述统计→回归→诊断检验→稳健性检验全流程。
+    还会根据 SPEC 关键词智能追加 DID/PSM/IV/中介/空间计量模板。
+
+    \b
+    用法:
+      scholarpilot code debt_paper                          # 生成 Stata 模板
+      scholarpilot code debt_paper --lang r                 # 生成 R 模板
+      scholarpilot code debt_paper --lang python            # 生成 Python 模板
+      scholarpilot code debt_paper --basic                  # 仅基础流程，不追加高级方法
+    """
+    fm = _get_file_manager()
+    project_dir = fm.get_project_dir(project)
+    if not project_dir:
+        console.print(f"[red]项目不存在: {project}[/red]")
         raise typer.Exit(1)
+
+    # 读取 SPEC
+    spec_path = project_dir / "SPEC.md"
+    if not spec_path.exists():
+        console.print("[red]SPEC.md 不存在，请先运行写作流程[/red]")
+        raise typer.Exit(1)
+
+    spec_text = spec_path.read_text(encoding="utf-8")
+
+    # 从 outline.json 读取标题
+    title = ""
+    outline_path = project_dir / ".scholar" / "outline.json"
+    if outline_path.exists():
+        try:
+            import json
+            outline = json.loads(outline_path.read_text(encoding="utf-8"))
+            title = outline.get("title", "")
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    from scholarpilot.tools.code_template_generator import CodeTemplateGenerator
+
+    gen = CodeTemplateGenerator(project_dir=project_dir)
+
+    if full:
+        template = gen.generate_full_template(spec_text, lang=lang, title=title)
+    else:
+        if lang == "stata":
+            template = gen.generate_stata_template(spec_text, title=title)
+        elif lang == "r":
+            template = gen.generate_r_template(spec_text, title=title)
+        elif lang == "python":
+            template = gen.generate_python_template(spec_text, title=title)
+        else:
+            console.print(f"[red]不支持的语言: {lang}。支持: stata, r, python[/red]")
+            raise typer.Exit(1)
+
+    # 确定输出路径
+    ext_map = {"stata": ".do", "r": ".R", "python": ".py"}
+    ext = ext_map.get(lang, ".txt")
+
+    if output:
+        output_path = Path(output)
+    else:
+        analysis_dir = project_dir / "analysis"
+        analysis_dir.mkdir(parents=True, exist_ok=True)
+        output_path = analysis_dir / f"analysis_template{ext}"
+
+    output_path.write_text(template, encoding="utf-8")
+
+    console.print(f"[green]代码模板已生成: {output_path}[/green]")
+    console.print(f"[dim]语言: {lang} | 模板长度: {len(template)} 字符[/dim]")
+
+    # 显示模板概要
+    lines = template.split("\n")
+    section_markers = [l for l in lines if l.strip().startswith("// ===")]
+    if section_markers:
+        console.print("\n[bold]模板结构:[/bold]")
+        for marker in section_markers:
+            console.print(f"  {marker.strip()}")
+
+
+@app.command()
+def stats(
+    project: str = typer.Argument(..., help="项目名称"),
+    data: str = typer.Option("", "--data", "-d", help="数据文件路径（CSV/Excel），默认搜索 data/ 目录"),
+    dep_var: str = typer.Option("", "--dep", help="被解释变量名"),
+    indep_vars: str = typer.Option("", "--indep", help="解释变量名，逗号分隔"),
+    entity_var: str = typer.Option("", "--entity", help="面板个体变量（如 province）"),
+    time_var: str = typer.Option("", "--time", help="时间变量（如 year）"),
+    model: str = typer.Option("ols", "--model", help="回归模型: ols|fe|re|quantile|logit|probit|tobit"),
+    quantiles: str = typer.Option("", "--quantiles", help="分位数列表（逗号分隔），如 0.1,0.25,0.5,0.75,0.9"),
+    tobit_lower: float = typer.Option(None, "--tobit-lower", help="Tobit左截断点"),
+    tobit_upper: float = typer.Option(None, "--tobit-upper", help="Tobit右截断点"),
+    output: str = typer.Option("", "--output", "-o", help="输出路径（默认 .scholar/stats_results.json）"),
+):
+    """统计分析——描述性统计、回归、VIF检验、分位数回归、离散选择模型.
+
+    \b
+    科研场景：研究者上传 CSV 数据后，不想打开 Stata 也能跑基础分析。
+    本命令直接用 pandas + statsmodels 计算，结果可注入论文。
+
+    \b
+    用法:
+      scholarpilot stats debt_paper --data data/user_data.csv \\
+          --dep debt_risk --indep fiscal_gap,gdp_growth \\
+          --entity province --time year --model fe
+
+      scholarpilot stats debt_paper --dep debt_risk --indep fiscal_gap,gdp_growth \\
+          --model quantile --quantiles 0.1,0.25,0.5,0.75,0.9
+
+      scholarpilot stats debt_paper --dep default --indep debt_ratio,gdp_growth --model logit
+    """
+    fm = _get_file_manager()
+    project_dir = fm.get_project_dir(project)
+    if not project_dir:
+        console.print(f"[red]项目不存在: {project}[/red]")
+        raise typer.Exit(1)
+
+    # 查找数据文件
+    if data:
+        data_path = Path(data)
+        if not data_path.is_absolute():
+            data_path = project_dir / data_path
+    else:
+        # 自动搜索 data/ 目录
+        data_dir = project_dir / "data"
+        if data_dir.exists():
+            candidates = list(data_dir.glob("*.csv")) + list(data_dir.glob("*.xlsx"))
+            if candidates:
+                data_path = candidates[0]
+                console.print(f"[dim]自动检测到数据文件: {data_path.name}[/dim]")
+            else:
+                console.print("[red]未找到数据文件。请用 --data 指定路径，或将文件放入 data/ 目录[/red]")
+                raise typer.Exit(1)
+        else:
+            console.print("[red]未找到 data/ 目录。请用 --data 指定数据文件路径[/red]")
+            raise typer.Exit(1)
+
+    if not data_path.exists():
+        console.print(f"[red]数据文件不存在: {data_path}[/red]")
+        raise typer.Exit(1)
+
+    try:
+        from scholarpilot.tools.data_preprocessor import DataPreprocessor
+        from scholarpilot.tools.stats_engine import StatsEngine
+    except ImportError as e:
+        console.print(f"[red]实证分析依赖未安装: {e}[/red]")
+        console.print("[dim]安装: pip install scholarpilot[empirical][/dim]")
+        raise typer.Exit(1)
+
+    # 加载数据
+    dp = DataPreprocessor()
+    df = dp.load_data(data_path)
+    console.print(f"[green]数据加载成功: {len(df)} 行, {len(df.columns)} 列[/green]")
+
+    engine = StatsEngine()
+
+    # 描述性统计
+    console.print("\n[bold]描述性统计:[/bold]")
+    desc_stats = engine.descriptive_stats(df)
+    console.print(engine.format_results(desc_stats, format_type="markdown"))
+
+    # 相关系数
+    console.print("\n[bold]相关系数矩阵:[/bold]")
+    corr = engine.correlation_matrix(df)
+    console.print(engine.format_results(corr, format_type="markdown"))
+
+    # 回归分析
+    if dep_var and indep_vars:
+        indep_list = [v.strip() for v in indep_vars.split(",")]
+
+        if model in ("fe", "re") and entity_var and time_var:
+            console.print(f"\n[bold]面板回归 ({model.upper()}):[/bold]")
+            reg_results = engine.panel_regression(
+                df, dep_var, indep_list, entity_var, time_var,
+                model=model, cluster=True,
+            )
+        elif model == "quantile":
+            q_list = None
+            if quantiles:
+                q_list = [float(q.strip()) for q in quantiles.split(",")]
+            console.print(f"\n[bold]分位数回归:[/bold]")
+            reg_results = engine.quantile_regression(
+                df, dep_var, indep_list, quantiles=q_list, robust=True,
+            )
+        elif model == "logit":
+            console.print(f"\n[bold]Logit 回归:[/bold]")
+            reg_results = engine.logit_regression(df, dep_var, indep_list, robust=True)
+        elif model == "probit":
+            console.print(f"\n[bold]Probit 回归:[/bold]")
+            reg_results = engine.probit_regression(df, dep_var, indep_list, robust=True)
+        elif model == "tobit":
+            console.print(f"\n[bold]Tobit 回归:[/bold]")
+            reg_results = engine.tobit_regression(
+                df, dep_var, indep_list, lower=tobit_lower, upper=tobit_upper,
+            )
+        else:
+            console.print(f"\n[bold]OLS 回归:[/bold]")
+            reg_results = engine.ols_regression(df, dep_var, indep_list, robust=True)
+
+        console.print(engine.format_results(reg_results, format_type="markdown"))
+
+        # VIF 检验（仅对连续模型做，logit/probit/tobit 跳过）
+        if model not in ("logit", "probit", "tobit"):
+            console.print("\n[bold]VIF 多重共线性检验:[/bold]")
+            vif_results = engine.vif_test(df, indep_list)
+            console.print(engine.format_results(vif_results, format_type="markdown"))
+            has_vif = True
+        else:
+            vif_results = {}
+            has_vif = False
+
+        # 保存结果
+        import json
+        results = {
+            "descriptive": desc_stats,
+            "correlation": corr,
+            "regression": reg_results,
+        }
+        if has_vif:
+            results["vif"] = vif_results
+        output_path = Path(output) if output else project_dir / ".scholar" / "stats_results.json"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(results, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        console.print(f"\n[green]结果已保存: {output_path}[/green]")
+    else:
+        console.print("\n[dim]未指定 --dep 和 --indep，跳过回归分析[/dim]")
+        console.print("[dim]模型选项: ols|fe|re|quantile|logit|probit|tobit[/dim]")
+        console.print("[dim]完整分析: scholarpilot stats <project> --dep <Y> --indep <X1,X2> --entity <id> --time <t> --model fe[/dim]")
+
+
+@app.command(name="preprocess")
+def preprocess(
+    project: str = typer.Argument(..., help="项目名称"),
+    data: str = typer.Option("", "--data", "-d", help="数据文件路径（CSV/Excel）"),
+    winsorize: bool = typer.Option(True, "--winsorize/--no-winsorize", help="1%/99%缩尾处理"),
+    output: str = typer.Option("", "--output", "-o", help="输出路径（默认 data/cleaned_data.csv）"),
+):
+    """数据预处理——缺失值检测、缩尾处理、清洗报告.
+
+    \b
+    科研场景：拿到原始数据第一步就是清洗。本命令自动检测缺失值、
+    执行 1%/99% 缩尾处理（中国金融实证标准操作），并生成清洗报告。
+
+    \b
+    用法:
+      scholarpilot preprocess debt_paper --data data/raw_data.csv
+      scholarpilot preprocess debt_paper --data data/raw_data.xlsx --no-winsorize
+    """
+    fm = _get_file_manager()
+    project_dir = fm.get_project_dir(project)
+    if not project_dir:
+        console.print(f"[red]项目不存在: {project}[/red]")
+        raise typer.Exit(1)
+
+    # 查找数据文件
+    if data:
+        data_path = Path(data)
+        if not data_path.is_absolute():
+            data_path = project_dir / data_path
+    else:
+        data_dir = project_dir / "data"
+        if data_dir.exists():
+            candidates = list(data_dir.glob("*.csv")) + list(data_dir.glob("*.xlsx"))
+            if candidates:
+                data_path = candidates[0]
+                console.print(f"[dim]自动检测到数据文件: {data_path.name}[/dim]")
+            else:
+                console.print("[red]未找到数据文件。请用 --data 指定路径[/red]")
+                raise typer.Exit(1)
+        else:
+            console.print("[red]未找到 data/ 目录。请用 --data 指定数据文件路径[/red]")
+            raise typer.Exit(1)
+
+    if not data_path.exists():
+        console.print(f"[red]数据文件不存在: {data_path}[/red]")
+        raise typer.Exit(1)
+
+    try:
+        from scholarpilot.tools.data_preprocessor import DataPreprocessor
+    except ImportError as e:
+        console.print(f"[red]依赖未安装: {e}[/red]")
+        console.print("[dim]安装: pip install scholarpilot[empirical][/dim]")
+        raise typer.Exit(1)
+
+    dp = DataPreprocessor()
+    df_original = dp.load_data(data_path)
+    console.print(f"[green]数据加载成功: {len(df_original)} 行, {len(df_original.columns)} 列[/green]")
+
+    operations = []
+
+    # 缺失值检测
+    console.print("\n[bold]缺失值检测:[/bold]")
+    missing_report = dp.check_missing(df_original)
+    has_missing = False
+    for var, info in missing_report.items():
+        if info["count"] > 0:
+            has_missing = True
+            console.print(f"  {var}: {info['count']} 缺失 ({info['percentage']:.1f}%) → 建议: {info['suggestion']}")
+
+    if not has_missing:
+        console.print("  [green]无缺失值[/green]")
+
+    # 缺失值处理
+    df_cleaned = df_original.copy()
+    if has_missing:
+        strategy = {}
+        for var, info in missing_report.items():
+            if info["count"] > 0:
+                strategy[var] = info["suggestion"].split()[0]
+        if strategy:
+            df_cleaned = dp.handle_missing(df_cleaned, strategy)
+            operations.append(f"缺失值处理: {strategy}")
+            console.print(f"[dim]已处理缺失值: {len(strategy)} 个变量[/dim]")
+
+    # 缩尾处理
+    if winsorize:
+        numeric_vars = df_cleaned.select_dtypes(include=["number"]).columns.tolist()
+        # 排除标识列
+        id_cols = {"year", "province", "city", "region", "id", "code"}
+        winsor_vars = [v for v in numeric_vars if v.lower() not in id_cols]
+        if winsor_vars:
+            df_cleaned = dp.winsorize(df_cleaned, winsor_vars, lower=0.01, upper=0.99)
+            operations.append(f"缩尾处理: {len(winsor_vars)} 个变量 (1%/99%)")
+            console.print(f"[dim]已缩尾处理: {len(winsor_vars)} 个变量[/dim]")
+
+    # 生成清洗报告
+    report = dp.generate_cleaning_report(df_original, df_cleaned, operations)
+    console.print(f"\n[bold]数据清洗报告:[/bold]")
+    console.print(report)
+
+    # 保存清洗后数据
+    output_path = Path(output) if output else project_dir / "data" / "cleaned_data.csv"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    df_cleaned.to_csv(output_path, index=False, encoding="utf-8-sig")
+    console.print(f"\n[green]清洗后数据已保存: {output_path}[/green]")
+    console.print(f"[dim]原始行数: {len(df_original)} → 清洗后: {len(df_cleaned)}[/dim]")
+
+
+@app.command()
+def datasource(
+    project: str = typer.Argument(..., help="项目名称"),
+    output: str = typer.Option("", "--output", "-o", help="输出路径（默认 data_collection_guide.md）"),
+):
+    """生成数据采集指南——匹配变量到 CSMAR/Wind/RESSET/NBS 等数据源.
+
+    \b
+    科研场景：研究生拿到 SPEC 后不知道去哪里找数据。
+    本命令根据 SPEC 中的变量设计，自动匹配推荐数据源。
+
+    \b
+    用法:
+      scholarpilot datasource debt_paper
+    """
+    fm = _get_file_manager()
+    project_dir = fm.get_project_dir(project)
+    if not project_dir:
+        console.print(f"[red]项目不存在: {project}[/red]")
+        raise typer.Exit(1)
+
+    spec_path = project_dir / "SPEC.md"
+    if not spec_path.exists():
+        console.print("[red]SPEC.md 不存在[/red]")
+        raise typer.Exit(1)
+
+    spec_text = spec_path.read_text(encoding="utf-8")
+
+    from scholarpilot.tools.data_source_guide import generate_data_source_guide
+
+    output_path = Path(output) if output else project_dir / "data_collection_guide.md"
+    guide = generate_data_source_guide(spec_text, output_path)
+
+    console.print(f"[green]数据采集指南已生成: {output_path}[/green]")
+    console.print(f"[dim]指南长度: {len(guide)} 字符[/dim]")
+
+
+@app.command()
+def diagnose(
+    project: str = typer.Argument(..., help="项目名称"),
+    data: str = typer.Option("", "--data", "-d", help="数据文件路径"),
+    dep_var: str = typer.Option("", "--dep", help="被解释变量"),
+    indep_vars: str = typer.Option("", "--indep", help="解释变量，逗号分隔"),
+    entity_var: str = typer.Option("", "--entity", help="面板个体变量"),
+    time_var: str = typer.Option("", "--time", help="时间变量"),
+):
+    """计量诊断检验——VIF/Hausman/异方差/自相关/单位根.
+
+    \b
+    科研场景：审稿人常问"是否做了多重共线性检验""FE还是RE""是否存在异方差"。
+
+    \b
+    用法:
+      scholarpilot diagnose debt_paper --data data/user_data.csv \\
+          --dep debt_risk --indep fiscal_gap,gdp_growth \\
+          --entity province --time year
+    """
+    fm = _get_file_manager()
+    project_dir = fm.get_project_dir(project)
+    if not project_dir:
+        console.print(f"[red]项目不存在: {project}[/red]")
+        raise typer.Exit(1)
+
+    if data:
+        data_path = Path(data)
+        if not data_path.is_absolute():
+            data_path = project_dir / data_path
+    else:
+        data_dir = project_dir / "data"
+        if data_dir.exists():
+            candidates = list(data_dir.glob("*.csv")) + list(data_dir.glob("*.xlsx"))
+            if candidates:
+                data_path = candidates[0]
+            else:
+                console.print("[red]未找到数据文件[/red]")
+                raise typer.Exit(1)
+        else:
+            console.print("[red]未找到 data/ 目录[/red]")
+            raise typer.Exit(1)
+
+    try:
+        from scholarpilot.tools.data_preprocessor import DataPreprocessor
+        from scholarpilot.tools.econometric_diagnostics import EconometricDiagnostics
+    except ImportError as e:
+        console.print(f"[red]依赖未安装: {e}[/red]")
+        console.print("[dim]安装: pip install scholarpilot[empirical][/dim]")
+        raise typer.Exit(1)
+
+    dp = DataPreprocessor()
+    df = dp.load_data(data_path)
+    console.print(f"[green]数据加载: {len(df)} 行, {len(df.columns)} 列[/green]")
+
+    diag = EconometricDiagnostics()
+    results = {}
+
+    indep_list = [v.strip() for v in indep_vars.split(",")] if indep_vars else []
+
+    if indep_list:
+        # VIF
+        console.print("\n[bold]VIF 多重共线性检验:[/bold]")
+        vif = diag.vif_test(df, indep_list)
+        results["vif"] = vif
+        for var, val in vif.get("variables", {}).items():
+            console.print(f"  {var}: VIF = {val:.2f}")
+        console.print(f"  最大VIF: {vif.get('max_vif', 'N/A'):.2f}")
+
+    if dep_var and indep_list and entity_var and time_var:
+        # Hausman
+        console.print("\n[bold]Hausman 检验 (FE vs RE):[/bold]")
+        hausman = diag.hausman_test(df, dep_var, indep_list, entity_var, time_var)
+        results["hausman"] = hausman
+        console.print(f"  chi2 = {hausman.get('chi2', 'N/A')}")
+        console.print(f"  p值 = {hausman.get('p_value', 'N/A')}")
+        console.print(f"  建议: {hausman.get('recommendation', 'N/A')}")
+
+    if dep_var and indep_list:
+        # Breusch-Pagan
+        console.print("\n[bold]Breusch-Pagan 异方差检验:[/bold]")
+        bp = diag.breusch_pagan_test(df, dep_var, indep_list)
+        results["breusch_pagan"] = bp
+        console.print(f"  LM = {bp.get('lm_statistic', 'N/A')}")
+        console.print(f"  p值 = {bp.get('p_value', 'N/A')}")
+
+    # 诊断报告
+    if results:
+        report = diag.generate_diagnostics_report(results)
+        report_path = project_dir / ".scholar" / "diagnostics_report.md"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(report, encoding="utf-8")
+        console.print(f"\n[green]诊断报告已保存: {report_path}[/green]")
+
+
+@app.command()
+def mechanism(
+    project: str = typer.Argument(..., help="项目名称"),
+    data: str = typer.Option("", "--data", "-d", help="数据文件路径"),
+    x: str = typer.Option("", "--x", help="自变量（核心解释变量）"),
+    y: str = typer.Option("", "--y", help="因变量（被解释变量）"),
+    mediator: str = typer.Option("", "--mediator", "-m", help="中介变量"),
+    moderator: str = typer.Option("", "--moderator", help="调节变量（调节效应分析用）"),
+    controls: str = typer.Option("", "--controls", help="控制变量，逗号分隔"),
+    analysis_type: str = typer.Option("mediation", "--type", help="分析类型: mediation|moderation"),
+    bootstrap: bool = typer.Option(False, "--bootstrap", help="使用Bootstrap检验中介效应"),
+):
+    """机制分析——中介效应/调节效应分析.
+
+    \b
+    科研场景：中国实证论文几乎都有"机制分析"章节。
+
+    \b
+    用法:
+      # 中介效应
+      scholarpilot mechanism debt_paper --data data/user_data.csv \\
+          --x fiscal_gap --y debt_risk --mediator financial_dev --controls gdp_growth,urban_rate
+
+      # 调节效应
+      scholarpilot mechanism debt_paper --data data/user_data.csv \\
+          --x fiscal_gap --y debt_risk --moderator gdp_growth --type moderation
+    """
+    fm = _get_file_manager()
+    project_dir = fm.get_project_dir(project)
+    if not project_dir:
+        console.print(f"[red]项目不存在: {project}[/red]")
+        raise typer.Exit(1)
+
+    if data:
+        data_path = Path(data)
+        if not data_path.is_absolute():
+            data_path = project_dir / data_path
+    else:
+        data_dir = project_dir / "data"
+        if data_dir.exists():
+            candidates = list(data_dir.glob("*.csv")) + list(data_dir.glob("*.xlsx"))
+            if candidates:
+                data_path = candidates[0]
+            else:
+                console.print("[red]未找到数据文件[/red]")
+                raise typer.Exit(1)
+        else:
+            console.print("[red]未找到 data/ 目录[/red]")
+            raise typer.Exit(1)
+
+    try:
+        from scholarpilot.tools.data_preprocessor import DataPreprocessor
+        from scholarpilot.tools.mediation_analysis import MediationAnalysis
+    except ImportError as e:
+        console.print(f"[red]依赖未安装: {e}[/red]")
+        console.print("[dim]安装: pip install scholarpilot[empirical][/dim]")
+        raise typer.Exit(1)
+
+    dp = DataPreprocessor()
+    df = dp.load_data(data_path)
+    console.print(f"[green]数据加载: {len(df)} 行[/green]")
+
+    ma = MediationAnalysis()
+    control_list = [c.strip() for c in controls.split(",")] if controls else None
+    results = {}
+
+    if analysis_type == "mediation" and x and y and mediator:
+        console.print(f"\n[bold]中介效应分析 (Baron & Kenny 三步法):[/bold]")
+        console.print(f"  路径: {x} → {mediator} → {y}")
+
+        bk = ma.baron_kenny(df, x=x, y=y, mediator=mediator, controls=control_list)
+        results["baron_kenny"] = bk
+
+        console.print(f"\n  步骤1 (总效应 c): {bk.get('total_effect', 'N/A')}")
+        console.print(f"  步骤2 (X→M, a): {bk.get('step2', {}).get('coefficients', {}).get(x, 'N/A')}")
+        console.print(f"  步骤3 (直接效应 c'): {bk.get('direct_effect', 'N/A')}")
+        console.print(f"  间接效应 (a*b): {bk.get('indirect_effect', 'N/A')}")
+        console.print(f"  中介类型: {bk.get('mediation_type', 'N/A')}")
+
+        # Sobel检验
+        if "step2" in bk and "step3" in bk:
+            a_coef = bk["step2"].get("coefficients", {}).get(x, 0)
+            a_se = bk["step2"].get("std_errors", {}).get(x, 0)
+            b_coef = bk["step3"].get("coefficients", {}).get(mediator, 0)
+            b_se = bk["step3"].get("std_errors", {}).get(mediator, 0)
+
+            sobel = ma.sobel_test(a_coef, b_coef, a_se, b_se)
+            results["sobel"] = sobel
+            console.print(f"\n  Sobel检验: z = {sobel.get('z', 'N/A')}, p = {sobel.get('p_value', 'N/A')}")
+
+        # Bootstrap
+        if bootstrap:
+            console.print(f"\n  Bootstrap 检验 (1000次)...")
+            boot = ma.bootstrap_mediation(df, x=x, y=y, mediator=mediator,
+                                          controls=control_list, n_bootstrap=1000)
+            results["bootstrap"] = boot
+            console.print(f"  间接效应: {boot.get('indirect_effect', 'N/A')}")
+            console.print(f"  95% CI: [{boot.get('ci_lower', 'N/A')}, {boot.get('ci_upper', 'N/A')}]")
+            console.print(f"  显著: {'是' if boot.get('significant') else '否'}")
+
+    elif analysis_type == "moderation" and x and y and moderator:
+        console.print(f"\n[bold]调节效应分析:[/bold]")
+        console.print(f"  模型: {y} = β1*{x} + β2*{moderator} + β3*({x}*{moderator}) + controls")
+
+        mod = ma.moderation_analysis(df, x=x, y=y, moderator=moderator, controls=control_list)
+        results["moderation"] = mod
+
+        console.print(f"\n  R² = {mod.get('r_squared', 'N/A')}")
+        console.print(f"  交互项系数 = {mod.get('coefficients', {}).get(f'{x}_{moderator}', 'N/A')}")
+        console.print(f"  交互项p值 = {mod.get('interaction_p_value', 'N/A')}")
+        console.print(f"  存在调节效应: {'是' if mod.get('has_moderation') else '否'}")
+    else:
+        console.print("[red]参数不足。中介效应需要 --x --y --mediator；调节效应需要 --x --y --moderator --type moderation[/red]")
+        raise typer.Exit(1)
+
+    # 生成报告
+    report = ma.generate_mechanism_report(results)
+    report_path = project_dir / ".scholar" / "mechanism_report.md"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(report, encoding="utf-8")
+    console.print(f"\n[green]机制分析报告已保存: {report_path}[/green]")
+
+
+@app.command(name="plot")
+def plot_cmd(
+    project: str = typer.Argument(..., help="项目名称"),
+    plot_type: str = typer.Option("distribution", "--type", "-t", help="图表类型: distribution|boxplot|coef|corr|event|moran"),
+    data: str = typer.Option("", "--data", "-d", help="数据文件路径"),
+    variables: str = typer.Option("", "--vars", help="变量名，逗号分隔"),
+    output: str = typer.Option("", "--output", "-o", help="输出路径（默认 analysis/ 目录）"),
+):
+    """科研绘图——分布图/箱线图/系数图/热力图/事件研究图/Moran散点图.
+
+    \b
+    用法:
+      scholarpilot plot debt_paper --type distribution --vars debt_risk,fiscal_gap
+      scholarpilot plot debt_paper --type coef --output analysis/coef_plot.pdf
+    """
+    fm = _get_file_manager()
+    project_dir = fm.get_project_dir(project)
+    if not project_dir:
+        console.print(f"[red]项目不存在: {project}[/red]")
+        raise typer.Exit(1)
+
+    try:
+        import matplotlib  # noqa: F401
+    except ImportError:
+        console.print("[red]matplotlib 未安装。安装: pip install scholarpilot[empirical][/red]")
+        raise typer.Exit(1)
+
+    from scholarpilot.tools.plot_generator import PlotGenerator
+
+    pg = PlotGenerator()
+    var_list = [v.strip() for v in variables.split(",")] if variables else []
+
+    # 确定输出路径
+    if output:
+        output_path = Path(output)
+    else:
+        analysis_dir = project_dir / "analysis"
+        analysis_dir.mkdir(parents=True, exist_ok=True)
+        output_path = analysis_dir / f"{plot_type}_plot.pdf"
+
+    if plot_type in ("distribution", "boxplot"):
+        if not data:
+            data_dir = project_dir / "data"
+            if data_dir.exists():
+                candidates = list(data_dir.glob("*.csv")) + list(data_dir.glob("*.xlsx"))
+                if candidates:
+                    data_path = candidates[0]
+                else:
+                    console.print("[red]未找到数据文件[/red]")
+                    raise typer.Exit(1)
+            else:
+                console.print("[red]请用 --data 指定数据文件[/red]")
+                raise typer.Exit(1)
+        else:
+            data_path = Path(data)
+            if not data_path.is_absolute():
+                data_path = project_dir / data_path
+
+        from scholarpilot.tools.data_preprocessor import DataPreprocessor
+        dp = DataPreprocessor()
+        df = dp.load_data(data_path)
+
+        if not var_list:
+            var_list = df.select_dtypes(include=["number"]).columns.tolist()[:4]
+
+        if plot_type == "distribution":
+            pdf_path, png_path = pg.plot_distribution(df, var_list, output_path)
+        else:
+            pdf_path, png_path = pg.plot_boxplot(df, var_list, output_path)
+
+        console.print(f"[green]图表已生成: {pdf_path}[/green]")
+        console.print(f"[dim]预览图: {png_path}[/dim]")
+
+    elif plot_type == "corr":
+        if not data:
+            data_dir = project_dir / "data"
+            candidates = list(data_dir.glob("*.csv")) if data_dir.exists() else []
+            if not candidates:
+                console.print("[red]请用 --data 指定数据文件[/red]")
+                raise typer.Exit(1)
+            data_path = candidates[0]
+        else:
+            data_path = Path(data)
+            if not data_path.is_absolute():
+                data_path = project_dir / data_path
+
+        from scholarpilot.tools.data_preprocessor import DataPreprocessor
+        from scholarpilot.tools.stats_engine import StatsEngine
+        dp = DataPreprocessor()
+        df = dp.load_data(data_path)
+        engine = StatsEngine()
+        corr = engine.correlation_matrix(df, variables=var_list if var_list else None)
+
+        pdf_path, png_path = pg.plot_correlation_heatmap(corr, output_path)
+        console.print(f"[green]相关系数热力图已生成: {pdf_path}[/green]")
+
+    else:
+        console.print(f"[yellow]图表类型 '{plot_type}' 需要提供结果数据。请使用 Python API 调用。[/yellow]")
+        console.print("[dim]支持的数据驱动类型: distribution, boxplot, corr[/dim]")
 
 
 if __name__ == "__main__":
