@@ -259,6 +259,7 @@ class CNKIAiohttpEngine:
         search_query: str,
         year_start: str = "2020",
         year_end: str = "2026",
+        author: str = "",
     ) -> str:
         """构建 QueryJson 参数（复刻 papertracker_social 格式）.
 
@@ -266,60 +267,84 @@ class CNKIAiohttpEngine:
             search_query: CNKI 检索式（如 SU%='地方政府债务'）。
             year_start: 起始年份。
             year_end: 结束年份。
+            author: 作者名（可选，添加 AU%= 作者检索字段）。
 
         Returns:
             JSON 字符串。
         """
+        q_group = [
+            {
+                "Key": "Subject",
+                "Title": "",
+                "Logic": 0,
+                "Items": [
+                    {
+                        "Key": "Expert",
+                        "Title": "",
+                        "Logic": 0,
+                        "Field": "EXPERT",
+                        "Operator": 0,
+                        "Value": search_query,
+                        "Value2": "",
+                    }
+                ],
+                "ChildItems": [],
+            },
+        ]
+
+        # 添加作者检索字段（AU%=）
+        if author:
+            q_group.append({
+                "Key": "Author",
+                "Title": "作者",
+                "Logic": 0,
+                "Items": [
+                    {
+                        "Key": "Author",
+                        "Title": "",
+                        "Logic": 0,
+                        "Field": "AU",
+                        "Operator": 0,
+                        "Value": author,
+                        "Value2": "",
+                    }
+                ],
+                "ChildItems": [],
+            })
+
+        q_group.append({
+            "Key": "ControlGroup",
+            "Title": "",
+            "Logic": 0,
+            "Items": [],
+            "ChildItems": [
+                {
+                    "Key": ".tit-startend-yearbox",
+                    "Title": "",
+                    "Logic": 0,
+                    "Items": [
+                        {
+                            "Key": ".tit-startend-yearbox",
+                            "Title": "出版年度",
+                            "Logic": 0,
+                            "Field": "YE",
+                            "Operator": 7,
+                            "Value": year_start,
+                            "Value2": year_end,
+                        }
+                    ],
+                    "ChildItems": [],
+                }
+            ],
+        })
+
         query_json = {
             "Platform": "",
             "Resource": "JOURNAL",
             "Classid": "YSTT4HG0",
             "Products": "",
             "QNode": {
-                "QGroup": [
-                    {
-                        "Key": "Subject",
-                        "Title": "",
-                        "Logic": 0,
-                        "Items": [
-                            {
-                                "Key": "Expert",
-                                "Title": "",
-                                "Logic": 0,
-                                "Field": "EXPERT",
-                                "Operator": 0,
-                                "Value": search_query,
-                                "Value2": "",
-                            }
-                        ],
-                        "ChildItems": [],
-                    },
-                    {
-                        "Key": "ControlGroup",
-                        "Title": "",
-                        "Logic": 0,
-                        "Items": [],
-                        "ChildItems": [
-                            {
-                                "Key": ".tit-startend-yearbox",
-                                "Title": "",
-                                "Logic": 0,
-                                "Items": [
-                                    {
-                                        "Key": ".tit-startend-yearbox",
-                                        "Title": "出版年度",
-                                        "Logic": 0,
-                                        "Field": "YE",
-                                        "Operator": 7,
-                                        "Value": year_start,
-                                        "Value2": year_end,
-                                    }
-                                ],
-                                "ChildItems": [],
-                            }
-                        ],
-                    },
-                ]
+                "QGroup": q_group,
             },
             "ExScope": "1",
             "SearchType": 4,
@@ -341,6 +366,7 @@ class CNKIAiohttpEngine:
         year_start: str = "2020",
         year_end: str = "2026",
         sort_field: str = "FFD",
+        author: str = "",
     ) -> CNKISearchResult:
         """执行 CNKI 检索.
 
@@ -351,6 +377,7 @@ class CNKIAiohttpEngine:
             year_start: 起始年份。
             year_end: 结束年份。
             sort_field: 排序字段（FFD=发表时间, RU=被引, 空=相关度）。
+            author: 作者名（可选，添加 AU%= 作者检索字段，用于引用验证）。
 
         Returns:
             CNKISearchResult: 检索结果。
@@ -361,7 +388,7 @@ class CNKIAiohttpEngine:
         else:
             search_query = query
 
-        query_json = self.build_query_json(search_query, year_start, year_end)
+        query_json = self.build_query_json(search_query, year_start, year_end, author=author)
 
         post_data = {
             "boolSearch": "true",

@@ -292,6 +292,7 @@ class OpenAlexEngine:
         is_oa: bool = False,
         has_abstract: bool = False,
         work_type: str = "",
+        author_search: str = "",
     ) -> str:
         """构建 OpenAlex 过滤器.
 
@@ -301,6 +302,7 @@ class OpenAlexEngine:
             is_oa: 是否仅返回开放获取论文.
             has_abstract: 是否仅返回有摘要的论文.
             work_type: 论文类型（article/review/book-chapter）.
+            author_search: 作者名搜索（精确匹配作者显示名）.
 
         Returns:
             过滤器字符串，如 "publication_year:2019-2026,is_oa:true".
@@ -317,6 +319,8 @@ class OpenAlexEngine:
             filters.append("has_abstract:true")
         if work_type:
             filters.append(f"type:{work_type}")
+        if author_search:
+            filters.append(f"authorships.author.display_name.search:{author_search}")
         return ",".join(filters)
 
     async def search(
@@ -328,6 +332,7 @@ class OpenAlexEngine:
         is_oa: bool = False,
         has_abstract: bool = False,
         work_type: str = "",
+        author_search: str = "",
         sort: str = "relevance_score:desc",
     ) -> OpenAlexSearchResult:
         """检索 OpenAlex 文献.
@@ -361,6 +366,7 @@ class OpenAlexEngine:
             is_oa=is_oa,
             has_abstract=has_abstract,
             work_type=work_type,
+            author_search=author_search,
         )
         if filters:
             params["filter"] = filters

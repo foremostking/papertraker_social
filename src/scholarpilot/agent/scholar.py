@@ -113,6 +113,10 @@ class ScholarAgent:
         self.eight_dim_stats: dict[str, Any] = {}
         self.feasibility: dict[str, Any] = {}
 
+        # 非交互模式（用于自动化测试或脚本调用）
+        self.non_interactive: bool = False
+        self.default_choices: dict[str, int] = {}  # 各交互步骤的默认选择
+
     async def run(self, user_input: str) -> None:
         """启动 Scholar Agent 工作流（支持断点续写）.
 
@@ -146,8 +150,14 @@ class ScholarAgent:
                     title="断点续写",
                 )
             )
-            from rich.prompt import Confirm
-            if Confirm.ask("是否从上次断点继续？", default=True):
+            should_resume = False
+            if self.non_interactive:
+                self.console.print("  [dim][非交互模式] 自动从断点继续[/dim]")
+                should_resume = True
+            else:
+                from rich.prompt import Confirm
+                should_resume = Confirm.ask("是否从上次断点继续？", default=True)
+            if should_resume:
                 resume = True
                 completed_phases = progress.get("completed_phases", [])
                 completed_sections = progress.get("completed_sections", [])
@@ -414,19 +424,18 @@ class ScholarAgent:
         # ── 多源检索：Semantic Scholar + arXiv ──────────────
         self.console.print("\n[dim]🔍 正在并行检索英文文献源（Semantic Scholar + arXiv）...[/dim]")
 
-        # 构建 Semantic Scholar 查询
-        ss_query = SemanticScholarEngine.build_query_from_topic(
-            topic=topic, region=region, content=content,
-        )
+        # 构建 Semantic Scholar 查询（使用英文翻译，与 OpenAlex 一致）
+        ss_query = self._build_english_query(topic, region, content)
         year_filter = f"{year_start}-{year_end}" if year_start and year_end else ""
 
-        # 构建 arXiv 查询
+        # 构建 arXiv 查询（同样使用英文翻译）
+        arxiv_query_en = self._build_english_query(topic, region, content)
         arxiv_query = ArxivEngine.build_query(
-            all_fields=topic,
+            all_fields=arxiv_query_en,
             category="econ.GN",  # General Economics
         )
         if not arxiv_query:
-            arxiv_query = f"all:{topic}"
+            arxiv_query = f"all:{arxiv_query_en}"
 
         # 并行检索
         ss_task = self.ss_engine.search(
@@ -683,6 +692,26 @@ class ScholarAgent:
             "路径依赖": "path dependence",
             "制度变迁": "institutional change",
             "机制分析": "mechanism analysis",
+            # 数字经济/创新
+            "数字经济": "digital economy",
+            "数字化转型": "digital transformation",
+            "绿色创新": "green innovation",
+            "企业创新": "enterprise innovation",
+            "技术创新": "technological innovation",
+            "创新绩效": "innovation performance",
+            "绿色转型": "green transformation",
+            "ESG": "ESG",
+            "可持续发展": "sustainable development",
+            "碳排放": "carbon emission",
+            "能源转型": "energy transition",
+            "上市公司": "listed companies",
+            "A股": "A-share",
+            "面板数据": "panel data",
+            "中介效应": "mediating effect",
+            "调节效应": "moderating effect",
+            "异质性分析": "heterogeneity analysis",
+            "稳健性检验": "robustness check",
+            "内生性": "endogeneity",
             # 区域
             "中国": "China",
             "中国西部": "western China",
@@ -693,7 +722,7 @@ class ScholarAgent:
             "省级": "provincial",
         }
 
-        # 逐段翻译
+        # 逐段翻译：只保留匹配到的英文关键词，丢弃未翻译的中文残文
         parts = []
         for text in [topic, content, region]:
             if not text:
@@ -702,18 +731,14 @@ class ScholarAgent:
             if text.strip() in CN_EN_MAP:
                 parts.append(CN_EN_MAP[text.strip()])
                 continue
-            # 尝试子串匹配：在原文中查找已知的中文关键词
-            translated = text
-            found_any = False
+            # 子串匹配：提取所有已知中文关键词的英文翻译
+            found_keywords = []
             for cn, en in sorted(CN_EN_MAP.items(), key=lambda x: -len(x[0])):
-                if cn in translated:
-                    translated = translated.replace(cn, f" {en} ")
-                    found_any = True
-            if found_any:
-                parts.append(translated.strip())
-            elif text == region:
-                # 区域未匹配，用通用翻译
-                parts.append("China" if "中国" in text or "西部" in text else "")
+                if cn in text:
+                    found_keywords.append(en)
+                    text = text.replace(cn, " ")  # 移除已匹配部分避免重复
+            if found_keywords:
+                parts.append(" ".join(found_keywords))
 
         # 去重去空
         seen = set()
@@ -1226,18 +1251,23 @@ class ScholarAgent:
             "  [cyan]3[/cyan]. 查看数据采集指南内容"
         )
 
-        from rich.prompt import IntPrompt
+        # 非交互模式：使用默认选择
+        if self.non_interactive:
+            choice = self.default_choices.get("data_collection", 2)
+            self.console.print(f"  [dim][非交互模式] 自动选择: {choice}[/dim]")
+        else:
+            from rich.prompt import IntPrompt
 
-        while True:
-            choice = IntPrompt.ask("请输入选项", default=2, choices=["1", "2", "3"])
-            if choice == 3:
-                # 显示指南前50行
-                self.console.print("\n[dim]--- 数据采集指南（前50行）---[/dim]")
-                for line in guide_content.split("\n")[:50]:
-                    self.console.print(line)
-                self.console.print("[dim]--- 完整指南请查看 data_collection_guide.md ---\n[/dim]")
-                continue
-            break
+            while True:
+                choice = IntPrompt.ask("请输入选项", default=2, choices=["1", "2", "3"])
+                if choice == 3:
+                    # 显示指南前50行
+                    self.console.print("\n[dim]--- 数据采集指南（前50行）---[/dim]")
+                    for line in guide_content.split("\n")[:50]:
+                        self.console.print(line)
+                    self.console.print("[dim]--- 完整指南请查看 data_collection_guide.md ---\n[/dim]")
+                    continue
+                break
 
         if choice == 1:
             # 用户提供了数据
@@ -1325,6 +1355,9 @@ class ScholarAgent:
             self.console.print(f"\n[green]检测到数据文件: {data_files[0].name}[/green]")
             self.console.print(f"  路径: {data_files[0]}")
 
+            if self.non_interactive:
+                self.console.print("  [dim][非交互模式] 自动跳过数据补交[/dim]")
+                return False
             from rich.prompt import Confirm
             if Confirm.ask("是否基于该数据重新生成实证章节？", default=True):
                 await self._regenerate_empirical_sections(data_files[0])
@@ -1339,6 +1372,9 @@ class ScholarAgent:
                 "  2. 将数据保存为 CSV/Excel 放入 data/ 文件夹\n"
                 "  3. 重新运行项目，系统会自动检测并提示\n"
             )
+            if self.non_interactive:
+                self.console.print("  [dim][非交互模式] 自动继续[/dim]")
+                return False
             from rich.prompt import Confirm
             if Confirm.ask("是否继续查看当前草稿？", default=True):
                 return False
@@ -1572,8 +1608,29 @@ class ScholarAgent:
             f"（中文 {zh_count}，英文 {en_count}）[/green]"
         )
 
-        # 2. 验证引用
-        self.console.print("[dim]🔍 正在验证引用真实性（CNKI + OpenAlex）...[/dim]")
+        # 2. 构建主题关键词和文献池（用于提高验证准确性）
+        topic_info = self.topic_info or {}
+        topic_keywords = " ".join(filter(None, [
+            topic_info.get("core_topic", ""),
+            topic_info.get("region", ""),
+            topic_info.get("content", ""),
+        ]))
+        # 从主题中提取核心关键词（取前几个词）
+        import re as _re
+        kw_parts = _re.findall(r'[\u4e00-\u9fff]{2,6}|[a-zA-Z]{3,}', topic_keywords)
+        topic_keywords = " ".join(kw_parts[:6]) if kw_parts else ""
+
+        # 构建 Phase 2 文献池（从全局文献库中获取）
+        literature_pool: list[dict] = []
+        try:
+            all_papers = self.library.list_all()
+            literature_pool = [p.to_dict() for p in all_papers]
+            self.console.print(f"  [dim]文献池: {len(literature_pool)} 篇已检索文献可供匹配[/dim]")
+        except Exception as e:
+            logger.debug(f"无法获取文献池: {e}")
+
+        # 3. 验证引用
+        self.console.print("[dim]🔍 正在验证引用真实性（文献池匹配 + CNKI + OpenAlex）...[/dim]")
         try:
             from scholarpilot.mcp.servers.cnki.aiohttp_engine import CNKIAiohttpEngine
             cnki_engine = CNKIAiohttpEngine()
@@ -1593,6 +1650,8 @@ class ScholarAgent:
             cnki_engine=cnki_engine,
             openalex_engine=openalex_engine,
             concurrency=3,
+            topic_keywords=topic_keywords,
+            literature_pool=literature_pool,
         )
 
         # 关闭引擎
@@ -1629,6 +1688,39 @@ class ScholarAgent:
         ref_path = self.project_dir / "draft" / "references.md"
         ref_path.write_text(ref_list, encoding="utf-8")
         self.console.print(f"  [green]参考文献列表已保存: {ref_path}[/green]")
+
+        # 5b. 保存 BibTeX 文件
+        bib_lines = ["% BibTeX references (auto-generated by ScholarPilot)"]
+        bib_count = 0
+        for i, c in enumerate(verified_citations, 1):
+            if not c.verified and not c.title:
+                continue
+            bib_key = f"ref{i}"
+            if c.authors:
+                author_str = " and ".join(c.authors[:5])
+            else:
+                author_str = "Unknown"
+            bib_lines.append("")
+            bib_lines.append(f"@article{{{bib_key},")
+            bib_lines.append(f"  author = {{{author_str}}},")
+            if c.title:
+                bib_lines.append(f"  title = {{{{{c.title}}}}},")
+            if c.journal:
+                bib_lines.append(f"  journal = {{{c.journal}}},")
+            bib_lines.append(f"  year = {{{c.year}}},")
+            if c.volume:
+                bib_lines.append(f"  volume = {{{c.volume}}},")
+            if c.issue:
+                bib_lines.append(f"  number = {{{c.issue}}},")
+            if c.pages:
+                bib_lines.append(f"  pages = {{{c.pages}}},")
+            if c.doi:
+                bib_lines.append(f"  doi = {{{c.doi}}},")
+            bib_lines.append("}")
+            bib_count += 1
+        bib_path = self.project_dir / "literature" / "references.bib"
+        bib_path.write_text("\n".join(bib_lines), encoding="utf-8")
+        self.console.print(f"  [green]BibTeX 已保存: {bib_path}（{bib_count} 条）[/green]")
 
         # 6. 追加到完整草稿
         updated_draft = full_text + "\n\n---\n\n" + ref_list + "\n\n---\n\n" + ai_disclosure
@@ -1677,7 +1769,8 @@ class ScholarAgent:
         draft_path.write_text(merged, encoding="utf-8")
         self.console.print(f"\n[green]完整草稿已合并: {draft_path}[/green]")
 
-    def _extract_sections_from_md(self, md: str) -> list[dict]:
+    @staticmethod
+    def _extract_sections_from_md(md: str) -> list[dict]:
         """从 Markdown 大纲提取章节信息.
 
         支持两种格式：
@@ -1686,7 +1779,12 @@ class ScholarAgent:
 
         过滤规则：排除非正文章节（如"大纲概览"、"详细大纲"等元信息标题）。
         只保留包含"第X章"或数字编号的正式章节标题。
+        自动清洗思考过程标记，确保不受 LLM 输出前缀干扰。
         """
+        # 先清洗思考过程标记
+        from scholarpilot.llm.gateway import LLMGateway
+        md = LLMGateway._clean_llm_output(md)
+
         # 非正文章节标题关键词（出现在标题中则跳过）
         NON_SECTION_KEYWORDS = [
             "大纲概览", "详细大纲", "概述", "目录", "章节结构",
@@ -1709,22 +1807,41 @@ class ScholarAgent:
 
                 # 过滤非正文章节
                 is_non_section = any(kw in title for kw in NON_SECTION_KEYWORDS)
-                # 正文章节应包含"第"或"引言"/"结论"/"绪论"
+                # 正文章节识别：支持"第X章"、"一、引言"、"1. 引言"等多种格式
                 is_real_section = (
                     "第" in title
                     or "引言" in title
                     or "结论" in title
                     or "绪论" in title
                     or "导论" in title
+                    or "文献综述" in title
+                    or "研究设计" in title
+                    or "实证" in title
+                    or "模型" in title
+                    or "分析" in title
+                    or "检验" in title
+                    or "稳健" in title
+                    or "机制" in title
+                    or "异质" in title
+                    or "政策" in title
+                    or "建议" in title
+                    # 中文数字编号：一、二、三、四、五、六、七、八、九、十
+                    or re.match(r"^[一二三四五六七八九十]+[、\.]", title) is not None
+                    # 阿拉伯数字编号：1. 2. 3.
+                    or re.match(r"^\d+[\.、]", title) is not None
                 )
 
                 if is_non_section or not is_real_section:
                     current_section = None
                     continue
 
+                # 从标题中提取字数（如"一、引言（约1500字）" → 1500）
+                wc_match = re.search(r"约?(\d{3,6})\s*字", title)
+                word_count = int(wc_match.group(1)) if wc_match else 2000
+
                 current_section = {
                     "title": title,
-                    "word_count": 2000,
+                    "word_count": word_count,
                     "subsections": [],
                     "key_points": [],
                 }
@@ -1769,6 +1886,10 @@ class ScholarAgent:
             self.console.print(Panel(preview, title=f"{filename} 预览", border_style="blue"))
 
         # 等待用户输入
+        if self.non_interactive:
+            self.console.print("  [dim][非交互模式] 自动确认[/dim]")
+            return True
+
         choice = Prompt.ask(
             "\n请选择",
             choices=["confirm", "modify", "skip", "exit"],
@@ -1794,7 +1915,15 @@ class ScholarAgent:
 
     @staticmethod
     def _extract_json(text: str) -> dict[str, Any] | None:
-        """从 LLM 响应中提取 JSON."""
+        """从 LLM 响应中提取 JSON.
+
+        自动清洗思考过程标记和 markdown 代码块包裹，
+        确保即使 LLM 输出含 [💭 思考] 等前缀也能正确提取 JSON。
+        """
+        # 先清洗思考过程标记
+        from scholarpilot.llm.gateway import LLMGateway
+        text = LLMGateway._clean_llm_output(text)
+
         # 尝试直接解析
         try:
             return json.loads(text)

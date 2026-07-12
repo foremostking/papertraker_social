@@ -11,6 +11,10 @@ from typing import Any, AsyncIterator, Optional
 
 import litellm
 
+# 禁用 litellm 远程模型价格表获取（避免 SSL 证书警告）
+# 必须在 import litellm 后立即设置，在任何 LLM 调用之前生效
+litellm.model_cost_default_url = ""
+
 from scholarpilot.config import Settings
 
 logger = logging.getLogger(__name__)
@@ -50,6 +54,8 @@ class LLMGateway:
             config: ScholarPilot 配置对象。
         """
         self.config = config
+        # 禁用 litellm 远程模型价格表获取（避免 SSL 证书警告）
+        litellm.model_cost_default_url = ""
         self._setup_api_keys()
 
     def _setup_api_keys(self) -> None:
@@ -110,6 +116,65 @@ class LLMGateway:
             if model_lower.startswith(prefix):
                 return getattr(self.config, key_field, None) or None
         return None
+
+    @staticmethod
+    def _clean_llm_output(content: str) -> str:
+        """清洗 LLM 输出，去除思考过程前缀和 markdown 代码块包裹.
+
+        某些模型（如 DeepSeek V3 通过火山方舟）会在正式内容前添加
+        思考过程标记（如 [💭 思考]、[🔧 执行]），以及用 ```markdown
+        包裹正文。本方法去除这些多余内容，只保留正文。
+
+        Args:
+            content: LLM 原始返回内容。
+
+        Returns:
+            清洗后的内容。
+        """
+        import re
+
+        lines = content.split("\n")
+        cleaned_lines: list[str] = []
+        in_code_block = False
+        skip_until_content = True
+
+        for line in lines:
+            stripped = line.strip()
+
+            # 跳过思考过程标记行（如 [💭 思考] xxx、[🔧 执行] xxx）
+            if re.match(r"^\[(💭|🔧|✅|❌|📝|📋|🔍|📊|💡|⚠️|🎯|✨|📚|🏗️|🔧)\s*", stripped):
+                skip_until_content = True
+                continue
+
+            # 跳过 ```markdown 开头行
+            if stripped.lower().startswith("```markdown"):
+                in_code_block = True
+                skip_until_content = False
+                continue
+
+            # 跳过 ``` 开头行（非 markdown 的代码块）
+            if stripped == "```" and in_code_block:
+                in_code_block = False
+                continue
+
+            # 如果还在跳过阶段，跳过空行
+            if skip_until_content:
+                if not stripped:
+                    continue
+                # 遇到第一个实际内容行，停止跳过
+                skip_until_content = False
+
+            cleaned_lines.append(line)
+
+        result = "\n".join(cleaned_lines).strip()
+
+        # 如果整个内容被 ``` 包裹但没有 markdown 标记，提取内部内容
+        if result.startswith("```") and result.endswith("```"):
+            lines = result.split("\n")
+            if len(lines) >= 3:
+                result = "\n".join(lines[1:-1]).strip()
+
+        return result
 
     # 空响应最大重试次数
     MAX_EMPTY_RETRIES = 3
@@ -175,7 +240,10 @@ class LLMGateway:
 
                 content = response.choices[0].message.content
                 if content and content.strip():
-                    return content
+                    # 清洗 LLM 输出：去除思考过程前缀（如 [💭 思考]、[🔧 执行] 等）
+                    content = self._clean_llm_output(content)
+                    if content.strip():
+                        return content
 
                 # 空响应 — 记录并重试
                 last_error_info = (
