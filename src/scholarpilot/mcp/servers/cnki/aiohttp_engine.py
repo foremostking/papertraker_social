@@ -197,7 +197,16 @@ class CNKIAiohttpEngine:
         """是否有 Cookie."""
         return bool(self._cookies)
 
-    # ===== QueryJson 构建 =====
+    # ===== 检索式构建 =====
+
+    # CNKI 专业检索字段代码（参考 CNKI 检索手册 1.2.5.2）
+    FIELD_CODES = {
+        "SU": "主题", "TI": "题名", "KY": "关键词", "AB": "摘要",
+        "FT": "全文", "AU": "作者", "FI": "第一责任人", "RP": "通讯作者",
+        "AF": "机构", "JN": "文献来源", "RF": "参考文献", "YE": "年",
+        "FU": "基金", "CLC": "分类号", "SN": "ISSN", "CN": "统一刊号",
+        "IB": "ISBN", "CF": "被引频次",
+    }
 
     @staticmethod
     def build_query(
@@ -207,19 +216,27 @@ class CNKIAiohttpEngine:
         year_start: str = "",
         year_end: str = "",
     ) -> str:
-        """构建 CNKI 检索式（SU%= 语法）.
+        """构建 CNKI 专业检索式.
 
-        CNKI 对长句和复杂检索式的支持有限，应尽量使用简洁的核心关键词。
-        如果 topic 是长句（>15字），只取前 15 字作为核心主题。
-        content 如果太长（>20字），会截断为前 20 字。
+        根据 CNKI 检索手册（1.2.5），使用专业检索语法：
+        - SU %= '关键词'  主题相关匹配（推荐）
+        - AU = '作者名'   作者精确匹配
+        - KY = '关键词'   关键词精确匹配
+        - TI % '篇名'    篇名模糊匹配
+        - YE BETWEEN('2022','2023')  年份范围
+        - CF > 0         被引频次筛选
+        - 字段间用 AND/OR/NOT 连接
+        - 同字段内用 *（与）/ +（或）/ -（非）组合
 
         Args:
             topic: 核心主题。
             region: 研究区域。
             content: 研究内容。
+            year_start: 起始年份（可选，也可在 search 方法中指定）。
+            year_end: 结束年份。
 
         Returns:
-            CNKI 检索式字符串。
+            CNKI 检索式字符串，如 "SU %= '数字经济' AND SU %= '绿色创新'".
         """
         # CNKI SU%= 对长句支持差，必须拆成 4-8 字核心关键词
         def extract_core(text: str, max_len: int = 8) -> str:
@@ -249,10 +266,94 @@ class CNKIAiohttpEngine:
 
         parts = []
         if core_topic:
-            parts.append(f"SU%='{core_topic}'")
+            parts.append(f"SU %= '{core_topic}'")
         if core_content and core_content not in core_topic:
-            parts.append(f"SU%='{core_content}'")
-        return " AND ".join(parts) if parts else f"SU%='{core_topic}'"
+            parts.append(f"SU %= '{core_content}'")
+        return " AND ".join(parts) if parts else f"SU %= '{core_topic}'"
+
+    @staticmethod
+    def build_professional_query(
+        subject: str = "",
+        title: str = "",
+        keyword: str = "",
+        author: str = "",
+        affiliation: str = "",
+        journal: str = "",
+        year_start: str = "",
+        year_end: str = "",
+        fund: str = "",
+        min_citations: int = 0,
+    ) -> str:
+        """构建 CNKI 专业检索式（完整字段支持）.
+
+        根据 CNKI 检索手册 1.2.5，支持多字段组合检索：
+        - 主题（SU）: 相关匹配 %=
+        - 篇名（TI）: 模糊匹配 %
+        - 关键词（KY）: 精确匹配 =
+        - 作者（AU）: 精确匹配 =
+        - 机构（AF）: 精确匹配 =
+        - 文献来源（JN）: 精确匹配 =
+        - 年份（YE）: BETWEEN
+        - 基金（FU）: 精确匹配 =
+        - 被引频次（CF）: > >= < <=
+
+        同字段内支持复合运算符：
+        - * : 同时包含（AND）
+        - + : 包含其一（OR）
+        - - : 包含前者但不包含后者（NOT）
+
+        Args:
+            subject: 主题词（支持 * + - 组合）.
+            title: 篇名词.
+            keyword: 关键词.
+            author: 作者名.
+            affiliation: 机构名.
+            journal: 文献来源（期刊名）.
+            year_start: 起始年份.
+            year_end: 结束年份.
+            fund: 基金名称.
+            min_citations: 最低被引频次（0=不筛选）.
+
+        Returns:
+            CNKI 专业检索式字符串.
+
+        Examples:
+            >>> build_professional_query(subject="数字经济 * 绿色创新", author="王磊", year_start="2022", year_end="2023")
+            "SU %= '数字经济 * 绿色创新' AND AU = '王磊' AND YE BETWEEN ('2022', '2023')"
+        """
+        parts = []
+
+        if subject:
+            parts.append(f"SU %= '{subject}'")
+        if title:
+            parts.append(f"TI % '{title}'")
+        if keyword:
+            parts.append(f"KY = '{keyword}'")
+        if author:
+            parts.append(f"AU = '{author}'")
+        if affiliation:
+            parts.append(f"AF = '{affiliation}'")
+        if journal:
+            parts.append(f"JN = '{journal}'")
+        if fund:
+            parts.append(f"FU = '{fund}'")
+
+        # 年份范围
+        if year_start and year_end:
+            if year_start == year_end:
+                parts.append(f"YE = '{year_start}'")
+            else:
+                parts.append(f"YE BETWEEN ('{year_start}', '{year_end}')")
+        elif year_start:
+            parts.append(f"YE >= '{year_start}'")
+        elif year_end:
+            parts.append(f"YE <= '{year_end}'")
+
+        # 被引频次筛选
+        if min_citations > 0:
+            parts.append(f"CF >= {min_citations}")
+
+        return " AND ".join(parts) if parts else "SU %= ''"
 
     @staticmethod
     def build_query_json(
@@ -260,14 +361,28 @@ class CNKIAiohttpEngine:
         year_start: str = "2020",
         year_end: str = "2026",
         author: str = "",
+        journal: str = "",
+        affiliation: str = "",
+        min_citations: int = 0,
     ) -> str:
         """构建 QueryJson 参数（复刻 papertracker_social 格式）.
 
+        根据 CNKI 检索手册，每个检索字段对应一个独立的 QGroup 条目：
+        - Subject (EXPERT): 主题检索式
+        - Author (AU): 作者精确匹配
+        - Journal (JN): 文献来源精确匹配
+        - Affiliation (AF): 机构精确匹配
+        - CitedFreq (CF): 被引频次筛选
+        - ControlGroup: 年份范围
+
         Args:
-            search_query: CNKI 检索式（如 SU%='地方政府债务'）。
+            search_query: CNKI 检索式（如 SU %= '地方政府债务'）。
             year_start: 起始年份。
             year_end: 结束年份。
-            author: 作者名（可选，添加 AU%= 作者检索字段）。
+            author: 作者名（AU= 精确匹配）。
+            journal: 文献来源/期刊名（JN= 精确匹配）。
+            affiliation: 机构名（AF= 精确匹配）。
+            min_citations: 最低被引频次（0=不筛选）。
 
         Returns:
             JSON 字符串。
@@ -292,7 +407,7 @@ class CNKIAiohttpEngine:
             },
         ]
 
-        # 添加作者检索字段（AU%=）
+        # 作者检索字段（AU= 精确匹配）
         if author:
             q_group.append({
                 "Key": "Author",
@@ -306,6 +421,66 @@ class CNKIAiohttpEngine:
                         "Field": "AU",
                         "Operator": 0,
                         "Value": author,
+                        "Value2": "",
+                    }
+                ],
+                "ChildItems": [],
+            })
+
+        # 文献来源检索字段（JN= 精确匹配）
+        if journal:
+            q_group.append({
+                "Key": "Journal",
+                "Title": "文献来源",
+                "Logic": 0,
+                "Items": [
+                    {
+                        "Key": "Journal",
+                        "Title": "",
+                        "Logic": 0,
+                        "Field": "JN",
+                        "Operator": 0,
+                        "Value": journal,
+                        "Value2": "",
+                    }
+                ],
+                "ChildItems": [],
+            })
+
+        # 机构检索字段（AF= 精确匹配）
+        if affiliation:
+            q_group.append({
+                "Key": "Affiliation",
+                "Title": "机构",
+                "Logic": 0,
+                "Items": [
+                    {
+                        "Key": "Affiliation",
+                        "Title": "",
+                        "Logic": 0,
+                        "Field": "AF",
+                        "Operator": 0,
+                        "Value": affiliation,
+                        "Value2": "",
+                    }
+                ],
+                "ChildItems": [],
+            })
+
+        # 被引频次筛选（CF >= N）
+        if min_citations > 0:
+            q_group.append({
+                "Key": "CitedFreq",
+                "Title": "被引频次",
+                "Logic": 0,
+                "Items": [
+                    {
+                        "Key": "CitedFreq",
+                        "Title": "",
+                        "Logic": 0,
+                        "Field": "CF",
+                        "Operator": 3,  # >=
+                        "Value": str(min_citations),
                         "Value2": "",
                     }
                 ],
@@ -367,28 +542,59 @@ class CNKIAiohttpEngine:
         year_end: str = "2026",
         sort_field: str = "FFD",
         author: str = "",
+        journal: str = "",
+        affiliation: str = "",
+        min_citations: int = 0,
     ) -> CNKISearchResult:
         """执行 CNKI 检索.
 
+        支持 CNKI 检索手册中的多种筛选条件：
+        - 主题检索（SU %=）
+        - 作者检索（AU =）
+        - 机构检索（AF =）
+        - 文献来源检索（JN =）
+        - 年份范围（YE BETWEEN）
+        - 被引频次筛选（CF >=）
+        - 排序：FFD=发表时间, RU=被引, 空=相关度
+
         Args:
-            query: 检索词或检索式。如果是纯文本（不含 SU%=），自动构建检索式。
+            query: 检索词或检索式。如果是纯文本（不含 SU %=），自动构建检索式。
             limit: 返回数量（最大 50）。
             page: 页码。
             year_start: 起始年份。
             year_end: 结束年份。
             sort_field: 排序字段（FFD=发表时间, RU=被引, 空=相关度）。
-            author: 作者名（可选，添加 AU%= 作者检索字段，用于引用验证）。
+            author: 作者名（精确匹配 AU=，用于引用验证）。
+            journal: 文献来源/期刊名（精确匹配 JN=）。
+            affiliation: 机构名（精确匹配 AF=）。
+            min_citations: 最低被引频次（0=不筛选）。
 
         Returns:
             CNKISearchResult: 检索结果。
         """
         # 构建检索式
-        if "SU%=" not in query and "TI%=" not in query:
-            search_query = self.build_query(query)
-        else:
+        # 检测是否已是专业检索式（含 SU %= / AU = / KY = 等语法）
+        is_pro = any(
+            f"{code} %=" in query or f"{code} =" in query or f"{code} %" in query
+            for code in ["SU", "TI", "KY", "AB", "AU", "AF", "JN", "FT", "FU"]
+        )
+        if is_pro:
             search_query = query
+        elif "SU%=" in query or "TI%=" in query:
+            # 兼容旧格式 SU%= → 转为新格式 SU %=
+            search_query = query.replace("SU%=", "SU %=").replace("TI%=", "TI %")
+        else:
+            # 纯文本 → 自动构建检索式
+            search_query = self.build_query(query)
 
-        query_json = self.build_query_json(search_query, year_start, year_end, author=author)
+        # 额外筛选条件通过 QGroup 传入（不拼进检索式字符串）
+        # 这样每个字段是独立的 QGroup 条目，CNKI API 能正确解析
+
+        query_json = self.build_query_json(
+            search_query, year_start, year_end,
+            author=author, journal=journal,
+            affiliation=affiliation, min_citations=min_citations,
+        )
 
         post_data = {
             "boolSearch": "true",
