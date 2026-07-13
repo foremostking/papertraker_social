@@ -1840,5 +1840,152 @@ def plot_cmd(
         console.print("[dim]支持的数据驱动类型: distribution, boxplot, corr[/dim]")
 
 
+@app.command(name="parse-result")
+def parse_result(
+    project: str = typer.Argument(..., help="项目名称"),
+    file: str = typer.Option("", "--file", "-f", help="回归输出文件路径"),
+    source: str = typer.Option("auto", "--source", "-s", help="输出格式: auto/stata/r/python/json"),
+    output: str = typer.Option("", "--output", "-o", help="输出路径（默认 analysis/parsed_result.md）"),
+):
+    """解析回归输出——从 Stata/R/Python 日志提取系数/标准误/p值.
+
+    \b
+    科研场景：研究生用 Stata/R 跑完回归后，需要把输出结果
+    整理成论文表格。本命令自动解析日志文件，提取系数、标准误、
+    p 值等关键信息，生成 Markdown 表格。
+
+    \b
+    用法:
+      scholarpilot parse-result debt_paper --file data/stata_output.log
+      scholarpilot parse-result debt_paper --file data/r_output.txt --source r
+      scholarpilot parse-result debt_paper --file data/result.json --source json
+    """
+    from scholarpilot.tools.result_parser import ResultParser
+
+    fm = _get_file_manager()
+    project_dir = fm.get_project_dir(project)
+    if not project_dir:
+        console.print(f"[red]项目不存在: {project}[/red]")
+        raise typer.Exit(1)
+
+    if not file:
+        console.print("[red]请用 --file 指定回归输出文件路径[/red]")
+        raise typer.Exit(1)
+
+    file_path = Path(file)
+    if not file_path.is_absolute():
+        file_path = project_dir / file_path
+
+    if not file_path.exists():
+        console.print(f"[red]文件不存在: {file_path}[/red]")
+        raise typer.Exit(1)
+
+    parser = ResultParser()
+    try:
+        result = parser.parse_file(file_path, source=source)
+    except Exception as e:
+        console.print(f"[red]解析失败: {e}[/red]")
+        raise typer.Exit(1)
+
+    # 输出 Markdown 表格
+    md_text = parser.to_markdown(result, title=f"回归结果（来源: {result['source']}）")
+
+    output_path = Path(output) if output else project_dir / "analysis" / "parsed_result.md"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(md_text, encoding="utf-8")
+
+    console.print(f"[green]解析完成！结果已保存: {output_path}[/green]")
+    console.print(f"[dim]模型类型: {result['model_type']}, 变量数: {len(result['variables'])}[/dim]")
+    if result.get("n_obs"):
+        console.print(f"[dim]观测数: {result['n_obs']}[/dim]")
+    if result.get("r_squared") is not None:
+        console.print(f"[dim]R²: {result['r_squared']:.4f}[/dim]")
+
+
+@app.command(name="package")
+def package(
+    project: str = typer.Argument(..., help="项目名称或项目目录路径"),
+    output: str = typer.Option("", "--output", "-o", help="输出 zip 路径（默认 <project>_repro.zip）"),
+    include_data: bool = typer.Option(True, "--include-data/--no-include-data", help="是否包含 data/ 目录，默认 True"),
+    description: str = typer.Option("", "--description", "-d", help="项目描述（写入 README）"),
+    data_source: str = typer.Option("", "--data-source", help="数据来源说明（写入 README）"),
+):
+    """打包项目为可复现研究包（zip）.
+
+    \b
+    科研场景：论文投稿或数据共享时，需要将 data/ + code/ + paper/
+    连同依赖锁文件、Makefile、README、溯源清单一起打包，供审稿人
+    和读者复现研究。本命令自动完成打包。
+
+    \b
+    生成内容：
+      - data/ + code/ + paper/ 项目内容
+      - requirements.txt（pip freeze 锁定版本）
+      - Makefile（make data / make analysis / make paper）
+      - README.md（项目说明、运行步骤、依赖列表）
+      - manifest.json（输入/输出文件 SHA256 + 参数 + 依赖版本）
+
+    \b
+    用法：
+      scholarpilot package debt_paper
+      scholarpilot package debt_paper --output repro.zip
+      scholarpilot package debt_paper --no-include-data
+    """
+    from scholarpilot.tools.reproducibility import ReproducibilityPackager
+
+    fm = _get_file_manager()
+
+    # project 既可能是项目名称（在 projects_dir 下），也可能是直接的目录路径
+    project_dir = fm.get_project_dir(project)
+    if project_dir is None:
+        # 尝试作为直接路径解析
+        direct_path = Path(project)
+        if direct_path.exists() and direct_path.is_dir():
+            project_dir = direct_path
+        else:
+            console.print(f"[red]项目不存在: {project}[/red]")
+            raise typer.Exit(1)
+
+    # 默认输出路径
+    if output:
+        output_path = Path(output)
+        if not output_path.is_absolute():
+            output_path = project_dir.parent / output_path
+    else:
+        output_path = project_dir.parent / f"{project_dir.name}_repro.zip"
+
+    packager = ReproducibilityPackager()
+    try:
+        zip_path = packager.package(
+            project_dir=project_dir,
+            output_path=output_path,
+            include_data=include_data,
+            project_name=project_dir.name,
+            description=description,
+            data_source=data_source,
+        )
+    except Exception as e:
+        console.print(f"[red]打包失败: {e}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"[green]可复现研究包已生成: {zip_path}[/green]")
+    console.print(f"[dim]文件大小: {zip_path.stat().st_size} bytes[/dim]")
+    console.print(f"[dim]包含数据: {'是' if include_data else '否'}[/dim]")
+
+    # 展示包内文件列表
+    import zipfile as _zipfile
+
+    with _zipfile.ZipFile(zip_path, "r") as zf:
+        names = zf.namelist()
+    console.print(f"[dim]包内文件数: {len(names)}[/dim]")
+    table = Table(title="包内容", show_header=True, header_style="bold")
+    table.add_column("文件", style="cyan")
+    for name in names[:20]:
+        table.add_row(name)
+    if len(names) > 20:
+        table.add_row(f"...（共 {len(names)} 个文件）")
+    console.print(table)
+
+
 if __name__ == "__main__":
     app()
