@@ -115,6 +115,8 @@ def _get_dependency_versions() -> dict[str, str]:
     """获取已安装的关键依赖版本.
 
     使用 ``importlib.metadata`` 查询，缺失的包会被跳过。
+    对于 ``scholarpilot`` 自身，若元数据不可用（如开发模式 PYTHONPATH），
+    回退到 ``_get_scholarpilot_version()``。
 
     Returns:
         依赖名 -> 版本号 字典，如 ``{"numpy": "1.26.0", "pandas": "2.1.0"}``。
@@ -126,7 +128,15 @@ def _get_dependency_versions() -> dict[str, str]:
         try:
             deps[pkg] = version(pkg)
         except PackageNotFoundError:
-            logger.debug("依赖未安装，跳过: %s", pkg)
+            # scholarpilot 自身可能在开发模式（PYTHONPATH）下无元数据，回退
+            if pkg == "scholarpilot":
+                sp_ver = _get_scholarpilot_version()
+                if sp_ver and sp_ver != "unknown":
+                    deps[pkg] = sp_ver
+                else:
+                    logger.debug("scholarpilot 版本不可用（开发模式？）")
+            else:
+                logger.debug("依赖未安装，跳过: %s", pkg)
         except Exception:  # pragma: no cover - 防御性
             logger.debug("查询依赖版本失败: %s", pkg)
     return deps

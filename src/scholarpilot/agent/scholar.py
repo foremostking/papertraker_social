@@ -278,6 +278,9 @@ class ScholarAgent:
                 "[dim]已将本篇论文记录写入研究者画像（跨论文长期记忆）[/dim]"
             )
 
+            # Phase 8b: 去AI味 + 中文润色后处理
+            self._phase8b_deai_polish()
+
             # Phase 8 增强：显示质量报告 + 导出建议 + 实证工具提示
             self._phase8_post_completion()
 
@@ -1623,9 +1626,16 @@ class ScholarAgent:
         # 构建 Phase 2 文献池（从全局文献库中获取）
         literature_pool: list[dict] = []
         try:
-            all_papers = self.library.list_all()
-            literature_pool = [p.to_dict() for p in all_papers]
-            self.console.print(f"  [dim]文献池: {len(literature_pool)} 篇已检索文献可供匹配[/dim]")
+            # 优先获取当前项目的文献（Phase 2 检索结果）
+            project_papers = self.library.get_project_papers(self.project_name)
+            if project_papers:
+                literature_pool = project_papers
+                self.console.print(f"  [dim]文献池: {len(literature_pool)} 篇当前项目文献可供匹配[/dim]")
+            else:
+                # 回退到全局文献库（其他项目的文献也可能有用）
+                all_papers_dict = self.library.search(keyword="", limit=500)
+                literature_pool = all_papers_dict
+                self.console.print(f"  [dim]文献池: {len(literature_pool)} 篇全局文献库文献可供匹配[/dim]")
         except Exception as e:
             logger.debug(f"无法获取文献池: {e}")
 
@@ -2527,6 +2537,409 @@ class ScholarAgent:
         ):
             self.console.print("  [green]• 论文质量达标，可考虑导出投稿[/green]")
             self.console.print("  [dim]  导出命令: scholarpilot export <项目> -f docx[/dim]")
+
+    def _phase8b_deai_polish(self) -> None:
+        """Phase 8b: 去AI味 + 中文润色后处理.
+
+        在引用管理（Phase 7b）之后、post_completion 之前执行：
+        1. 对 full_draft.md 进行 AI 痕迹检测
+        2. 逐章运行去AI味处理（自动策略选择）
+        3. 对去AI味后文本进行中文润色
+        4. 保存 full_draft_polished.md 和 deai_report.md
+        5. 更新 state.json 记录完成状态
+
+        异常处理：去AI味或润色失败时记录日志但不中断流程。
+        """
+        from rich.panel import Panel
+
+        log = logging.getLogger(__name__)
+
+        self.console.print(
+            Panel(
+                "[bold cyan]去AI味 + 中文润色后处理[/bold cyan]\n"
+                "检测AI写作痕迹 → 逐章去AI味 → 中文润色 → 生成报告",
+                title="Phase 8b",
+                border_style="cyan",
+            )
+        )
+
+        # 非交互模式判断
+        if not self.non_interactive:
+            from rich.prompt import Confirm
+
+            try:
+                should_run = Confirm.ask(
+                    "是否执行去AI味和中文润色处理？",
+                    default=True,
+                )
+            except Exception:
+                should_run = True
+            if not should_run:
+                self.console.print("[yellow]已跳过去AI味和润色处理[/yellow]")
+                return
+        else:
+            self.console.print("  [dim][非交互模式] 自动执行去AI味和润色[/dim]")
+
+        # 读取 full_draft.md
+        draft_path = self.project_dir / "draft" / "full_draft.md"
+        if not draft_path.exists():
+            self.console.print("[yellow]草稿文件不存在，跳过去AI味处理[/yellow]")
+            log.warning("full_draft.md 不存在，跳过 Phase 8b")
+            return
+
+        full_text = draft_path.read_text(encoding="utf-8")
+        if not full_text.strip():
+            self.console.print("[yellow]草稿内容为空，跳过去AI味处理[/yellow]")
+            return
+
+        # 延迟导入去AI味和润色模块
+        try:
+            from scholarpilot.tools.de_ai import DeAIEngine
+            from scholarpilot.tools.polish_engine import PolishEngine
+        except ImportError as e:
+            log.error("导入去AI味/润色模块失败: %s", e)
+            self.console.print(f"[red]导入去AI味/润色模块失败: {e}[/red]")
+            return
+
+        deai_engine = DeAIEngine()
+        polish_engine = PolishEngine()
+
+        # ---- 1. AI痕迹检测（整体）----
+        self.console.print("\n[dim]检测AI写作痕迹...[/dim]")
+        try:
+            risk_before = deai_engine.detect_ai_patterns(full_text)
+        except Exception as e:
+            log.error("AI痕迹检测失败: %s", e)
+            self.console.print(f"[red]AI痕迹检测失败: {e}[/red]")
+            return
+
+        self.console.print(
+            f"  [cyan]处理前[/cyan] 风险等级: {risk_before.risk_level.value}, "
+            f"AI生成概率: {risk_before.ai_probability:.1%}, "
+            f"总体评分: {risk_before.overall_score:.1f}"
+        )
+        if risk_before.detected_patterns:
+            self.console.print(
+                f"  [dim]检测到AI模式: {', '.join(risk_before.detected_patterns)}[/dim]"
+            )
+
+        # ---- 2. 按章节拆分 ----
+        sections = self._split_draft_for_deai(full_text)
+        self.console.print(f"  [dim]共拆分 {len(sections)} 个章节[/dim]")
+
+        # ---- 3. 逐章去AI味 + 中文润色 ----
+        polished_sections: list[str] = []
+        deai_results: list = []
+        total_polish_changes = 0
+
+        for idx, section in enumerate(sections, 1):
+            title = section.get("title", f"章节{idx}")
+            content = section.get("content", "")
+
+            if not content.strip():
+                polished_sections.append(content)
+                continue
+
+            self.console.print(
+                f"  [dim]({idx}/{len(sections)}) 去AI味: {title}[/dim]"
+            )
+
+            # 去AI味处理（自动策略选择）
+            deai_result = None
+            try:
+                deai_result = deai_engine.process(content)
+                deai_results.append(deai_result)
+                processed_text = deai_result.processed_text
+            except Exception as e:
+                log.error("章节 '%s' 去AI味失败: %s", title, e)
+                self.console.print(
+                    f"    [yellow]去AI味失败，保留原文: {e}[/yellow]"
+                )
+                processed_text = content
+
+            # 中文润色
+            try:
+                polish_result = polish_engine.polish_chinese(processed_text)
+                polished_text = polish_result.polished_text
+                total_polish_changes += polish_result.change_count
+            except Exception as e:
+                log.error("章节 '%s' 中文润色失败: %s", title, e)
+                self.console.print(
+                    f"    [yellow]中文润色失败，使用去AI味结果: {e}[/yellow]"
+                )
+                polished_text = processed_text
+
+            polished_sections.append(polished_text)
+
+        # ---- 4. 合并结果 ----
+        polished_full = "\n\n---\n\n".join(polished_sections)
+
+        # ---- 5. 保存 full_draft_polished.md（不覆盖原草稿）----
+        polished_path = self.project_dir / "draft" / "full_draft_polished.md"
+        try:
+            polished_path.write_text(polished_full, encoding="utf-8")
+            self.console.print(
+                f"\n  [green]去AI味润色后草稿已保存: {polished_path}[/green]"
+            )
+        except Exception as e:
+            log.error("保存 full_draft_polished.md 失败: %s", e)
+            self.console.print(f"  [red]保存润色后草稿失败: {e}[/red]")
+
+        # ---- 6. 生成 deai_report.md（含前后风险对比）----
+        try:
+            risk_after = deai_engine.detect_ai_patterns(polished_full)
+        except Exception as e:
+            log.error("处理后AI风险检测失败: %s", e)
+            risk_after = risk_before  # 降级使用处理前的评估
+
+        report = self._generate_deai_report(
+            risk_before, risk_after, deai_results, total_polish_changes
+        )
+        report_path = self.project_dir / "draft" / "deai_report.md"
+        try:
+            report_path.write_text(report, encoding="utf-8")
+            self.console.print(
+                f"  [green]去AI味报告已保存: {report_path}[/green]"
+            )
+        except Exception as e:
+            log.error("保存 deai_report.md 失败: %s", e)
+            self.console.print(f"  [red]保存报告失败: {e}[/red]")
+
+        # 显示处理效果摘要
+        self.console.print(
+            f"\n  [cyan]处理后[/cyan] 风险等级: {risk_after.risk_level.value}, "
+            f"AI生成概率: {risk_after.ai_probability:.1%}, "
+            f"总体评分: {risk_after.overall_score:.1f}"
+        )
+        if risk_before.ai_probability > 0:
+            improvement = (
+                (risk_before.ai_probability - risk_after.ai_probability)
+                / risk_before.ai_probability * 100
+            )
+        else:
+            improvement = 0.0
+        self.console.print(
+            f"  [green]AI风险降低: {improvement:+.1f}%[/green]"
+        )
+
+        # ---- 7. 更新 state.json 记录去AI味和润色已完成 ----
+        try:
+            from datetime import datetime, timezone
+
+            state = self.file_manager.load_state(self.project_dir) or {}
+            state["deai_polish_completed"] = True
+            state["deai_polish_at"] = datetime.now(timezone.utc).isoformat()
+            state["deai_risk_before"] = {
+                "level": risk_before.risk_level.value,
+                "probability": risk_before.ai_probability,
+                "score": risk_before.overall_score,
+            }
+            state["deai_risk_after"] = {
+                "level": risk_after.risk_level.value,
+                "probability": risk_after.ai_probability,
+                "score": risk_after.overall_score,
+            }
+            state["deai_improvement"] = round(improvement, 1)
+            state["deai_sections_processed"] = len(deai_results)
+            state["deai_polish_changes"] = total_polish_changes
+            self.file_manager.save_state(self.project_dir, state)
+            log.info("state.json 已更新：去AI味和润色完成")
+        except Exception as e:
+            log.error("更新 state.json 失败: %s", e)
+            self.console.print(f"  [yellow]更新状态文件失败: {e}[/yellow]")
+
+    def _split_draft_for_deai(self, full_text: str) -> list[dict]:
+        """将完整草稿拆分为章节列表，用于去AI味处理.
+
+        按 ## 二级标题拆分；若无二级标题，则将整个文本作为单个章节处理。
+        保留每章的标题行在内容中。
+
+        Args:
+            full_text: 完整草稿文本.
+
+        Returns:
+            章节字典列表，每项含 title 和 content.
+        """
+        lines = full_text.split("\n")
+        sections: list[dict] = []
+        current_title = "标题/前言"
+        current_lines: list[str] = []
+
+        for line in lines:
+            # 匹配二级标题（## 开头，但不是 ### 或更深）
+            if line.startswith("## ") and not line.startswith("### "):
+                if current_lines:
+                    sections.append({
+                        "title": current_title,
+                        "content": "\n".join(current_lines),
+                    })
+                current_title = line.lstrip("# ").strip()
+                current_lines = [line]
+            else:
+                current_lines.append(line)
+
+        if current_lines:
+            sections.append({
+                "title": current_title,
+                "content": "\n".join(current_lines),
+            })
+
+        return sections
+
+    def _generate_deai_report(
+        self,
+        risk_before,
+        risk_after,
+        deai_results: list,
+        polish_changes: int,
+    ) -> str:
+        """生成去AI味与润色报告（Markdown格式）.
+
+        包含整体风险评估对比、检测到的AI写作模式、各章节处理摘要、
+        应用策略汇总、中文润色统计和总结建议。
+
+        Args:
+            risk_before: 处理前AI风险评估（AIRiskAssessment）.
+            risk_after: 处理后AI风险评估（AIRiskAssessment）.
+            deai_results: 各章节的去AI味处理结果列表（DeAIResult）.
+            polish_changes: 中文润色修改总数.
+
+        Returns:
+            Markdown 格式的报告字符串.
+        """
+        import datetime as _dt
+
+        lines: list[str] = []
+
+        lines.append("# ScholarPilot 去AI味与润色报告")
+        lines.append("")
+        lines.append(
+            f"> 生成时间: {_dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        lines.append("")
+
+        # 一、整体AI风险评估对比
+        lines.append("## 一、整体AI风险评估对比")
+        lines.append("")
+        lines.append("| 指标 | 处理前 | 处理后 | 变化 |")
+        lines.append("| --- | --- | --- | --- |")
+        lines.append(
+            f"| 风险等级 | {risk_before.risk_level.value} | "
+            f"{risk_after.risk_level.value} | "
+            f"{'降低' if risk_after.risk_level.value != risk_before.risk_level.value else '未变'} |"
+        )
+        lines.append(
+            f"| AI生成概率 | {risk_before.ai_probability:.1%} | "
+            f"{risk_after.ai_probability:.1%} | "
+            f"{(risk_after.ai_probability - risk_before.ai_probability):+.1%} |"
+        )
+        lines.append(
+            f"| 总体AI特征评分 | {risk_before.overall_score:.1f} | "
+            f"{risk_after.overall_score:.1f} | "
+            f"{(risk_after.overall_score - risk_before.overall_score):+.1f} |"
+        )
+        lines.append("")
+
+        # 二、检测到的AI写作模式
+        lines.append("## 二、检测到的AI写作模式")
+        lines.append("")
+        lines.append("### 处理前检测到的模式")
+        lines.append("")
+        if risk_before.detected_patterns:
+            for pattern in risk_before.detected_patterns:
+                still = "仍存在" if pattern in risk_after.detected_patterns else "已消除"
+                lines.append(f"- {pattern} —— {still}")
+        else:
+            lines.append("- 未检测到明显的AI写作模式")
+        lines.append("")
+        lines.append("### 处理后检测到的模式")
+        lines.append("")
+        if risk_after.detected_patterns:
+            for pattern in risk_after.detected_patterns:
+                lines.append(f"- {pattern}")
+        else:
+            lines.append("- 未检测到明显的AI写作模式")
+        lines.append("")
+
+        # 三、各章节处理摘要
+        lines.append("## 三、各章节处理摘要")
+        lines.append("")
+        if deai_results:
+            lines.append("| 章节 | 应用策略数 | 修改数 | 改善幅度 |")
+            lines.append("| --- | --- | --- | --- |")
+            for idx, result in enumerate(deai_results, 1):
+                lines.append(
+                    f"| 章节{idx} | {len(result.strategies_applied)} | "
+                    f"{len(result.changes)} | {result.improvement:+.1f}% |"
+                )
+            lines.append("")
+
+            # 策略汇总
+            strategy_counts: dict[str, int] = {}
+            for result in deai_results:
+                for s in result.strategies_applied:
+                    name = s.value if hasattr(s, "value") else str(s)
+                    strategy_counts[name] = strategy_counts.get(name, 0) + 1
+            if strategy_counts:
+                lines.append("### 应用策略汇总")
+                lines.append("")
+                lines.append("| 策略 | 使用次数 |")
+                lines.append("| --- | --- |")
+                for name, count in sorted(
+                    strategy_counts.items(), key=lambda x: -x[1]
+                ):
+                    lines.append(f"| {name} | {count} |")
+                lines.append("")
+        else:
+            lines.append("无章节处理结果。")
+            lines.append("")
+
+        # 四、中文润色统计
+        lines.append("## 四、中文润色统计")
+        lines.append("")
+        lines.append(f"- 中文润色修改总数: {polish_changes}")
+        lines.append("")
+
+        # 五、总结与建议
+        lines.append("## 五、总结与建议")
+        lines.append("")
+        if risk_before.ai_probability > 0:
+            improvement = (
+                (risk_before.ai_probability - risk_after.ai_probability)
+                / risk_before.ai_probability * 100
+            )
+        else:
+            improvement = 0.0
+
+        if improvement > 30:
+            lines.append("去AI味效果显著，AI风险已大幅降低。")
+        elif improvement > 10:
+            lines.append("去AI味效果较好，AI风险有所降低，建议进一步优化。")
+        elif improvement > 0:
+            lines.append("去AI味效果有限，建议尝试更多策略组合。")
+        else:
+            lines.append("去AI味效果不明显，建议人工复核或调整策略。")
+        lines.append("")
+
+        if risk_after.detected_patterns:
+            lines.append("**残留问题及建议**:")
+            lines.append("")
+            if "句式单一性" in risk_after.detected_patterns:
+                lines.append("- 进一步调整句式长度分布，制造长短交替")
+            if "套路化过渡词" in risk_after.detected_patterns:
+                lines.append("- 替换或删除残留的套路化过渡词")
+            if "过度对仗排比" in risk_after.detected_patterns:
+                lines.append("- 打破残留的对称排比结构")
+            if "过度精确表述" in risk_after.detected_patterns:
+                lines.append("- 将过度精确的数据改为约数表述")
+            if "机械的三段式结构" in risk_after.detected_patterns:
+                lines.append("- 打破残留的三段式结构")
+            lines.append("")
+
+        lines.append("---")
+        lines.append("*本报告由 ScholarPilot 去AI味引擎与润色引擎自动生成*")
+
+        return "\n".join(lines)
 
     def _phase8_post_completion(self) -> None:
         """Phase 8 后处理：质量报告 + 导出建议 + 实证工具提示."""

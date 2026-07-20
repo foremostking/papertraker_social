@@ -55,6 +55,38 @@ class Citation:
         }
 
 
+def _is_valid_zh_author(name: str, non_name_words: set[str]) -> bool:
+    """检查中文字符串是否像真实作者名.
+
+    Args:
+        name: 待检查的字符串
+        non_name_words: 非姓名用词集合
+
+    Returns:
+        True 如果像真实作者名，False 如果是误匹配
+    """
+    name = name.strip()
+    if not name:
+        return False
+
+    # 长度检查：中文姓名通常 2-4 字（少数民族名可达 5-6 字）
+    if len(name) < 2 or len(name) > 6:
+        return False
+
+    # 检查是否包含非姓名用词
+    for word in non_name_words:
+        if word in name:
+            return False
+
+    # 检查是否全是非姓名高频字
+    # 常见非姓名高频字（单独出现或组合出现都不像人名）
+    non_name_high_freq = set("的了在是为有对及或这与那其此该某本但而则即若")
+    if all(c in non_name_high_freq for c in name):
+        return False
+
+    return True
+
+
 def extract_citations_from_text(text: str) -> list[Citation]:
     """从正文中提取引用.
 
@@ -75,13 +107,35 @@ def extract_citations_from_text(text: str) -> list[Citation]:
     """
     citations = []
     seen: set[str] = set()
-
     # 中文常见非引用短语黑名单（避免误匹配"另一方面，1984"等）
     ZH_BLACKLIST = {
         "另一方面", "从排他性看", "一方面", "另一方面", "总而言之",
         "综上所述", "由此可见", "不难看出", "值得注意", "需要指出",
         "具体而言", "换言之", "与此同时", "不可否认", "毋庸置疑",
         "显而易见", "众所周知", "一般来说", "通常而言", "一般而言",
+        # 代词/指示词
+        "这与", "那与", "这与刘", "那与刘", "其与",
+        # 常见正文短语（2-6字）
+        "水平上显著", "上显著", "显著", "不显著", "正相关", "负相关",
+        "正相关关", "负相关关", "显著正相", "显著负相",
+        "水平上", "上显著", "为显著", "呈显著",
+        "系数为", "相关系", "相关系数",
+        "研究发现", "研究结论", "研究结",
+        "影响", "的结果", "的结果表",
+    }
+
+    # 中文非姓名用词（出现在作者名中则判定为误匹配）
+    ZH_NON_NAME_CHARS = {
+        # 常见动词/形容词/副词
+        "显著", "水平", "关系", "影响", "结果", "表明", "说明",
+        "发现", "系数", "相关", "回归", "模型", "变量", "数据",
+        "样本", "假设", "效应", "机制", "理论", "分析",
+        # 常见虚词/代词
+        "的", "了", "在", "为", "是", "有", "对", "及", "或",
+        "这", "那", "其", "此", "该", "某", "本", "该",
+        "与", "和", "但", "而", "则", "即", "若",
+        # 常见学术用语
+        "研究", "论文", "文献", "参考", "引用",
     }
 
     # 格式1: 中文作者（年份）— 兼容顿号、逗号、和/与 连接
@@ -129,6 +183,16 @@ def extract_citations_from_text(text: str) -> list[Citation]:
             seen.add(key)
             authors = re.split(r'[、，,]|和|与|及', authors_str)
             authors = [a.replace('等', '').strip() for a in authors if a.strip()]
+            # 作者名合理性过滤：移除非姓名用词导致的误匹配
+            valid_authors = [a for a in authors if _is_valid_zh_author(a, ZH_NON_NAME_CHARS)]
+            if not valid_authors:
+                # 所有作者名都不合理，丢弃此引用
+                continue
+            if len(valid_authors) < len(authors):
+                # 部分作者名不合理，说明正则误匹配了正文文本
+                # 只保留合理的作者名，并重建 raw
+                authors = valid_authors
+                raw = f"{'、'.join(authors)}（{year}）"
             citations.append(Citation(
                 raw=raw,
                 authors=authors,
@@ -148,6 +212,13 @@ def extract_citations_from_text(text: str) -> list[Citation]:
             seen.add(key)
             authors = re.split(r'[、，,]|和|与|及', authors_str)
             authors = [a.replace('等', '').strip() for a in authors if a.strip()]
+            # 作者名合理性过滤
+            valid_authors = [a for a in authors if _is_valid_zh_author(a, ZH_NON_NAME_CHARS)]
+            if not valid_authors:
+                continue
+            if len(valid_authors) < len(authors):
+                authors = valid_authors
+                raw = f"{'、'.join(authors)}，{year}"
             citations.append(Citation(
                 raw=raw,
                 authors=authors,
@@ -214,30 +285,48 @@ async def verify_citation(
     # 去掉 et al. 后缀
     first_author_clean = first_author.replace(" et al.", "").replace(" et al", "").strip()
 
-    # === 策略1: 在 Phase 2 文献池中交叉匹配 ===
+    # === 策略1: 在 Phase 2 文献池中多层匹配 ===
+    # 匹配优先级：
+    #   1a. 作者+年份精确匹配
+    #   1b. 作者+年份±1年模糊匹配（LLM 常记错年份）
+    #   1c. 作者+标题关键词匹配（忽略年份）
     if literature_pool:
+        # 1a: 精确年份匹配
         for paper in literature_pool:
             paper_year = str(paper.get("year", ""))
             if paper_year != citation.year:
                 continue
-            paper_authors = paper.get("authors", [])
-            if not paper_authors:
-                continue
-            # 提取第一作者姓氏进行匹配
-            for pa in paper_authors[:3]:
-                pa_lower = pa.lower().strip()
-                # 检查姓氏是否匹配（英文: 姓在前或后；中文: 全名匹配）
-                if (first_author_clean.lower() in pa_lower
-                    or pa_lower in first_author_clean.lower()
-                    or _match_surname(first_author_clean, pa)):
-                    citation.verified = True
-                    citation.source = paper.get("source", "literature_pool")
-                    citation.title = paper.get("title", "")
-                    citation.journal = paper.get("journal", "") or paper.get("venue", "")
-                    citation.doi = paper.get("doi", "")
-                    citation.abstract = paper.get("abstract", "")
-                    citation.authors = paper_authors[:5]
-                    citation.year = paper_year
+            if _match_paper_to_citation(paper, citation, first_author_clean):
+                _fill_citation_from_paper(citation, paper, "literature_pool")
+                return citation
+
+        # 1b: 年份±1年模糊匹配（LLM 常记错年份）
+        try:
+            cit_year_int = int(citation.year)
+        except ValueError:
+            cit_year_int = None
+
+        if cit_year_int is not None:
+            for paper in literature_pool:
+                paper_year_raw = paper.get("year", "")
+                try:
+                    paper_year_int = int(paper_year_raw)
+                except (ValueError, TypeError):
+                    continue
+                # 年份差1年以内
+                if abs(paper_year_int - cit_year_int) > 1:
+                    continue
+                if _match_paper_to_citation(paper, citation, first_author_clean):
+                    _fill_citation_from_paper(citation, paper, "literature_pool")
+                    citation.year = str(paper_year_int)  # 修正年份
+                    return citation
+
+        # 1c: 作者+标题关键词匹配（忽略年份，适用于经典文献）
+        # 仅当引用的作者名较长（≥3字符）时才做此匹配，避免误匹配
+        if len(first_author_clean) >= 3:
+            for paper in literature_pool:
+                if _match_paper_to_citation(paper, citation, first_author_clean):
+                    _fill_citation_from_paper(citation, paper, "literature_pool")
                     return citation
 
     try:
@@ -352,6 +441,81 @@ def _match_any_author(query_author: str, paper_authors: list[str]) -> bool:
         if _match_surname(query_clean, pa):
             return True
     return False
+
+
+def _match_paper_to_citation(
+    paper: dict,
+    citation: Citation,
+    first_author_clean: str,
+) -> bool:
+    """检查文献池中的一篇论文是否匹配当前引用.
+
+    匹配规则（任一满足即认为匹配）:
+        1. 作者名匹配（通过 _match_any_author）
+        2. 标题关键词高度重合（≥2个共同关键词，适用于LLM生成的标题简写引用）
+
+    Args:
+        paper: 文献池中的论文 dict.
+        citation: 待验证的引用.
+        first_author_clean: 清理后的第一作者名.
+
+    Returns:
+        True 如果匹配.
+    """
+    paper_authors = paper.get("authors", [])
+
+    # 规则1: 作者名匹配
+    if paper_authors and _match_any_author(first_author_clean, paper_authors):
+        return True
+
+    # 规则2: 标题关键词匹配（仅当引用有 raw 文本时）
+    # 适用于 LLM 生成的 "Zhang (2022)" 这种简写引用
+    paper_title = paper.get("title", "")
+    if paper_title and citation.raw:
+        # 从 raw 中提取可能的标题词（去掉作者名和年份后）
+        raw_lower = citation.raw.lower()
+        title_lower = paper_title.lower()
+        # 提取标题中的实词（≥4字符）
+        title_words = set(re.findall(r'[a-z]{4,}', title_lower))
+        raw_words = set(re.findall(r'[a-z]{4,}', raw_lower))
+        # 如果标题中有≥2个词出现在 raw 中，认为匹配
+        common = title_words & raw_words
+        if len(common) >= 2:
+            return True
+
+    return False
+
+
+def _fill_citation_from_paper(
+    citation: Citation,
+    paper: dict,
+    source: str,
+) -> None:
+    """从文献池论文填充引用信息.
+
+    Args:
+        citation: 待填充的引用（原地修改）.
+        paper: 文献池中的论文 dict.
+        source: 来源标记（如 "literature_pool"）.
+    """
+    citation.verified = True
+    citation.source = source
+    citation.title = paper.get("title", "")
+    citation.journal = paper.get("journal", "") or paper.get("venue", "") or paper.get("primary_venue", "")
+    citation.doi = paper.get("doi", "")
+    citation.abstract = paper.get("abstract", "")
+    paper_authors = paper.get("authors", [])
+    if paper_authors:
+        citation.authors = paper_authors[:5]
+    # 更新年份
+    paper_year = str(paper.get("year", ""))
+    if paper_year:
+        citation.year = paper_year
+    # 根据标题语言更新 citation.language
+    if citation.title and not re.search(r'[\u4e00-\u9fff]', citation.title):
+        citation.language = "en"
+    elif citation.title and re.search(r'[\u4e00-\u9fff]', citation.title):
+        citation.language = "zh"
 
 
 def _match_surname(query_author: str, paper_author: str) -> bool:

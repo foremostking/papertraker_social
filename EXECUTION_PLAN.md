@@ -115,3 +115,156 @@ context/prompts/
 2. P1-5 → P1-6（串行，依赖P0-1的Prompt结构）
 3. P1-7 → P1-8（可并行）
 4. 集成测试
+
+---
+
+## 四、P2-P6 执行记录（2026-07-18 ~ 2026-07-20）
+
+### P2: 工具链增强（2026-07-18 完成）
+
+| 编号 | 任务 | 文件 | 测试 | 状态 |
+|------|------|------|------|------|
+| P2-1 | 回归结果解析器 | `tools/result_parser.py` | 43 tests | ✅ |
+| P2-2 | 可复现性打包 | `tools/reproducibility.py` | 45 tests | ✅ |
+| P2-3 | 空间计量模板 | `tools/code_template_generator.py` | 16 tests | ✅ |
+
+**关键成果：**
+- `result_parser.py` 支持 Stata/R/Python/JSON 四种格式回归输出解析
+- `reproducibility.py` 实现 ProvenanceTracker + ReproducibilityPackager
+- `code_template_generator.py` 新增空间计量（SAR/SEM/SDM）R 和 Python 模板
+
+### P3: 学术诚信基础（2026-07-19 完成）
+
+| 编号 | 任务 | 文件 | 状态 |
+|------|------|------|------|
+| P3-1 | 三层引用模糊匹配 | `tools/citation_manager.py` | ✅ |
+| P3-2 | 去AI味+润色集成 | `agent/scholar.py` (Phase 8b) | ✅ |
+| P3-3 | AI检测CLI命令 | `cli.py` (`check-ai`) | ✅ |
+| P3-4 | 导出验证 | `cli.py` (`export`) | ✅ |
+| P3-5 | E2E v5 完美通过 | — | ✅ |
+
+**关键成果：**
+- 引用验证三层策略：1a 精确匹配 → 1b 年份±1模糊 → 1c 经典文献忽略年份
+- Phase 8b 去 AI 味+润色自动执行，生成 `full_draft_polished.md` + `deai_report.md`
+- E2E v5：0 CRITICAL，0 WARNING，5章25386字（原始）+26515字（润色），37引用0未验证，48.6%中文
+
+### P4: 差异化价值（2026-07-20 完成）
+
+| 编号 | 任务 | 文件 | 状态 |
+|------|------|------|------|
+| P4-1 | 期刊推荐 | `tools/submission_helper.py` + `cli.py` | ✅ |
+| P4-2 | Cover Letter + 审稿回复 | `tools/submission_helper.py` + `cli.py` | ✅ |
+| P4-3 | 数据源指引 | `tools/data_source_guide.py` + `cli.py` | ✅ |
+
+**关键成果：**
+- `recommend-journal`：冲刺/匹配/保底三级策略，6本期刊推荐
+- `cover-letter`：4段式结构（投稿声明/贡献/匹配度/声明）
+- `revision-plan`：9要素修改计划 + 执行顺序 + 工作量汇总
+- `datasource`：17变量匹配 CSMAR/Wind/NBS 等数据源
+
+### P5: 体验壁垒（2026-07-20 完成）
+
+| 编号 | 任务 | 文件 | 状态 |
+|------|------|------|------|
+| P5-1 | 项目仪表盘 | `cli.py` (`dashboard`) | ✅ |
+| P5-2 | 文献笔记矩阵 | `cli.py` (`literature-matrix`) | ✅ |
+| P5-3 | 多模型配置 | `cli.py` (`model-config`) | ✅ |
+
+**关键成果：**
+- `dashboard`：6区块总览（基本信息/阶段进度/质量指标/文件清单/投稿状态/下一步建议）
+- `literature-matrix`：基础版+LLM增强版，解析32条文献
+- `model-config`：查看配置/API Key状态/阶段-模型映射/模型推荐
+
+### P6: 文档与测试（2026-07-20 完成）
+
+| 编号 | 任务 | 文件 | 状态 |
+|------|------|------|------|
+| P6-1a | README 重写 | `README.md` | ✅ |
+| P6-1b | .env.example 更新 | `.env.example` | ✅ |
+| P6-1c | 命令速查表 | `COMMANDS.md` | ✅ |
+| P6-2a | submission_helper 测试 | `tests/test_submission_helper.py` (29 tests) | ✅ |
+| P6-2b | dashboard + literature 测试 | `tests/test_dashboard.py` (12) + `tests/test_literature_matrix.py` (23) | ✅ |
+
+**关键成果：**
+- README 反映 31 命令、GLM-4 支持、三类用户场景
+- .env.example 补全智谱/火山方舟/Claude/OpenAI/DeepSeek 配置
+- COMMANDS.md 详细命令速查 + 5 个常见工作流
+- P4/P5 新增功能 64 个测试全部通过
+
+---
+
+## 五、GLM-4 集成记录（2026-07-18）
+
+**背景：** LiteLLM 1.89.4 不原生支持 `zhipu/` 前缀，需通过 OpenAI 兼容模式调用。
+
+**实现：**
+- `config.py`：新增 `zhipu_api_base` / `zhipu_default_model` / `zhipu_api_key`
+- `gateway.py`：新增 `_is_zhipu_model()` 方法 + Zhipu 分支（chat + chat_stream）
+- `.env`：新增智谱配置，默认模型切换为 glm-4
+- NO_PROXY：添加 `open.bigmodel.cn`
+
+**关键修复：**
+- `api_base` 未传入 `litellm.acompletion` → 修复为 `is_ark or is_zhipu` 共用 api_base 传入
+
+---
+
+## 六、当前 CLI 命令清单（33 个）
+
+| 类别 | 命令 | 实现阶段 |
+|------|------|----------|
+| 入门 | `init`, `examples` | P7 |
+| 核心流程 | `new`, `chat`, `status`, `progress`, `dashboard`, `list`, `edit`, `versions` | P0/P5/P7 |
+| 质量保障 | `check-ai`, `quality`, `review` | P3/P0 |
+| 数据分析 | `stats`, `diagnose`, `mechanism`, `tables`, `plot`, `parse-result`, `preprocess`, `code` | P0/P2 |
+| 导出打包 | `export`, `finalize`, `package` | P0/P2 |
+| 投稿支持 | `recommend-journal`, `cover-letter`, `revision-plan`, `datasource` | P4 |
+| 体验增强 | `literature-matrix`, `model-config` | P5 |
+| 文献管理 | `library`, `feed`, `profile` | P1 |
+
+---
+
+## 七、测试统计
+
+| 测试文件 | 测试数 | 覆盖模块 |
+|----------|--------|----------|
+| test_submission_helper.py | 29 | P4 投稿支持 |
+| test_dashboard.py | 12 | P5 仪表盘（参考文献解析） |
+| test_literature_matrix.py | 23 | P5 文献矩阵（参考文献解析） |
+| test_result_parser.py | 43 | P2-1 回归结果解析 |
+| test_reproducibility.py | 45 | P2-2 可复现性打包 |
+| test_code_template.py | 16 | P2-3 空间计量模板 |
+| test_de_ai.py | 27 | P3-2 去AI味引擎 |
+| 其他测试文件 | ~200+ | P0/P1 核心模块 |
+| **总计** | **~400+** | — |
+
+---
+
+### P7: 用户体验关键路径优化（2026-07-20 完成）
+
+| 编号 | 任务 | 文件 | 状态 |
+|------|------|------|------|
+| P7-1 | 修复 reproducibility 测试失败 | `tools/reproducibility.py` | ✅ |
+| P7-2 | 首次使用引导命令 | `cli.py` (`init`) | ✅ |
+| P7-3 | 示例项目模板（8个，6学科） | `cli.py` (`_get_example_templates`) | ✅ |
+| P7-4 | examples 命令 + new --template | `cli.py` (`examples`, `new`) | ✅ |
+
+**关键成果：**
+- `_get_dependency_versions()` 增加 scholarpilot 开发模式回退，修复测试失败
+- `init` 命令：3步交互式引导（选提供商→输入API Key→确认模型），2分钟完成首次配置
+- `examples` 命令：8个模板覆盖金融学/宏观/微观/产业/区域/国际贸易
+- `new --template` 选项：从模板创建项目，自动预填标题/研究类型/研究主题描述
+- CLI 命令总数从 31 增至 33
+
+---
+
+## 八、后续规划
+
+### P8: 多场景 E2E 验证（待实施）
+- 场景 A：金融学实证（公司治理，A股样本）— 使用 `finance-governance` 模板
+- 场景 B：宏观经济学（省级面板，财政政策）— 使用 `macro-fiscal` 模板
+- 验证不同学科、不同数据结构的鲁棒性
+
+### P9: 产品化打包（待实施）
+- PyPI 发布准备
+- Docker 化部署
+- Web UI 原型
