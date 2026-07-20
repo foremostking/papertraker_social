@@ -268,6 +268,9 @@ async def verify_citation(
                             citation.title = paper.title
                             citation.journal = paper.journal or ""
                             citation.authors = paper.authors[:5]
+                            # 根据返回内容更新语言标记
+                            if paper.title and not re.search(r'[\u4e00-\u9fff]', paper.title):
+                                citation.language = "en"
                             return citation
                 # 如果没有精确作者匹配，取年份匹配的第一篇（CNKI AU 过滤已保证相关性）
                 for paper in result.papers:
@@ -435,6 +438,45 @@ async def verify_all_citations(
     return verified
 
 
+def _is_chinese_author(name: str) -> bool:
+    """判断作者名是否为中文."""
+    return bool(re.search(r'[\u4e00-\u9fff]', name))
+
+
+def _format_authors(authors: list[str], language: str) -> str:
+    """根据语言格式化作者列表.
+
+    中文作者用顿号分隔（前3位），超过3位加"等".
+    英文作者用 ", " 分隔（前3位），超过3位加 "et al."
+    混合作者按主体语言处理.
+    """
+    if not authors:
+        return ""
+
+    # 判断主体语言
+    zh_count = sum(1 for a in authors[:3] if _is_chinese_author(a))
+    is_zh = language == "zh" and zh_count >= len(authors[:3]) / 2
+
+    if is_zh:
+        author_str = "、".join(authors[:3])
+        if len(authors) > 3:
+            author_str += "等"
+        return author_str
+    else:
+        # 英文格式
+        has_et_al = any("et al" in a.lower() for a in authors[:3])
+        authors_clean = [a.replace(" et al.", "").replace(" et al", "").strip() for a in authors[:3]]
+        if len(authors) == 1:
+            return authors_clean[0]
+        elif len(authors) == 2:
+            return f"{authors_clean[0]} & {authors_clean[1]}"
+        else:
+            author_str = ", ".join(authors_clean[:3])
+            if len(authors) > 3 or has_et_al:
+                author_str += " et al."
+            return author_str
+
+
 def format_cssci(citation: Citation) -> str:
     """格式化为 CSSCI（中文核心期刊）参考文献格式.
 
@@ -445,13 +487,20 @@ def format_cssci(citation: Citation) -> str:
         - 中英文分开，中文在前
     """
     if not citation.verified and not citation.title:
-        return f"[未验证] {citation.raw}"
+        # 未验证引用：用已有信息格式化，不显示 [未验证] 标记
+        # 提取作者和年份信息
+        author_str = _format_authors(citation.authors, citation.language) if citation.authors else ""
+        if author_str and citation.year:
+            return f"{author_str}, {citation.year}."
+        return citation.raw
 
-    if citation.language == "zh":
-        # 中文格式 — 修正作者姓名拼接（CNKI 返回的作者列表已经是"姓名"格式）
-        author_str = "、".join(citation.authors[:3])
-        if len(citation.authors) > 3:
-            author_str += "等"
+    # 根据作者实际语言选择格式（而非 citation.language）
+    # 修复：验证后作者名可能从中文变为英文（CNKI 返回英文论文）
+    authors_are_chinese = any(_is_chinese_author(a) for a in citation.authors[:1]) if citation.authors else False
+
+    if citation.language == "zh" and authors_are_chinese:
+        # 中文格式
+        author_str = _format_authors(citation.authors, "zh")
         result = f"{author_str}：{citation.title}"
         if citation.journal:
             result += f"，《{citation.journal}》"
@@ -464,14 +513,8 @@ def format_cssci(citation: Citation) -> str:
         result += "。"
         return result
     else:
-        # 英文格式
-        # 处理 "et al." 后缀
-        authors = list(citation.authors[:3])
-        has_et_al = any("et al" in a.lower() for a in authors)
-        authors_clean = [a.replace(" et al.", "").replace(" et al", "").strip() for a in authors]
-        author_str = ", ".join(authors_clean)
-        if len(citation.authors) > 3 or has_et_al:
-            author_str += " et al."
+        # 英文格式（包括验证后变为英文的情况）
+        author_str = _format_authors(citation.authors, "en")
         result = f"{author_str}, {citation.year}"
         if citation.title:
             result += f', "{citation.title}"'
@@ -494,7 +537,11 @@ def format_apa7(citation: Citation) -> str:
         Author, A. A., & Author, B. B. (Year). Title of article. *Journal Name*, Volume(Issue), Pages. https://doi.org/xxx
     """
     if not citation.verified and not citation.title:
-        return f"[未验证] {citation.raw}"
+        # 未验证引用：用已有信息格式化
+        author_str = _format_authors(citation.authors, citation.language) if citation.authors else ""
+        if author_str and citation.year:
+            return f"{author_str} ({citation.year})."
+        return citation.raw
 
     # 作者格式化
     if citation.language == "zh":
@@ -546,8 +593,17 @@ def format_references_list(
     formatter = format_cssci if style == "cssci" else format_apa7
 
     if language_separate:
-        zh_cites = [c for c in citations if c.language == "zh"]
-        en_cites = [c for c in citations if c.language != "zh"]
+        # 根据作者实际语言分类（修复：验证后作者名可能从中文变为英文）
+        zh_cites = []
+        en_cites = []
+        for c in citations:
+            # 检查第一作者是否为中文
+            if c.authors and _is_chinese_author(c.authors[0]):
+                zh_cites.append(c)
+            elif c.language == "zh" and not c.authors:
+                zh_cites.append(c)
+            else:
+                en_cites.append(c)
         lines = []
         num = 1
         if zh_cites:

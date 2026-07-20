@@ -46,6 +46,13 @@ class Settings(BaseSettings):
     deepseek_api_key: str = ""
     zhipu_api_key: str = ""
 
+    # ── 智谱 AI（Zhipu / GLM）────────────────────────────
+    # OpenAI 兼容 API，通过 LiteLLM 的 openai/ 前缀 + api_base 调用
+    # https://open.bigmodel.cn/api/paas/v4/
+    zhipu_api_base: str = "https://open.bigmodel.cn/api/paas/v4/"
+    # 默认模型（如 glm-4、glm-4-plus、glm-4.5）
+    zhipu_default_model: str = "glm-4"
+
     # ── 火山方舟（Volcano Ark / 豆包）─────────────────────
     # OpenAI 兼容 API，通过 LiteLLM 的 openai/ 前缀 + api_base 调用
     ark_api_key: str = ""

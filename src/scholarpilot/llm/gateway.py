@@ -82,6 +82,7 @@ class LLMGateway:
 
         no_proxy_domains = [
             "ark.cn-beijing.volces.com",
+            "open.bigmodel.cn",  # 智谱 AI
             "kns.cnki.net",
             "navi.cnki.net",
             "gwz.cass.org.cn",
@@ -100,6 +101,18 @@ class LLMGateway:
             model_lower.startswith("ark")
             or model_lower.startswith("ep-")
             or model_lower.startswith("doubao")
+        )
+
+    def _is_zhipu_model(self, model: str) -> bool:
+        """判断是否为智谱 GLM 模型.
+
+        智谱 GLM 系列模型名：glm-4、glm-4-plus、glm-4.5、glm-4-flash 等。
+        LiteLLM 1.89 不原生支持 zhipu/ 前缀，需走 OpenAI 兼容模式。
+        """
+        model_lower = model.lower()
+        return (
+            model_lower.startswith("glm")
+            or model_lower.startswith("zhipu")
         )
 
     def _select_api_key(self, model: str) -> Optional[str]:
@@ -206,10 +219,18 @@ class LLMGateway:
 
         # 火山方舟特殊处理：OpenAI 兼容 API + 自定义 api_base
         is_ark = self._is_ark_model(model)
+        # 智谱 GLM 特殊处理：OpenAI 兼容 API + 自定义 api_base
+        is_zhipu = self._is_zhipu_model(model)
         if is_ark:
             litellm_model = model if model.startswith("openai/") else f"openai/{model}"
             api_base = self.config.ark_api_base
             api_key = self.config.ark_api_key
+        elif is_zhipu:
+            # 智谱 GLM 走 OpenAI 兼容模式：openai/glm-4 + api_base
+            # LiteLLM 不原生支持 zhipu/ 前缀，必须用 openai/ 前缀 + api_base
+            litellm_model = model if model.startswith("openai/") else f"openai/{model}"
+            api_base = self.config.zhipu_api_base
+            api_key = self.config.zhipu_api_key
         else:
             litellm_model = model
             api_base = None
@@ -222,7 +243,7 @@ class LLMGateway:
             call_kwargs.setdefault("max_tokens", 16384)
 
             try:
-                if is_ark:
+                if is_ark or is_zhipu:
                     response = await litellm.acompletion(
                         model=litellm_model,
                         messages=messages,
@@ -299,6 +320,25 @@ class LLMGateway:
             litellm_model = model if model.startswith("openai/") else f"openai/{model}"
             api_base = self.config.ark_api_base
             api_key = self.config.ark_api_key
+
+            async for chunk in litellm.acompletion(
+                model=litellm_model,
+                messages=messages,
+                api_key=api_key,
+                api_base=api_base,
+                stream=True,
+                **kwargs,
+            ):
+                content = chunk.choices[0].delta.content if chunk.choices else None
+                if content:
+                    yield content
+            return
+
+        # 智谱 GLM 特殊处理（OpenAI 兼容模式）
+        if self._is_zhipu_model(model):
+            litellm_model = model if model.startswith("openai/") else f"openai/{model}"
+            api_base = self.config.zhipu_api_base
+            api_key = self.config.zhipu_api_key
 
             async for chunk in litellm.acompletion(
                 model=litellm_model,
