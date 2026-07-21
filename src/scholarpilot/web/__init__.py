@@ -1,0 +1,1 @@
+"""ScholarPilot Web UI package."""

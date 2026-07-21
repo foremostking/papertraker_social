@@ -255,6 +255,7 @@ async def verify_citation(
     citation: Citation,
     cnki_engine=None,
     openalex_engine=None,
+    ss_engine=None,
     topic_keywords: str = "",
     literature_pool: list[dict] | None = None,
 ) -> Citation:
@@ -264,13 +265,14 @@ async def verify_citation(
         1. 先在 literature_pool（Phase 2 文献池）中匹配作者+年份
         2. 中文引用用 CNKI 验证（作者 + 年份 + 主题词）
         3. 英文引用用 OpenAlex 验证（作者 + 年份 + 主题词）
-        4. 如果优先源失败，尝试另一个源
+        4. 如果 OpenAlex 失败，用 Semantic Scholar 兜底（原生支持作者名搜索）
         5. 搜索关键词: 第一作者姓氏 + 年份 + 主题关键词
 
     Args:
         citation: 待验证的引用.
         cnki_engine: CNKIAiohttpEngine 实例（可选）.
         openalex_engine: OpenAlexEngine 实例（可选）.
+        ss_engine: SemanticScholarEngine 实例（可选，英文验证兜底）.
         topic_keywords: 研究主题关键词（用于辅助搜索，避免返回不相关论文）.
         literature_pool: Phase 2 已检索到的文献列表（dict 列表），优先在此匹配.
 
@@ -382,9 +384,9 @@ async def verify_citation(
                 year_end=citation.year,
             )
             if result.papers:
-                # 优先匹配年份+作者，其次只匹配年份
+                # 优先匹配年份+作者，其次只匹配年份（±1年容错）
                 for paper in result.papers:
-                    if str(paper.year) == citation.year:
+                    if _year_match(paper.year, citation.year):
                         author_match = _match_any_author(first_author_clean, paper.authors)
                         if author_match or not paper.authors:
                             citation.verified = True
@@ -401,7 +403,7 @@ async def verify_citation(
                             return citation
                 # 降级：取年份匹配的第一篇
                 for paper in result.papers:
-                    if str(paper.year) == citation.year:
+                    if _year_match(paper.year, citation.year):
                         citation.verified = True
                         citation.source = "openalex"
                         citation.title = paper.title
@@ -415,6 +417,32 @@ async def verify_citation(
                             citation.authors = paper.authors[:5]
                         return citation
 
+        # ===== Semantic Scholar 兜底（英文引用验证） =====
+        # SS 的 search API 原生匹配 authors 字段，比 OpenAlex 的 search 参数更准确
+        if not citation.verified and ss_engine and citation.language == "en":
+            try:
+                ss_result = await ss_engine.search(
+                    query=first_author_clean,
+                    limit=5,
+                    year=citation.year,
+                )
+                if ss_result and ss_result.papers:
+                    for paper in ss_result.papers:
+                        if _year_match(paper.year, citation.year):
+                            author_match = _match_any_author(first_author_clean, paper.authors)
+                            if author_match or not paper.authors:
+                                citation.verified = True
+                                citation.source = "semantic_scholar"
+                                citation.title = paper.title
+                                citation.journal = paper.primary_venue or ""
+                                citation.doi = paper.doi
+                                citation.abstract = paper.abstract
+                                if paper.authors:
+                                    citation.authors = paper.authors[:5]
+                                return citation
+            except Exception as ss_err:
+                logger.debug(f"Semantic Scholar 兜底验证失败 [{citation.raw}]: {ss_err}")
+
     except Exception as e:
         logger.warning(f"验证引用失败 [{citation.raw}]: {e}")
 
@@ -422,6 +450,21 @@ async def verify_citation(
         citation.source = "unverified"
 
     return citation
+
+
+def _year_match(paper_year, citation_year: str, tolerance: int = 1) -> bool:
+    """检查论文年份是否匹配引用年份（允许 ±N 年误差）.
+
+    LLM 常记错年份，严格匹配会导致大量验证失败。
+    """
+    if not paper_year or not citation_year:
+        return False
+    try:
+        py = int(str(paper_year))
+        cy = int(str(citation_year).strip())
+        return abs(py - cy) <= tolerance
+    except (ValueError, TypeError):
+        return str(paper_year).strip() == str(citation_year).strip()
 
 
 def _match_any_author(query_author: str, paper_authors: list[str]) -> bool:
@@ -559,6 +602,7 @@ async def verify_all_citations(
     citations: list[Citation],
     cnki_engine=None,
     openalex_engine=None,
+    ss_engine=None,
     concurrency: int = 3,
     topic_keywords: str = "",
     literature_pool: list[dict] | None = None,
@@ -569,6 +613,7 @@ async def verify_all_citations(
         citations: 待验证的引用列表.
         cnki_engine: CNKI 引擎实例.
         openalex_engine: OpenAlex 引擎实例.
+        ss_engine: Semantic Scholar 引擎实例（英文验证兜底）.
         concurrency: 并发数（避免 API 限流）.
         topic_keywords: 研究主题关键词（传递给 verify_citation）.
         literature_pool: Phase 2 文献池（传递给 verify_citation）.
@@ -582,7 +627,7 @@ async def verify_all_citations(
         async with semaphore:
             await asyncio.sleep(0.3)  # 请求间隔
             return await verify_citation(
-                cite, cnki_engine, openalex_engine,
+                cite, cnki_engine, openalex_engine, ss_engine,
                 topic_keywords=topic_keywords,
                 literature_pool=literature_pool,
             )

@@ -1640,7 +1640,7 @@ class ScholarAgent:
             logger.debug(f"无法获取文献池: {e}")
 
         # 3. 验证引用
-        self.console.print("[dim]🔍 正在验证引用真实性（文献池匹配 + CNKI + OpenAlex）...[/dim]")
+        self.console.print("[dim]🔍 正在验证引用真实性（文献池 + CNKI + OpenAlex + Semantic Scholar）...[/dim]")
         try:
             from scholarpilot.mcp.servers.cnki.aiohttp_engine import CNKIAiohttpEngine
             cnki_engine = CNKIAiohttpEngine()
@@ -1655,10 +1655,22 @@ class ScholarAgent:
         except Exception:
             self.console.print("[dim]  OpenAlex 引擎初始化失败，跳过英文引用验证[/dim]")
 
+        # Semantic Scholar 引擎（英文验证兜底，原生支持作者名搜索）
+        ss_engine = getattr(self, 'ss_engine', None)
+        if ss_engine is None:
+            try:
+                from scholarpilot.mcp.servers.semantic_scholar import SemanticScholarEngine
+                ss_engine = SemanticScholarEngine(api_key=self.settings.ss_api_key or None)
+                self.ss_engine = ss_engine
+            except Exception:
+                ss_engine = None
+                self.console.print("[dim]  Semantic Scholar 引擎初始化失败，英文验证可能不完整[/dim]")
+
         verified_citations = await verify_all_citations(
             citations,
             cnki_engine=cnki_engine,
             openalex_engine=openalex_engine,
+            ss_engine=ss_engine,
             concurrency=3,
             topic_keywords=topic_keywords,
             literature_pool=literature_pool,
