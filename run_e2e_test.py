@@ -82,15 +82,20 @@ async def main():
 
     # 3.1 检查文件是否存在
     draft_dir = project_dir / "draft"
+    scholar_dir = project_dir / ".scholar"
+    lit_dir = project_dir / "literature"
     files_to_check = [
-        "full_draft.md",
-        "full_draft_polished.md",
-        "references.md",
-        "deai_report.md",
+        ("full_draft.md", draft_dir),
+        ("full_draft_polished.md", draft_dir),
+        ("references.md", draft_dir),
+        ("deai_report.md", draft_dir),
+        ("claim_calibration_report.md", draft_dir),
+        ("evidence_matrix.json", scholar_dir),
+        ("evidence_matrix.md", lit_dir),
     ]
     print("\n[1] 文件检查")
-    for fname in files_to_check:
-        fpath = draft_dir / fname
+    for fname, fdir in files_to_check:
+        fpath = fdir / fname
         if fpath.exists():
             chars = len(fpath.read_text(encoding="utf-8"))
             print(f"  ✅ {fname}: {chars:,} 字符")
@@ -177,6 +182,48 @@ async def main():
         print(f"  引用验证: {verified}/{total} ({rate:.0f}%)")
         results["citation_rate"] = rate
 
+    # 3.6 证据矩阵验证
+    print("\n[6] 证据矩阵验证")
+    matrix_path = project_dir / ".scholar" / "evidence_matrix.json"
+    if matrix_path.exists():
+        matrix = json.loads(matrix_path.read_text(encoding="utf-8"))
+        total_papers = matrix.get("total_papers", 0)
+        section_maps = matrix.get("section_maps", [])
+        gap_report = matrix.get("gap_report", {})
+        print(f"  ✅ 证据矩阵: {total_papers} 篇文献, {len(section_maps)} 章节映射")
+        print(f"  证据缺口: {gap_report.get('total_gaps', 0)} 处")
+        results["evidence_matrix_papers"] = total_papers
+        results["evidence_matrix_sections"] = len(section_maps)
+    else:
+        print(f"  ❌ 证据矩阵未生成")
+        results["evidence_matrix_papers"] = 0
+
+    # 3.7 Claim 校准验证
+    print("\n[7] Claim 校准验证")
+    claim_report_path = draft_dir / "claim_calibration_report.md"
+    if claim_report_path.exists():
+        claim_content = claim_report_path.read_text(encoding="utf-8")
+        print(f"  ✅ Claim 校准报告: {len(claim_content):,} 字符")
+        results["claim_report"] = len(claim_content)
+    else:
+        print(f"  ❌ Claim 校准报告未生成")
+        results["claim_report"] = 0
+
+    if state_path.exists():
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        claim_summary = state.get("claim_calibration_summary", {})
+        if claim_summary:
+            print(f"  结论总数: {claim_summary.get('total_claims', 0)}")
+            print(f"  充分支撑: {claim_summary.get('supported', 0)}")
+            print(f"  结论越界: {claim_summary.get('overreach', 0)}")
+            print(f"  无引用支撑: {claim_summary.get('unsupported', 0)}")
+            print(f"  诚信评分: {claim_summary.get('integrity_score', 0)}/100")
+            results["claim_integrity_score"] = claim_summary.get("integrity_score", 0)
+            results["claim_overreach"] = claim_summary.get("overreach", 0)
+        else:
+            print(f"  ⚠️ state.json 中无 claim 校准数据")
+            results["claim_integrity_score"] = 0
+
     # 4. 总结
     print("\n" + "=" * 60)
     print("  E2E 测试总结")
@@ -189,6 +236,8 @@ async def main():
         ("无模型思考痕迹", results.get("traces", 999) == 0),
         ("无双句号", results.get("double_periods", 999) == 0),
         ("英文引用不完整数<3", results.get("en_refs_incomplete", 999) < 3),
+        ("证据矩阵已生成", results.get("evidence_matrix_papers", 0) > 0),
+        ("Claim校准报告已生成", results.get("claim_report", 0) > 0),
     ]
 
     for name, passed in checks:

@@ -106,6 +106,31 @@ from scholarpilot.context.prompts.extended import (
     ROBUSTNESS_CHECK_PROMPT,
 )
 
+# 阶段化角色卡
+from scholarpilot.context.prompts.roles import (
+    PHASE_ROLES,
+    get_role_prompt,
+    RETRIEVAL_EXPERT_ROLE,
+    EVIDENCE_ANALYST_ROLE,
+    RESEARCH_DESIGNER_ROLE,
+    ACADEMIC_WRITER_ROLE,
+    CITATION_CURATOR_ROLE,
+    DEAI_EDITOR_ROLE,
+    REVIEWER_ROLE,
+)
+
+# 证据矩阵 Prompt
+from scholarpilot.context.prompts.evidence import (
+    EVIDENCE_EXTRACTION_PROMPT,
+    EVIDENCE_ARGUMENT_MAPPING_PROMPT,
+)
+
+# Claim校准 Prompt
+from scholarpilot.context.prompts.claim import (
+    CLAIM_EXTRACTION_PROMPT,
+    CLAIM_CALIBRATION_PROMPT,
+)
+
 __all__ = [
     # 原有 13 个
     "SCHOLAR_SYSTEM_PROMPT",
@@ -163,4 +188,20 @@ __all__ = [
     "METHODOLOGY_DESIGN_PROMPT",
     "VARIABLE_DEFINITION_PROMPT",
     "ROBUSTNESS_CHECK_PROMPT",
+    # 阶段化角色卡
+    "PHASE_ROLES",
+    "get_role_prompt",
+    "RETRIEVAL_EXPERT_ROLE",
+    "EVIDENCE_ANALYST_ROLE",
+    "RESEARCH_DESIGNER_ROLE",
+    "ACADEMIC_WRITER_ROLE",
+    "CITATION_CURATOR_ROLE",
+    "DEAI_EDITOR_ROLE",
+    "REVIEWER_ROLE",
+    # 证据矩阵 Prompt
+    "EVIDENCE_EXTRACTION_PROMPT",
+    "EVIDENCE_ARGUMENT_MAPPING_PROMPT",
+    # Claim校准 Prompt
+    "CLAIM_EXTRACTION_PROMPT",
+    "CLAIM_CALIBRATION_PROMPT",
 ]

@@ -113,6 +113,9 @@ class ScholarAgent:
         self.eight_dim_stats: dict[str, Any] = {}
         self.feasibility: dict[str, Any] = {}
 
+        # 证据矩阵构建器（Phase 2.5 初始化，Phase 7 使用）
+        self.evidence_matrix_builder = None
+
         # 非交互模式（用于自动化测试或脚本调用）
         self.non_interactive: bool = False
         self.default_choices: dict[str, int] = {}  # 各交互步骤的默认选择
@@ -192,6 +195,13 @@ class ScholarAgent:
             # Phase 2: 多源文献检索 + 8维统计
             if "literature_search" not in completed_phases:
                 await self._phase2_literature_search()
+            self.file_manager.save_progress(
+                self.project_dir, "evidence_matrix"
+            )
+
+            # Phase 2.5: 证据矩阵构建（新增）
+            if "evidence_matrix" not in completed_phases:
+                await self._phase2_5_build_evidence_matrix()
             self.file_manager.save_progress(
                 self.project_dir, "spec_generation"
             )
@@ -280,6 +290,9 @@ class ScholarAgent:
 
             # Phase 8b: 去AI味 + 中文润色后处理
             self._phase8b_deai_polish()
+
+            # Phase 8c: Claim校准（新增）
+            await self._phase8c_claim_calibration()
 
             # Phase 8 增强：显示质量报告 + 导出建议 + 实证工具提示
             self._phase8_post_completion()
@@ -880,6 +893,128 @@ class ScholarAgent:
 
         return "\n".join(lines) if lines else "暂无检索结果"
 
+    # ===== Phase 2.5: 证据矩阵构建 =====
+
+    async def _phase2_5_build_evidence_matrix(self) -> None:
+        """Phase 2.5: 构建证据矩阵.
+
+        在文献检索完成后、规格生成前，对文献池进行结构化证据提取：
+        1. 收集当前项目的所有文献
+        2. 通过 LLM 批量提取每篇文献的关键发现、证据类型、证据强度
+        3. 构建论点-证据映射（此处仅建文献层，章节映射在 Phase 5 大纲生成后补充）
+        4. 持久化到 .scholar/evidence_matrix.json 和 literature/evidence_matrix.md
+
+        异常处理：证据矩阵构建失败不中断主流程，仅记录日志。
+        """
+        from rich.panel import Panel
+
+        self.console.print(
+            Panel(
+                "[bold cyan]证据矩阵构建[/bold cyan]\n"
+                "结构化提取文献证据 → 建立论点-证据映射 → 识别证据缺口",
+                title="Phase 2.5",
+                border_style="cyan",
+            )
+        )
+
+        topic = self.topic_info.get("topic", "")
+        if not topic:
+            self.console.print("[yellow]研究主题为空，跳过证据矩阵构建[/yellow]")
+            return
+
+        # 收集当前项目的文献
+        try:
+            project_papers = self.library.get_project_papers(self.project_name)
+        except Exception as e:
+            logger.warning("获取项目文献失败: %s", e)
+            project_papers = []
+
+        if not project_papers:
+            # 回退到各检索引擎的原始结果
+            project_papers = self._collect_papers_for_library()
+
+        if not project_papers:
+            self.console.print("[yellow]文献池为空，跳过证据矩阵构建[/yellow]")
+            return
+
+        # 过滤有摘要的文献（无摘要无法提取证据）
+        papers_with_abstract = [
+            p for p in project_papers
+            if p.get("abstract") and p.get("abstract", "").strip()
+        ]
+        self.console.print(
+            f"  [dim]文献池: {len(project_papers)} 篇，"
+            f"其中 {len(papers_with_abstract)} 篇有摘要可提取证据[/dim]"
+        )
+
+        if not papers_with_abstract:
+            self.console.print("[yellow]无含摘要的文献，跳过证据矩阵构建[/yellow]")
+            return
+
+        # 初始化证据矩阵构建器
+        try:
+            from scholarpilot.tools.evidence_matrix import EvidenceMatrixBuilder
+        except ImportError as e:
+            logger.error("导入证据矩阵模块失败: %s", e)
+            self.console.print(f"[red]导入证据矩阵模块失败: {e}[/red]")
+            return
+
+        self.evidence_matrix_builder = EvidenceMatrixBuilder(
+            llm=self.llm,
+            library=self.library,
+        )
+
+        # 构建证据矩阵（不含章节映射，大纲尚未生成）
+        self.console.print("[dim]📋 正在构建证据矩阵（批量提取文献证据）...[/dim]")
+        try:
+            matrix = await self.evidence_matrix_builder.build_matrix(
+                project_papers=papers_with_abstract,
+                topic=topic,
+                outline_sections=None,  # 大纲尚未生成，章节映射在 Phase 5 补充
+                batch_size=10,
+                max_papers=30,
+            )
+        except Exception as e:
+            logger.error("证据矩阵构建失败: %s", e, exc_info=True)
+            self.console.print(f"[red]证据矩阵构建失败: {e}[/red]")
+            return
+
+        # 统计输出
+        strong = sum(1 for p in matrix.papers if p.evidence_strength.value == "strong")
+        moderate = sum(1 for p in matrix.papers if p.evidence_strength.value == "moderate")
+        weak = sum(1 for p in matrix.papers if p.evidence_strength.value == "weak")
+        unverified = sum(1 for p in matrix.papers if p.evidence_strength.value == "unverified")
+
+        self.console.print(f"  [green]证据矩阵构建完成: {matrix.total_papers} 篇文献[/green]")
+        self.console.print(
+            f"  [dim]证据强度分布: 强{strong} / 中{moderate} / 弱{weak} / 未验证{unverified}[/dim]"
+        )
+
+        # 持久化
+        try:
+            matrix_path = self.project_dir / ".scholar" / "evidence_matrix.json"
+            matrix.save(matrix_path)
+            self.console.print(f"  [dim]已保存: {matrix_path}[/dim]")
+
+            # 导出人类可读的 Markdown 版本
+            md_path = self.project_dir / "literature" / "evidence_matrix.md"
+            md_path.parent.mkdir(parents=True, exist_ok=True)
+            md_path.write_text(matrix.to_markdown(), encoding="utf-8")
+            self.console.print(f"  [dim]已导出: {md_path}[/dim]")
+        except Exception as e:
+            logger.warning("证据矩阵持久化失败: %s", e)
+            self.console.print(f"  [yellow]证据矩阵持久化失败: {e}[/yellow]")
+
+        # 保存到记忆
+        self.memory.add("evidence_matrix", {
+            "total_papers": matrix.total_papers,
+            "strong": strong,
+            "moderate": moderate,
+            "weak": weak,
+            "unverified": unverified,
+            "matrix_path": str(matrix_path) if 'matrix_path' in dir() else "",
+        })
+
     # ===== Phase 3: 生成论文规格 =====
 
     async def _phase3_generate_spec(self) -> None:
@@ -976,6 +1111,30 @@ class ScholarAgent:
 
         # 保存到记忆
         self.memory.add("outline", {"path": str(outline_path), "json": outline_json})
+
+        # ── 补充证据矩阵的章节-论点映射（Phase 2.5 → Phase 5 联动）──
+        if self.evidence_matrix_builder and self.evidence_matrix_builder._current_matrix:
+            sections_for_mapping = outline_json.get("sections", []) if outline_json else []
+            if sections_for_mapping:
+                self.console.print("[dim]📋 补充证据矩阵章节-论点映射...[/dim]")
+                try:
+                    updated_matrix = await self.evidence_matrix_builder.fill_section_maps(
+                        self.evidence_matrix_builder._current_matrix,
+                        sections_for_mapping,
+                    )
+                    # 重新持久化
+                    matrix_path = self.project_dir / ".scholar" / "evidence_matrix.json"
+                    updated_matrix.save(matrix_path)
+                    md_path = self.project_dir / "literature" / "evidence_matrix.md"
+                    md_path.write_text(updated_matrix.to_markdown(), encoding="utf-8")
+                    gap_count = updated_matrix.gap_report.get("total_gaps", 0)
+                    self.console.print(
+                        f"  [green]章节映射完成: {len(updated_matrix.section_maps)} 章，"
+                        f"证据缺口 {gap_count} 处[/green]"
+                    )
+                except Exception as e:
+                    logger.warning("证据矩阵章节映射补充失败: %s", e)
+                    self.console.print(f"  [yellow]证据矩阵章节映射补充失败: {e}[/yellow]")
 
     # ===== Phase 7: 逐章撰写 =====
 
@@ -1077,10 +1236,21 @@ class ScholarAgent:
             self.console.print(f"\n[dim]✍️ 正在撰写: {section_title} (约{word_count}字)...[/dim]")
 
             # 为文献综述章节注入更详细的文献列表（含摘要），其他章节使用精简列表
+            # 优先使用证据矩阵的结构化证据（如有）
+            evidence_context = ""
             relevant_papers = self._format_papers_brief(max_papers=8)
             if "文献综述" in section_title or "综述" in section_title:
                 relevant_papers = self._format_papers_for_review(max_per_source=10)
                 self.console.print("[dim]  📚 文献综述章节：注入详细文献列表（含摘要）[/dim]")
+
+            # 证据矩阵注入（Phase 2.5 生成）
+            if hasattr(self, "evidence_matrix_builder") and self.evidence_matrix_builder:
+                try:
+                    evidence_context = self.evidence_matrix_builder.format_for_writing(section_title)
+                    if evidence_context and "证据矩阵尚未构建" not in evidence_context:
+                        self.console.print("[dim]  📋 证据矩阵：注入结构化论点-证据映射[/dim]")
+                except Exception as e:
+                    logger.debug("证据矩阵注入失败: %s", e)
 
             # 判断当前章节是否为实证章节，决定是否注入真实数据
             section_empirical_data = ""
@@ -1110,6 +1280,7 @@ class ScholarAgent:
                 relevant_papers=relevant_papers,
                 previous_sections=prev_summary_text,
                 empirical_data=section_empirical_data,
+                evidence_context=evidence_context,
                 history=[],  # 章节撰写不传历史，避免 prompt 膨胀
             )
 
@@ -2400,6 +2571,36 @@ class ScholarAgent:
         # 6. 期刊达标评估
         report["assessment"] = self._assess_journal_readiness(report)
 
+        # 7. Claim 校准指标（从 state.json 读取）
+        state = self.file_manager.load_state(self.project_dir) or {}
+        claim_summary = state.get("claim_calibration_summary", {})
+        if claim_summary:
+            report["claim_calibration"] = {
+                "completed": True,
+                "total_claims": claim_summary.get("total_claims", 0),
+                "supported": claim_summary.get("supported", 0),
+                "overreach": claim_summary.get("overreach", 0),
+                "unsupported": claim_summary.get("unsupported", 0),
+                "partial": claim_summary.get("partial", 0),
+                "integrity_score": claim_summary.get("integrity_score", 0),
+                "critical_issues_count": claim_summary.get("critical_issues_count", 0),
+            }
+        else:
+            report["claim_calibration"] = {"completed": False}
+
+        # 8. 证据矩阵指标（从 state.json 读取）
+        evidence_mem = self.memory.get("evidence_matrix", {})
+        if evidence_mem:
+            report["evidence_matrix"] = {
+                "total_papers": evidence_mem.get("total_papers", 0),
+                "strong": evidence_mem.get("strong", 0),
+                "moderate": evidence_mem.get("moderate", 0),
+                "weak": evidence_mem.get("weak", 0),
+                "unverified": evidence_mem.get("unverified", 0),
+            }
+        else:
+            report["evidence_matrix"] = {"total_papers": 0}
+
         return report
 
     def _assess_journal_readiness(self, report: dict[str, Any]) -> dict[str, str]:
@@ -2519,6 +2720,32 @@ class ScholarAgent:
             self.console.print(f"  [green]✓[/green] 实证表格模板（{table_count}张）")
         elif report.get("is_empirical", False):
             self.console.print("  [yellow]⚠ 实证表格模板未生成（运行: scholarpilot tables <项目>）[/yellow]")
+
+        # 证据矩阵指标
+        evidence = report.get("evidence_matrix", {})
+        if evidence.get("total_papers", 0) > 0:
+            self.console.print(
+                f"\n[bold]证据矩阵:[/bold] {evidence['total_papers']} 篇文献 "
+                f"(强{evidence.get('strong', 0)}/中{evidence.get('moderate', 0)}/"
+                f"弱{evidence.get('weak', 0)}/未验证{evidence.get('unverified', 0)})"
+            )
+
+        # Claim 校准指标
+        claim = report.get("claim_calibration", {})
+        if claim.get("completed"):
+            score = claim.get("integrity_score", 0)
+            score_color = "green" if score >= 80 else "yellow" if score >= 60 else "red"
+            self.console.print(
+                f"\n[bold]Claim 校准:[/bold] {claim.get('total_claims', 0)} 条结论 | "
+                f"诚信评分: [{score_color}]{score}/100[/{score_color}]"
+            )
+            overreach = claim.get("overreach", 0)
+            unsupported = claim.get("unsupported", 0)
+            if overreach > 0 or unsupported > 0:
+                self.console.print(
+                    f"  [yellow]⚠ 结论越界 {overreach} 条 | 无引用支撑 {unsupported} 条[/yellow]"
+                )
+                self.console.print("  [dim]  详见: draft/claim_calibration_report.md[/dim]")
 
         # 未验证引用警告
         unverified = report.get("unverified_count", 0)
@@ -2952,6 +3179,199 @@ class ScholarAgent:
         lines.append("*本报告由 ScholarPilot 去AI味引擎与润色引擎自动生成*")
 
         return "\n".join(lines)
+
+    # ===== Phase 8c: Claim 校准 =====
+
+    async def _phase8c_claim_calibration(self) -> None:
+        """Phase 8c: Claim 校准（Actor-Critic 双代理模式）.
+
+        在去AI味处理后，对论文中的核心结论句进行逐条校准：
+        1. 读取润色后的全文（full_draft_polished.md，回退到 full_draft.md）
+        2. 提取每章核心结论句（识别"因此""综上""研究表明"等标记）
+        3. 逐条校准结论与证据的匹配关系
+        4. 对"结论越界"判断增加 Actor-Critic 二次确认
+        5. 生成 claim_calibration_report.md
+        6. 更新 state.json 记录校准结果
+
+        报告作为"建议"而非"强制修改"，不自动改正文。
+        异常处理：校准失败不中断主流程，仅记录日志。
+        """
+        from rich.panel import Panel
+
+        self.console.print(
+            Panel(
+                "[bold cyan]Claim 校准[/bold cyan]\n"
+                "提取核心结论 → 逐条校准证据匹配 → 识别结论越界 → 生成报告",
+                title="Phase 8c",
+                border_style="cyan",
+            )
+        )
+
+        # 非交互模式判断
+        if not self.non_interactive:
+            from rich.prompt import Confirm
+
+            try:
+                should_run = Confirm.ask(
+                    "是否执行 Claim 校准（结论-证据匹配校验）？",
+                    default=True,
+                )
+            except Exception:
+                should_run = True
+            if not should_run:
+                self.console.print("[yellow]已跳过 Claim 校准[/yellow]")
+                return
+        else:
+            self.console.print("  [dim][非交互模式] 自动执行 Claim 校准[/dim]")
+
+        # 读取润色后的全文（优先 polished，回退到原始草稿）
+        polished_path = self.project_dir / "draft" / "full_draft_polished.md"
+        draft_path = self.project_dir / "draft" / "full_draft.md"
+
+        full_text = ""
+        source_label = ""
+        if polished_path.exists():
+            full_text = polished_path.read_text(encoding="utf-8")
+            source_label = "full_draft_polished.md"
+        elif draft_path.exists():
+            full_text = draft_path.read_text(encoding="utf-8")
+            source_label = "full_draft.md"
+
+        if not full_text.strip():
+            self.console.print("[yellow]草稿文件不存在或为空，跳过 Claim 校准[/yellow]")
+            logger.warning("草稿为空，跳过 Phase 8c")
+            return
+
+        self.console.print(f"  [dim]读取源文件: {source_label}[/dim]")
+
+        # 收集参考文献信息（用于校准时交叉验证）
+        references: list[dict[str, Any]] = []
+        ref_path = self.project_dir / "draft" / "references.md"
+        if ref_path.exists():
+            ref_text = ref_path.read_text(encoding="utf-8")
+            for line in ref_text.split("\n"):
+                line = line.strip()
+                if not line or line.startswith("#") or line.startswith("---") or len(line) < 10:
+                    continue
+                # 解析参考文献行，提取结构化信息
+                # 格式: [N] 作者：标题，《期刊》，年份。
+                import re as _re
+                ref_match = _re.match(r'\[(\d+)\]\s*(.+)', line)
+                if ref_match:
+                    ref_num = ref_match.group(1)
+                    ref_content = ref_match.group(2)
+                    # 提取年份
+                    year_match = _re.search(r'(\d{4})年?', ref_content)
+                    year = year_match.group(1) if year_match else ""
+                    # 提取作者（冒号前的部分）
+                    author_part = ref_content.split("：")[0] if "：" in ref_content else ref_content.split(",")[0] if "," in ref_content else ""
+                    # 提取标题（冒号后到《或"前）
+                    title_part = ""
+                    if "：" in ref_content:
+                        after_colon = ref_content.split("：", 1)[1]
+                        # 标题到《或"或.前
+                        for sep in ["《", '"', "'", "."]:
+                            if sep in after_colon:
+                                title_part = after_colon.split(sep)[0].strip()
+                                break
+                        if not title_part:
+                            title_part = after_colon[:50].strip()
+                    references.append({
+                        "id": ref_num,
+                        "text": ref_content,
+                        "authors": author_part.strip(),
+                        "year": year,
+                        "title": title_part.strip(),
+                    })
+
+        # 收集证据矩阵数据（用于交叉验证）
+        evidence_matrix_data: dict[str, Any] | None = None
+        matrix_path = self.project_dir / ".scholar" / "evidence_matrix.json"
+        if matrix_path.exists():
+            try:
+                evidence_matrix_data = json.loads(
+                    matrix_path.read_text(encoding="utf-8")
+                )
+                self.console.print(
+                    f"  [dim]已加载证据矩阵数据（{evidence_matrix_data.get('total_papers', 0)} 篇文献）[/dim]"
+                )
+            except Exception as e:
+                logger.debug("加载证据矩阵数据失败: %s", e)
+
+        # 初始化 Claim 校准器
+        try:
+            from scholarpilot.tools.claim_calibrator import ClaimCalibrator
+        except ImportError as e:
+            logger.error("导入 Claim 校准模块失败: %s", e)
+            self.console.print(f"[red]导入 Claim 校准模块失败: {e}[/red]")
+            return
+
+        calibrator = ClaimCalibrator(
+            llm=self.llm,
+            evidence_matrix_data=evidence_matrix_data,
+        )
+
+        # 执行校准
+        self.console.print("[dim]🔍 正在校准核心结论（逐章提取+逐条校验）...[/dim]")
+        try:
+            report = await calibrator.calibrate_document(
+                full_text=full_text,
+                references=references,
+            )
+        except Exception as e:
+            logger.error("Claim 校准失败: %s", e, exc_info=True)
+            self.console.print(f"[red]Claim 校准失败: {e}[/red]")
+            return
+
+        # 输出统计
+        self.console.print(f"  [green]Claim 校准完成: {report.total_claims} 条结论[/green]")
+        self.console.print(
+            f"  [dim]充分支撑: {report.supported} | 部分支撑: {report.partial} | "
+            f"结论越界: {report.overreach} | 无引用: {report.unsupported}[/dim]"
+        )
+        self.console.print(
+            f"  [dim]诚信评分: {report.overall_integrity_score}/100[/dim]"
+        )
+
+        if report.critical_issues:
+            self.console.print(f"  [yellow]严重问题: {len(report.critical_issues)} 项[/yellow]")
+            for issue in report.critical_issues[:5]:  # 最多显示5条
+                self.console.print(f"    [red]• {issue}[/red]")
+            if len(report.critical_issues) > 5:
+                self.console.print(f"    [dim]...还有 {len(report.critical_issues) - 5} 项，详见报告[/dim]")
+
+        # 生成报告文件
+        try:
+            report_md = calibrator.to_markdown(report)
+            report_path = self.project_dir / "draft" / "claim_calibration_report.md"
+            report_path.write_text(report_md, encoding="utf-8")
+            self.console.print(f"  [dim]已保存报告: {report_path}[/dim]")
+        except Exception as e:
+            logger.warning("Claim 校准报告保存失败: %s", e)
+            self.console.print(f"  [yellow]报告保存失败: {e}[/yellow]")
+
+        # 更新 state.json
+        try:
+            from datetime import datetime, timezone
+
+            state = self.file_manager.load_state(self.project_dir) or {}
+            state["claim_calibration_completed"] = True
+            state["claim_calibration_at"] = datetime.now(timezone.utc).isoformat()
+            state["claim_calibration_summary"] = {
+                "total_claims": report.total_claims,
+                "supported": report.supported,
+                "overreach": report.overreach,
+                "unsupported": report.unsupported,
+                "partial": report.partial,
+                "integrity_score": report.overall_integrity_score,
+                "critical_issues_count": len(report.critical_issues),
+                "source_file": source_label,
+            }
+            self.file_manager.save_state(self.project_dir, state)
+            logger.info("state.json 已更新：Claim 校准完成")
+        except Exception as e:
+            logger.error("更新 state.json 失败: %s", e)
+            self.console.print(f"  [yellow]更新状态文件失败: {e}[/yellow]")
 
     def _phase8_post_completion(self) -> None:
         """Phase 8 后处理：质量报告 + 导出建议 + 实证工具提示."""
