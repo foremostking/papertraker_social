@@ -161,10 +161,11 @@ def extract_citations_from_text(text: str) -> list[Citation]:
     # 模式3: 英文引用 — 支持多作者和 et al.
     # 匹配: "Author & Author (Year)", "Author and Author (Year)", "Author et al. (Year)"
     # 支持: 单名(如Elhorst)、双名(如Guangqin Li)、姓+名组合
+    # 支持: 中英文混排 "Author和Author（Year）"、"Author与Author（Year）"
     en_pattern = re.compile(
         r'('
         r'(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)'  # 第一作者（1或2个词）
-        r'(?:\s*(?:and|&)\s*(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?))*'  # &/and 连接的后续作者
+        r'(?:\s*(?:and|&|和|与)\s*(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?))*'  # and/&,/与 连接的后续作者
         r'(?:\s+et\s+al\.?)?'  # 可能有 et al.
         r')'
         r'\s*[(（]\s*(\d{4})\s*[)）]'
@@ -234,9 +235,9 @@ def extract_citations_from_text(text: str) -> list[Citation]:
         key = f"{authors_str}_{year}"
         if key not in seen:
             seen.add(key)
-            # 解析作者列表：按 & / and 分割
+            # 解析作者列表：按 & / and / 和 / 与 分割
             has_et_al = "et al" in authors_str
-            authors_clean = re.split(r'\s+(?:and|&)\s+', authors_str)
+            authors_clean = re.split(r'\s*(?:and|&|和|与)\s*', authors_str)
             authors_clean = [a.replace('et al.', '').replace('et al', '').strip()
                             for a in authors_clean if a.strip() and a.strip() != "et al."]
             if has_et_al and authors_clean:
@@ -376,7 +377,17 @@ async def verify_citation(
         if not citation.verified and openalex_engine:
             # OpenAlex 搜索：作者名放入搜索词（OpenAlex 全文搜索会匹配作者名）
             # 不使用 authorships.author.display_name.search 过滤器（会导致 400 错误）
-            query = f"{first_author_clean} {topic_keywords}".strip() if topic_keywords else first_author_clean
+            # 对于经典文献（年份较早），不拼接主题词，只用作者名+年份搜索
+            try:
+                cit_year_int = int(citation.year)
+            except ValueError:
+                cit_year_int = None
+
+            # 经典文献（2000年以前）不加主题词，避免搜索词过于 specific 导致搜不到
+            if cit_year_int is not None and cit_year_int < 2000:
+                query = first_author_clean
+            else:
+                query = f"{first_author_clean} {topic_keywords}".strip() if topic_keywords else first_author_clean
             result = await openalex_engine.search(
                 query=query,
                 limit=5,

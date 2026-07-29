@@ -563,6 +563,7 @@ class DeAIEngine:
             score += min(passive_ratio * 20, 10)
 
         # --- 8. 列举项数量偏好 ---
+        # 学术论文天然使用编号列表，提高触发阈值避免误报
         list_patterns = [
             r"[（(][12345][）)]",
             r"[一二三四五]、",
@@ -571,7 +572,8 @@ class DeAIEngine:
         list_count = 0
         for pat in list_patterns:
             list_count += len(re.findall(pat, text))
-        if list_count >= 3 and list_count % 3 == 0 or list_count % 5 == 0 and list_count >= 5:
+        # 只有当列表标记数量很多且恰好是3的倍数时才触发（排除学术论文正常引用）
+        if list_count >= 6 and (list_count % 3 == 0 or (list_count % 5 == 0 and list_count >= 10)):
             detected.append("列举项数量偏好")
             score += 8
             problematic.append({
@@ -581,15 +583,12 @@ class DeAIEngine:
             })
 
         # --- 9. 缺乏口语化学术表达 ---
-        has_colloquial = any(w in text for w in _COLLOQUIAL_ACADEMIC)
-        if not has_colloquial and total_chars > 300:
-            detected.append("缺乏口语化学术表达")
-            score += 8
-            problematic.append({
-                "sentence": "（全局）未检测到口语化学术表达",
-                "pattern": "缺乏口语化学术表达",
-                "suggestion": "适当加入「实际上」「事实上」等表达，增加自然感",
-            })
+        # 学术论文应使用正式表述，不应有口语化表达
+        # 此检测器对学术论文不适用，跳过
+        # has_colloquial = any(w in text for w in _COLLOQUIAL_ACADEMIC)
+        # if not has_colloquial and total_chars > 300:
+        #     detected.append("缺乏口语化学术表达")
+        #     score += 8
 
         # --- 10. 逻辑连接词过度使用 ---
         connector_count = sum(text.count(w) for w in _LOGIC_CONNECTORS)
@@ -634,11 +633,18 @@ class DeAIEngine:
         if assessment.risk_level == AIRiskLevel.LOW:
             return [DeAIStrategy.GEMINI_REWRITE]
         if assessment.risk_level == AIRiskLevel.MEDIUM:
-            # 温和策略组合，避免多策略叠加引入新的AI写作特征
-            return [
-                DeAIStrategy.PARAPHRASE_SYNONYM,
+            # 基础策略 + 针对检测到的模式选择定向策略
+            strategies = [
+                DeAIStrategy.GEMINI_REWRITE,
                 DeAIStrategy.GEMINI_ANTI_FABRICATE,
             ]
+            if "过度精确表述" in assessment.detected_patterns:
+                strategies.append(DeAIStrategy.GEMINI_FACT_STRENGTHEN)
+            if "机械的三段式结构" in assessment.detected_patterns:
+                strategies.append(DeAIStrategy.GEMINI_DETAIL_ENRICH)
+            if "套路化过渡词" in assessment.detected_patterns:
+                strategies.append(DeAIStrategy.GEMINI_RATE_REDUCE)
+            return strategies
         # HIGH
         strategies = [
             DeAIStrategy.GEMINI_RECONSTRUCT,
@@ -705,6 +711,11 @@ class DeAIEngine:
         result = re.sub(r"(\d+)\.\d+%", r"约\1%", result)
         # 将过度精确的倍数改为约数（如 2.7倍 → 约2.7倍）
         result = re.sub(r"(?<!约)(\d+)\.\d+倍", r"约\1倍", result)
+        # 将过度精确的万/亿单位改为约数（如 3.2万 → 约3万）
+        result = re.sub(r"(?<!约)(\d+)\.\d+万", r"约\1万", result)
+        result = re.sub(r"(?<!约)(\d+)\.\d+亿", r"约\1亿", result)
+        # 将过度精确的个/家/篇等单位改为约数（如 15.3个 → 约15个）
+        result = re.sub(r"(?<!约)(\d+)\.\d+(个|家|篇|项|次)", r"约\1\2", result)
 
         return result
 
@@ -791,8 +802,8 @@ class DeAIEngine:
     def basic_rewrite(self, text: str) -> str:
         """基础改写（Gemini策略6）.
 
-        轻量级同义词替换，每组只替换最高频的1-2个词。
-        不做句式转换或设问句转换。
+        综合性轻量改写：替换AI味过渡词、打破三段式结构、
+        将过度精确数字转为约数。不做句式转换或设问句转换。
 
         Args:
             text: 原始文本.
@@ -802,7 +813,7 @@ class DeAIEngine:
         """
         result = text
 
-        # 只替换最核心的AI味过渡词
+        # 1. 替换核心AI味过渡词
         core_replacements = [
             ("因此", "由此"),
             ("然而", "不过"),
@@ -811,9 +822,30 @@ class DeAIEngine:
             ("值得注意的是", "需要关注的是"),
             ("不可否认", "应当承认"),
             ("显而易见", "可以看到"),
+            ("毋庸置疑", "可以确定的是"),
+            ("不难看出", "可以看到"),
+            ("由此可见", "由此可知"),
+            ("不言而喻", "自然地"),
+            ("众所周知", "普遍认为"),
         ]
         for old, new in core_replacements:
             result = result.replace(old, new)
+
+        # 2. 打破三段式结构
+        breakers = [
+            ("首先，", "从最基本的层面来看，"),
+            ("其次，", "进一步来看，"),
+            ("最后，", "更为关键的是，"),
+            ("第一，", "先看"),
+            ("第二，", "再看"),
+            ("第三，", "还应注意"),
+        ]
+        for old, new in breakers:
+            result = result.replace(old, new)
+
+        # 3. 将过度精确的小数表述改为约数
+        result = re.sub(r"(\d+)\.\d+%", r"约\1%", result)
+        result = re.sub(r"(?<!约)(\d+)\.\d+倍", r"约\1倍", result)
 
         return result
 
