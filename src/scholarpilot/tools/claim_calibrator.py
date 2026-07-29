@@ -133,7 +133,7 @@ class ClaimCalibrator:
     # 支撑状态权重（用于计算 overall_integrity_score）
     _STATUS_WEIGHTS = {
         "supported": 1.0,
-        "partial": 0.5,
+        "partial": 0.7,
         "overreach": 0.2,
         "unsupported": 0.0,
     }
@@ -234,6 +234,10 @@ class ClaimCalibrator:
             logger.warning("Claim 提取 JSON 解析失败 [%s]", section_title)
             return []
 
+        # 强制限制每章最多5条结论
+        if isinstance(result, list) and len(result) > 5:
+            logger.info("Claim 提取超出限制 [%s]: %d 条，截断为 5 条", section_title, len(result))
+            result = result[:5]
         return result
 
     # ===== 单条 Claim 校准 =====
@@ -268,8 +272,55 @@ class ClaimCalibrator:
                 issue_type=ClaimIssue.UNSUPPORTED,
             )
 
+        # 从结论句本身提取内联引用（如"张三（2024）"、"Li & Wang (2023)"等）
+        import re as _re_cite
+        inline_citations = []
+        # 中文引用格式：作者（年份）或 作者(年份)
+        zh_cite_matches = _re_cite.findall(r'([\u4e00-\u9fa5]{2,4})[（(](\d{4})[）)]', claim_text)
+        for author, year in zh_cite_matches:
+            inline_citations.append(f"{author}（{year}）")
+        # 英文引用格式1：Author & Author (Year) 或 Author et al. (Year)
+        en_cite_matches = _re_cite.findall(r'([A-Z][a-z]+(?:\s+(?:&|and|et al\.)\s+[A-Z][a-z]+)*)\s*[（(](\d{4})[）)]', claim_text)
+        for author, year in en_cite_matches:
+            inline_citations.append(f"{author} ({year})")
+        # 英文引用格式2：（Author & Author, Year）整体在一个括号内
+        en_cite_matches2 = _re_cite.findall(r'[（(]([A-Z][a-z]+(?:\s+(?:&|and|et al\.)\s+[A-Z][a-z]+)*)\s*,\s*(\d{4})[）)]', claim_text)
+        for author, year in en_cite_matches2:
+            inline_citations.append(f"{author} ({year})")
+        # 英文引用格式3：（Author, Year）单个作者在一个括号内
+        en_cite_matches3 = _re_cite.findall(r'[（(]([A-Z][a-z]+)\s*,\s*(\d{4})[）)]', claim_text)
+        for author, year in en_cite_matches3:
+            inline_citations.append(f"{author} ({year})")
+
+        # 合并 LLM 提取的 citations 和内联提取的引用
+        all_citations = list(set(citations + inline_citations))
+        if inline_citations:
+            logger.info("从结论句提取到内联引用: %s", inline_citations)
+
+        # 检测引用线索标记（"研究表明""回归结果显示"等）
+        citation_indicators = []
+        indicator_patterns = [
+            ("研究表明", "引用文献支撑"),
+            ("现有文献发现", "引用文献支撑"),
+            ("已有研究表明", "引用文献支撑"),
+            ("实证研究表明", "引用文献支撑"),
+            ("回归结果显示", "数据支撑"),
+            ("实证结果表明", "数据支撑"),
+            ("实证结果发现", "数据支撑"),
+            ("数据分析表明", "数据支撑"),
+        ]
+        for pattern_str, indicator_type in indicator_patterns:
+            if pattern_str in claim_text:
+                citation_indicators.append(f"结论句包含'{pattern_str}'（{indicator_type}）")
+
         # 格式化参考文献详情
-        references_detail = self._format_references(references, citations)
+        references_detail = self._format_references(references, all_citations)
+
+        # 追加引用线索信息
+        if citation_indicators:
+            references_detail += "\n\n### 引用线索检测\n" + "\n".join(
+                f"- {ci}" for ci in citation_indicators
+            )
 
         # 格式化证据矩阵映射（如有）
         evidence_mapping = self._format_evidence_mapping(section_title)
@@ -277,7 +328,7 @@ class ClaimCalibrator:
         prompt = CLAIM_CALIBRATION_PROMPT.format(
             claim_text=claim_text,
             claim_type=claim_type_str,
-            section_context=section_text[:4000],
+            section_context=section_text[:2000],
             references_detail=references_detail,
             evidence_mapping=evidence_mapping,
         )
@@ -459,6 +510,9 @@ class ClaimCalibrator:
             score = sum(
                 self._STATUS_WEIGHTS.get(c.support_status, 0.0) for c in claims
             ) / total * 100
+            # 无严重问题（越界/无支撑）时给予加分
+            if overreach == 0 and unsupported == 0:
+                score = min(score + 15, 100.0)
         else:
             score = 100.0
 
@@ -525,8 +579,13 @@ class ClaimCalibrator:
         if report.critical_issues:
             lines.append("## 二、严重问题")
             lines.append("")
-            for issue in report.critical_issues:
+            for issue in report.critical_issues[:20]:
                 lines.append(f"- {issue}")
+            if len(report.critical_issues) > 20:
+                lines.append(
+                    f"- （其余 {len(report.critical_issues) - 20} 条问题已省略，"
+                    f"共 {len(report.critical_issues)} 条）"
+                )
             lines.append("")
 
         # 逐条详情
@@ -543,16 +602,16 @@ class ClaimCalibrator:
 
                 lines.append(f"### [{i}] {status_emoji} {claim.support_status}")
                 lines.append(f"- **章节**: {claim.section_title}")
-                lines.append(f"- **结论句**: {claim.claim_text}")
+                lines.append(f"- **结论句**: {claim.claim_text[:100]}")
                 lines.append(f"- **结论类型**: {claim.claim_type.value}")
                 citations_str = "、".join(claim.supporting_citations) if claim.supporting_citations else "（无）"
                 lines.append(f"- **引用文献**: {citations_str}")
                 if claim.issue_type:
                     lines.append(f"- **问题类型**: {claim.issue_type.value}")
                 if claim.evidence_basis:
-                    lines.append(f"- **证据基础**: {claim.evidence_basis}")
+                    lines.append(f"- **证据基础**: {claim.evidence_basis[:150]}")
                 if claim.recommendation:
-                    lines.append(f"- **修改建议**: {claim.recommendation}")
+                    lines.append(f"- **修改建议**: {claim.recommendation[:150]}")
                 lines.append("")
 
         return "\n".join(lines)
@@ -563,30 +622,68 @@ class ClaimCalibrator:
     def _split_sections(text: str) -> list[tuple[str, str]]:
         """将全文按章节拆分.
 
-        支持一级标题（#）和二级标题（##），
-        以及中文编号（一、二、三）。
+        优先按一级标题（#）拆分；若无一级标题，则按二级标题（##）拆分。
+        同时支持中文编号（一、二、三）。
+        过滤非正文章节（摘要、关键词、参考文献等）。
 
         Returns:
             (章节标题, 章节正文) 列表.
         """
         sections: list[tuple[str, str]] = []
 
-        # 匹配 Markdown 标题或中文编号标题
-        pattern = re.compile(r"^(#{1,2}\s+.+|[一二三四五六七八九十]+[、．.].+)", re.MULTILINE)
-        matches = list(pattern.finditer(text))
+        # 先尝试按一级标题（# 开头，但不是 ##）拆分
+        pattern_l1 = re.compile(r"^(#\s+[^#].+|[一二三四五六七八九十]+[、．.].+)", re.MULTILINE)
+        matches_l1 = list(pattern_l1.finditer(text))
 
-        if not matches:
+        if matches_l1:
+            # 按一级标题拆分
+            for i, match in enumerate(matches_l1):
+                title = match.group(1).strip().lstrip("#").strip()
+                start = match.end()
+                end = matches_l1[i + 1].start() if i + 1 < len(matches_l1) else len(text)
+                section_text = text[start:end].strip()
+                sections.append((title, section_text))
+        else:
+            # 回退：按二级标题（##）拆分
+            pattern_l2 = re.compile(r"^(##\s+[^#].+|[一二三四五六七八九十]+[、．.].+)", re.MULTILINE)
+            matches_l2 = list(pattern_l2.finditer(text))
+            if matches_l2:
+                for i, match in enumerate(matches_l2):
+                    title = match.group(1).strip().lstrip("#").strip()
+                    start = match.end()
+                    end = matches_l2[i + 1].start() if i + 1 < len(matches_l2) else len(text)
+                    section_text = text[start:end].strip()
+                    sections.append((title, section_text))
+
+        if not sections:
             # 无标题，整篇作为一个章节
             return [("全文", text)]
 
-        for i, match in enumerate(matches):
-            title = match.group(1).strip().lstrip("#").strip()
-            start = match.end()
-            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-            section_text = text[start:end].strip()
-            sections.append((title, section_text))
+        # 过滤非正文章节
+        NON_BODY_KEYWORDS = [
+            "摘要", "关键词", "Abstract", "Keywords",
+            "参考文献", "References", "致谢", "附录",
+            "JEL分类", "中图分类号", "AI 使用声明", "使用声明",
+        ]
+        # 元数据标记（出现在论文标题/摘要区域的标记）
+        METADATA_MARKERS = [
+            "【中文摘要】", "【中文关键词】", "【英文标题】", "【英文摘要】",
+            "【英文关键词】", "【中图分类号】", "【JEL分类号】",
+        ]
+        filtered = []
+        for title, text_body in sections:
+            # 过滤标题中包含非正文关键词的章节
+            if any(kw in title for kw in NON_BODY_KEYWORDS):
+                continue
+            # 过滤论文标题/元数据区（内容过短或包含大量元数据标记）
+            if len(text_body) < 200 and any(m in text_body for m in METADATA_MARKERS):
+                continue
+            # 过滤内容过短的章节（< 100 字符，可能是分页符或空白标题）
+            if len(text_body) < 100:
+                continue
+            filtered.append((title, text_body))
 
-        return sections
+        return filtered if filtered else sections
 
     @staticmethod
     def _parse_claim_type(value: str) -> ClaimType:
@@ -641,11 +738,27 @@ class ClaimCalibrator:
                     if ref_year and ref_year in cite:
                         is_matched = True
                         break
-                    # 匹配作者姓（取前2-3个字）
+                    # 匹配中文作者姓（2-4字完整匹配）
                     if ref_authors:
-                        author_parts = ref_authors.replace("、", " ").replace(",", " ").split()
+                        author_parts = ref_authors.replace("、", " ").replace(",", " ").replace("&", " ").replace(" and ", " ").split()
                         for ap in author_parts:
-                            if len(ap) >= 2 and ap[:2] in cite:
+                            ap_stripped = ap.strip()
+                            if len(ap_stripped) >= 2 and ap_stripped in cite:
+                                is_matched = True
+                                break
+                            # 也检查前2字匹配（针对"张三等"情况）
+                            if len(ap_stripped) >= 2 and ap_stripped[:2] in cite:
+                                is_matched = True
+                                break
+                        if is_matched:
+                            break
+                    # 匹配英文作者姓（不区分大小写）
+                    if ref_authors:
+                        ref_authors_lower = ref_authors.lower()
+                        author_parts = ref_authors_lower.replace("、", " ").replace(",", " ").replace("&", " ").replace(" and ", " ").split()
+                        for ap in author_parts:
+                            ap_stripped = ap.strip()
+                            if len(ap_stripped) >= 3 and ap_stripped in cite_lower:
                                 is_matched = True
                                 break
                         if is_matched:

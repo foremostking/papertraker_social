@@ -187,6 +187,14 @@ class LLMGateway:
             if len(lines) >= 3:
                 result = "\n".join(lines[1:-1]).strip()
 
+        # 全局标点清洗：去除双句号、分号句号等异常标点组合
+        result = re.sub(r"；。", "；", result)      # 分号句号 → 分号
+        result = re.sub(r"。。+", "。", result)      # 多个句号 → 单句号
+        result = re.sub(r"；；+", "；", result)      # 多个分号 → 单分号
+        result = re.sub(r"，，+", "，", result)      # 多个逗号 → 单逗号
+        # 关键词列表中的分号句号：数字化转型；。企业 → 数字化转型；企业
+        result = re.sub(r"；。\s*", "；", result)
+
         return result
 
     # 空响应最大重试次数

@@ -1959,6 +1959,21 @@ class ScholarAgent:
 
         # 保存合并的草稿
         draft_path = self.project_dir / "draft" / "full_draft.md"
+        # 全局标点清洗（LLM 生成时可能引入异常标点组合）
+        # 使用 while 循环反复清洗 ；。，因为 `；。。` 这类组合单次替换后会残留 `；。`
+        # （单次 `；。\s*→；` 会把 `；。。` 变成 `；。`，而后续 `。。+→。` 又匹配不上单个 `。`）。
+        import re as _re_merge
+        _merge_sp_total = 0
+        while True:
+            merged, _n = _re_merge.subn(r"；。\s*", "；", merged)
+            _merge_sp_total += _n
+            if _n == 0:
+                break
+        merged = _re_merge.sub(r"。。+", "。", merged)      # 多个句号 → 单句号
+        merged = _re_merge.sub(r"；；+", "；", merged)      # 多个分号 → 单分号
+        merged = _re_merge.sub(r"，，+", "，", merged)      # 多个逗号 → 单逗号
+        if _merge_sp_total > 0:
+            logger.info("_merge_draft 标点清洗: 共清除 %d 处 ；。残留", _merge_sp_total)
         draft_path.write_text(merged, encoding="utf-8")
         self.console.print(f"\n[green]完整草稿已合并: {draft_path}[/green]")
 
@@ -2913,6 +2928,39 @@ class ScholarAgent:
         # ---- 4. 合并结果 ----
         polished_full = "\n\n---\n\n".join(polished_sections)
 
+        # ---- 4b. 全局标点清洗（去AI味/润色引擎可能在 LLM 调用后引入异常标点组合）----
+        # 关键：单次 `；。\s*→；` 无法清除 `；。。` 这类组合（替换后会残留 `；。`，
+        # 而后续 `。。+→。` 又匹配不上单个 `。`）。因此使用 while 循环反复清洗，
+        # 同时处理 `；。\s*`（含尾随空白）与直接 `；。` 两种模式，直至一轮内无任何变化才停止。
+        import re as _re_clean
+        _semicolon_period_total = 0   # 专门统计 ；。 清除次数
+        while True:
+            _sp_count = 0      # 本轮 ；。 清除数
+            _other_count = 0   # 本轮其他重复标点合并数
+            # `；。\s*` 已涵盖直接的 `；。`（\s* 匹配零或多个空白）
+            polished_full, _n = _re_clean.subn(r"；。\s*", "；", polished_full)
+            _sp_count += _n
+            _semicolon_period_total += _n
+            # 合并重复标点（可能在 ；。 清除后形成新的异常邻接，需在同一轮处理）
+            polished_full, _n = _re_clean.subn(r"。。+", "。", polished_full)
+            _other_count += _n
+            polished_full, _n = _re_clean.subn(r"；；+", "；", polished_full)
+            _other_count += _n
+            polished_full, _n = _re_clean.subn(r"，，+", "，", polished_full)
+            _other_count += _n
+            polished_full, _n = _re_clean.subn(r"：：+", "：", polished_full)
+            _other_count += _n
+            if _sp_count == 0 and _other_count == 0:
+                break
+        if _semicolon_period_total > 0:
+            log.info(
+                "Phase 8b 标点清洗: full_draft_polished 共清除 %d 处 ；。残留",
+                _semicolon_period_total,
+            )
+            self.console.print(
+                f"  [dim]标点清洗: 清除 {_semicolon_period_total} 处；。残留[/dim]"
+            )
+
         # ---- 5. 保存 full_draft_polished.md（不覆盖原草稿）----
         polished_path = self.project_dir / "draft" / "full_draft_polished.md"
         try:
@@ -3236,6 +3284,23 @@ class ScholarAgent:
         elif draft_path.exists():
             full_text = draft_path.read_text(encoding="utf-8")
             source_label = "full_draft.md"
+
+        # 读取后立即清洗标点（防御性：避免 ；。 残留进入 Claim 校准）
+        # 使用 while 循环反复清洗，与 Phase 8b 保持一致，确保彻底清除 `；。。` 这类残留。
+        import re as _re_clean
+        _c8c_sp_total = 0
+        while True:
+            full_text, _n = _re_clean.subn(r"；。\s*", "；", full_text)
+            _c8c_sp_total += _n
+            if _n == 0:
+                break
+        full_text = _re_clean.sub(r"。。+", "。", full_text)
+        full_text = _re_clean.sub(r"；；+", "；", full_text)
+        if _c8c_sp_total > 0:
+            logger.info(
+                "Phase 8c 标点清洗: %s 读取后清除 %d 处 ；。残留",
+                source_label, _c8c_sp_total,
+            )
 
         if not full_text.strip():
             self.console.print("[yellow]草稿文件不存在或为空，跳过 Claim 校准[/yellow]")

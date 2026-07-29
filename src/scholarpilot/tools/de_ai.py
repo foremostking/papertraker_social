@@ -154,7 +154,7 @@ class DeAIResult(BaseModel):
 SYNONYM_DICT: dict[str, list[str]] = {
     # ---- 动词 ----
     "提出": ["构建", "建立", "创立", "搭建"],
-    "研究": ["探讨", "分析", "考察", "审视"],
+    "研究": ["探讨", "分析", "考察", "评估"],
     "表明": ["显示", "揭示", "证实", "印证"],
     "影响": ["作用", "促进", "推动", "驱动"],
     "促进": ["推动", "驱动", "助推", "推进"],
@@ -634,10 +634,10 @@ class DeAIEngine:
         if assessment.risk_level == AIRiskLevel.LOW:
             return [DeAIStrategy.GEMINI_REWRITE]
         if assessment.risk_level == AIRiskLevel.MEDIUM:
+            # 温和策略组合，避免多策略叠加引入新的AI写作特征
             return [
-                DeAIStrategy.GEMINI_REWRITE,
-                DeAIStrategy.GEMINI_RATE_REDUCE,
                 DeAIStrategy.PARAPHRASE_SYNONYM,
+                DeAIStrategy.GEMINI_ANTI_FABRICATE,
             ]
         # HIGH
         strategies = [
@@ -660,8 +660,8 @@ class DeAIEngine:
     def reconstruct_logic(self, text: str) -> str:
         """重构论述逻辑（Gemini策略1）.
 
-        打破AI的三段式/对称式结构，重新组织论证顺序，
-        引入转折和递进的非线性逻辑。
+        打破AI的三段式/对称式结构，将"不仅...而且..."和
+        "一方面...另一方面..."拆分为独立句。
 
         Args:
             text: 原始文本.
@@ -671,25 +671,10 @@ class DeAIEngine:
         """
         result = text
 
-        # 打破"首先...其次...最后..."三段式
-        replacements = [
-            ("首先", "从最直接的层面来看"),
-            ("其次", "进一步审视则可以发现"),
-            ("最后", "归根结底"),
-            ("第一，", "首要的一点在于，"),
-            ("第二，", "与此相关的是，"),
-            ("第三，", "更为关键的是，"),
-            ("一是", "一方面"),
-            ("二是", "另一方面，从互补的视角来看"),
-            ("三是", "此外还须提及"),
-        ]
-        for old, new in replacements:
-            result = result.replace(old, new)
-
         # 打破"不仅...而且..."对称结构为独立句
         result = re.sub(
             r"不仅(.{2,30}?)[，,]而且(.{2,40}?)[。；]",
-            r"\1。与此同时，\2。",
+            r"\1。同时，\2。",
             result,
         )
 
@@ -700,26 +685,13 @@ class DeAIEngine:
             result,
         )
 
-        # 在论证段末添加非线性转折
-        paragraphs = result.split("\n")
-        for i, para in enumerate(paragraphs):
-            if para.strip() and not para.strip().endswith(("？", "！", "：")):
-                if i > 0 and random.random() < 0.3:
-                    transitions = [
-                        "当然，这一判断仍有待进一步检验。",
-                        "不过，事情或许并非如此简单。",
-                        "但若换一个角度来看，结论可能有所不同。",
-                    ]
-                    para = para.rstrip("。") + "。" + random.choice(transitions)
-                    paragraphs[i] = para
-
-        return "\n".join(paragraphs)
+        return result
 
     def strengthen_facts(self, text: str) -> str:
         """强化事实基础（Gemini策略2）.
 
-        添加具体数据支撑标记、时间节点和来源标注，
-        将模糊表述改为精确表述（如无数据则标记需要补充）。
+        将过度精确的小数表述改为约数，移除无来源支撑的绝对化表述。
+        不添加任何标记或占位符。
 
         Args:
             text: 原始文本.
@@ -729,55 +701,18 @@ class DeAIEngine:
         """
         result = text
 
-        # 将模糊量化表述标记为需要补充数据
-        vague_quantifiers = [
-            ("大量", "大量[需补充具体数据]"),
-            ("许多", "许多[需补充具体数据]"),
-            ("一些", "一些[需补充具体数据]"),
-            ("部分", "部分[需补充具体数据]"),
-            ("不少", "不少[需补充具体数据]"),
-            ("若干", "若干[需补充具体数据]"),
-        ]
-        for old, new in vague_quantifiers:
-            result = result.replace(old, new)
+        # 将过度精确的百分比改为约数（如 24.3% → 约24%）
+        result = re.sub(r"(\d+)\.\d+%", r"约\1%", result)
+        # 将过度精确的倍数改为约数（如 2.7倍 → 约2.7倍）
+        result = re.sub(r"(?<!约)(\d+)\.\d+倍", r"约\1倍", result)
 
-        # 为"研究表明"类表述添加来源标注
-        source_patterns = [
-            ("研究表明", "研究表明[需标注来源]"),
-            ("研究显示", "研究显示[需标注来源]"),
-            ("学者认为", "学者认为[需标注来源]"),
-            ("有研究指出", "有研究指出[需标注来源]"),
-            ("已有研究", "已有研究[需标注来源]"),
-        ]
-        for old, new in source_patterns:
-            if "[需标注来源]" not in result:
-                result = result.replace(old, new)
-
-        # 为缺少时间节点的论断添加时间标记
-        time_markers = [
-            "近年来", "截至目前", "在过去十年中", "自改革开放以来",
-            "进入21世纪以来", "在后疫情时代",
-        ]
-        sentences = self._split_sentences(result)
-        rebuilt = []
-        time_added = 0
-        for s in sentences:
-            has_time = any(t in s for t in time_markers) or re.search(r"\d{4}年", s)
-            if not has_time and time_added < 2 and len(s) > 15:
-                marker = random.choice(time_markers)
-                s = f"{marker}，{s}"
-                time_added += 1
-            rebuilt.append(s)
-
-        # 去除每句末尾的句号后再 join，避免 。。 双句号
-        rebuilt = [s.rstrip("。") for s in rebuilt]
-        return "。".join(rebuilt) + "。"
+        return result
 
     def enrich_details(self, text: str) -> str:
         """丰富内容细节（Gemini策略3）.
 
-        添加案例说明、背景解释和原因分析，
-        使论述更加丰满和具体。
+        打破机械的三段式结构，将"首先...其次...最后..."改为
+        更自然的论述顺序。不添加任何填充句。
 
         Args:
             text: 原始文本.
@@ -786,47 +721,29 @@ class DeAIEngine:
             丰富细节后的文本.
         """
         result = text
-        sentences = self._split_sentences(result)
-        enriched: list[str] = []
 
-        case_markers = [
-            "——以中国的实践为例，",
-            "（例如，在金融领域，）",
-            "具体而言，以制度改革为例，",
-            "从国际经验来看，",
+        # 打破三段式结构：将"首先...其次...最后"改为更自然的衔接
+        breakers = [
+            ("首先，", "从最基本的层面来看，"),
+            ("其次，", "进一步来看，"),
+            ("最后，", "更为关键的是，"),
+            ("第一，", "先看"),
+            ("第二，", "再看"),
+            ("第三，", "还应注意"),
+            ("一是", "一方面"),
+            ("二是", "另一方面"),
+            ("三是", "此外"),
         ]
-        background_markers = [
-            "从历史维度来看，",
-            "从制度演化的背景来看，",
-            "理解这一现象需要回到其发生的历史语境——",
-        ]
-        causal_markers = [
-            "究其原因，",
-            "从深层机制来看，",
-            "这一现象背后的逻辑在于——",
-        ]
+        for old, new in breakers:
+            result = result.replace(old, new)
 
-        detail_count = 0
-        for i, s in enumerate(sentences):
-            enriched.append(s)
-            # 每隔2-3句插入一个细节扩展
-            if detail_count < 3 and i > 0 and (i + 1) % 3 == 0 and len(s) > 20:
-                choice = detail_count % 3
-                if choice == 0:
-                    enriched.append(random.choice(case_markers) + "这一情形在现实中不乏印证。")
-                elif choice == 1:
-                    enriched.append(random.choice(background_markers) + "这一过程的演化并非一蹴而就。")
-                else:
-                    enriched.append(random.choice(causal_markers) + "多重因素的交织构成了这一结果。")
-                detail_count += 1
-
-        return "。".join(enriched) + ("。" if not result.endswith("。") else "")
+        return result
 
     def reduce_ai_rate(self, text: str) -> str:
         """降AI率（Gemini策略4）.
 
-        打乱句式规律性，变换句子长度（长短交替），
-        插入个人评述性语句，使用非常规标点（破折号、括号补充说明）。
+        打破套路化过渡词，替换为更自然的衔接方式。
+        不添加任何随机标点或填充内容。
 
         Args:
             text: 原始文本.
@@ -835,32 +752,27 @@ class DeAIEngine:
             降AI率后的文本.
         """
         result = text
-        sentences = self._split_sentences(result)
-        rebuilt: list[str] = []
 
-        for i, s in enumerate(sentences):
-            rebuilt.append(s)
+        # 替换套路化过渡词为更自然的表达
+        transition_replacements = [
+            ("综上所述", "总的来看"),
+            ("值得注意的是", "需要关注的是"),
+            ("显而易见", "可以看到"),
+            ("毋庸置疑", "可以确定的是"),
+            ("不难看出", "可以看到"),
+            ("由此可见", "由此可知"),
+            ("不言而喻", "自然地"),
+            ("不可否认", "应当承认"),
+        ]
+        for old, new in transition_replacements:
+            result = result.replace(old, new)
 
-        # 去除每句末尾的句号后再 join，避免 。。 双句号
-        rebuilt = [s.rstrip("。") for s in rebuilt]
-
-        # 用破折号替换部分逗号以制造非规则感
-        joined = "。".join(rebuilt)
-        # 随机将少量逗号替换为破折号
-        commas = list(re.finditer(r"，", joined))
-        if len(commas) > 5:
-            replace_count = min(len(commas) // 6, 3)
-            for match in random.sample(commas, replace_count):
-                pos = match.start()
-                joined = joined[:pos] + "——" + joined[pos + 1:]
-
-        return joined + ("。" if not joined.endswith(("。", "！", "？")) else "")
+        return result
 
     def anti_fabricate(self, text: str) -> str:
         """防止编造（Gemini策略5）.
 
-        标记无来源支撑的论断，将绝对化表述改为条件化表述，
-        添加不确定性标记。
+        将绝对化表述改为条件化表述，不添加任何标记或占位符。
 
         Args:
             text: 原始文本.
@@ -874,37 +786,13 @@ class DeAIEngine:
         for absolute, conditional in _ABSOLUTE_TO_CONDITIONAL.items():
             result = result.replace(absolute, conditional)
 
-        # 为无来源支撑的论断添加不确定性标记
-        uncertainty_prefixes = [
-            "据现有研究来看，",
-            "就目前掌握的证据而言，",
-            "从可获得的信息来看，",
-            "在现有文献的范围内，",
-        ]
-        # 识别断言性句子（以"是""能够""将会"结尾的判断句）
-        assertion_patterns = [
-            (r"(.{10,40}?)是(.{5,30}?)的根本原因[。]",
-             lambda m: f"{random.choice(uncertainty_prefixes)}{m.group(1)}可能是{m.group(2)}的根本原因之一。"),
-            (r"(.{10,40}?)能够(.{5,30}?)[。]",
-             lambda m: f"{random.choice(uncertainty_prefixes)}{m.group(1)}有望{m.group(2)}。"),
-        ]
-        for pat, repl in assertion_patterns:
-            result = re.sub(pat, repl, result)
-
-        # 标记可能编造的数据引用
-        result = re.sub(
-            r"(\d{4}年.{0,10}?研究表明)",
-            r"\1[待核实]",
-            result,
-        )
-
         return result
 
     def basic_rewrite(self, text: str) -> str:
         """基础改写（Gemini策略6）.
 
-        同义词替换、句式变换（主动与被动转换、陈述与疑问转换）、
-        语序调整。
+        轻量级同义词替换，每组只替换最高频的1-2个词。
+        不做句式转换或设问句转换。
 
         Args:
             text: 原始文本.
@@ -914,28 +802,20 @@ class DeAIEngine:
         """
         result = text
 
-        # 同义词替换（每组随机选一个替换词）
-        for original, synonyms in SYNONYM_DICT.items():
-            if original in result:
-                replacement = random.choice(synonyms)
-                result = result.replace(original, replacement, 1)
+        # 只替换最核心的AI味过渡词
+        core_replacements = [
+            ("因此", "由此"),
+            ("然而", "不过"),
+            ("此外", "同时"),
+            ("综上所述", "总的来看"),
+            ("值得注意的是", "需要关注的是"),
+            ("不可否认", "应当承认"),
+            ("显而易见", "可以看到"),
+        ]
+        for old, new in core_replacements:
+            result = result.replace(old, new)
 
-        # 将部分陈述句转换为设问句（偶发，增加自然感）
-        sentences = self._split_sentences(result)
-        rebuilt: list[str] = []
-        for i, s in enumerate(sentences):
-            if i > 0 and (i + 1) % 5 == 0 and s.endswith("。"):
-                # 尝试转换为设问
-                core = s.rstrip("。")
-                if "是" in core:
-                    parts = core.split("是", 1)
-                    if len(parts) == 2 and len(parts[0]) > 5:
-                        rebuilt.append(f"{parts[0]}是否{parts[1]}？答案并非那么简单。")
-                        continue
-            rebuilt.append(s)
-
-        rebuilt = [s.rstrip("。") for s in rebuilt]
-        return "。".join(rebuilt) + ("。" if not result.rstrip("。").endswith(("！", "？")) else "")
+        return result
 
     # =========================================================================
     # GPT5.5 去AI味 2 策略
@@ -944,8 +824,8 @@ class DeAIEngine:
     def humanize_rewrite(self, text: str) -> str:
         """人性化改写（GPT5.5策略1）.
 
-        规则：每句不超过约20个中文字符（不含标点），
-        加入思考性表达，模拟人类写作的"不完美性"。
+        将过长的句子拆分为短句，增加论述的自然节奏。
+        不添加任何口语化填充句或随机内容。
 
         Args:
             text: 原始文本.
@@ -957,12 +837,11 @@ class DeAIEngine:
         sentences = self._split_sentences(result)
         rebuilt: list[str] = []
 
-        think_idx = 0
-        for i, s in enumerate(sentences):
+        for s in sentences:
             # 统计中文字符数（不含标点）
             chinese_chars = len(re.findall(r"[\u4e00-\u9fff]", s))
 
-            if chinese_chars > 25:
+            if chinese_chars > 40:
                 # 拆分长句：在逗号、分号处分割
                 sub_parts = re.split(r"[，,；;]", s)
                 if len(sub_parts) >= 2:
@@ -978,18 +857,7 @@ class DeAIEngine:
 
         # 去除每句末尾的句号后再 join，避免 。。 双句号
         rebuilt = [s.rstrip("。") for s in rebuilt]
-
-        # 模拟"不完美性"：偶尔添加轻微的口语化重复
-        joined = "。".join(rebuilt)
-        if random.random() < 0.3:
-            imperfections = [
-                "也就是说，事情就是这么回事。",
-                "说到底，还是要在实践中去检验。",
-                "这一点，其实很关键。",
-            ]
-            joined += random.choice(imperfections)
-
-        return joined + ("。" if not joined.endswith(("。", "！", "？")) else "")
+        return "。".join(rebuilt) + ("。" if not result.rstrip("。").endswith(("！", "？")) else "")
 
     def reviewer_perspective(self, text: str) -> str:
         """审稿人视角修订（GPT5.5策略2）.
