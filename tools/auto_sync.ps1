@@ -5,7 +5,7 @@
 # Derive project dir from script location (avoids Chinese path encoding issues)
 $ProjectDir = Split-Path -Parent $PSScriptRoot
 $GitPath = "D:\Software\Git\cmd\git.exe"
-$LogFile = Join-Path $ProjectDir ".scholar\sync.log"
+$LogFile = Join-Path $ProjectDir ".git\auto-sync.log"
 $Remote = "origin"
 $Branch = "scholarpilot"
 
