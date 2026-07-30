@@ -1,11 +1,17 @@
-﻿# ScholarPilot 每日自动同步脚本
-# 功能：自动检测变更、提交并推送到 GitHub
+# ScholarPilot Daily Auto-Sync Script
+# Silent: skip when no changes, only log on push failure
+# Uses SSH protocol (remote set to git@github.com:...)
 
+# Derive project dir from script location (avoids Chinese path encoding issues)
+$ProjectDir = Split-Path -Parent $PSScriptRoot
 $GitPath = "D:\Software\Git\cmd\git.exe"
-$ProjectDir = "d:\副业\2026\AI论文自动化工程\scholarpilot"
 $LogFile = Join-Path $ProjectDir ".scholar\sync.log"
 $Remote = "origin"
 $Branch = "scholarpilot"
+
+# Ensure SSH can find keys in non-interactive (scheduled task) context
+$env:HOME = $env:USERPROFILE
+$env:GIT_SSH_COMMAND = "D:\Software\Git\usr\bin\ssh.exe -o StrictHostKeyChecking=no"
 
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
@@ -14,47 +20,47 @@ function Write-Log {
     Add-Content -Path $LogFile -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue
 }
 
-# 确保日志目录存在
+# Ensure log directory exists
 $LogDir = Split-Path $LogFile -Parent
 if (-not (Test-Path $LogDir)) {
     New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 }
 
 # 1. git add -A
-& $GitPath -C $ProjectDir add -A
+& $GitPath -C $ProjectDir add -A 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) {
-    Write-Log "git add -A 失败 (exit=$LASTEXITCODE)" "ERROR"
+    Write-Log "git add -A failed (exit=$LASTEXITCODE)" "ERROR"
     exit 1
 }
 
-# 2. 检查是否有变更
-$status = & $GitPath -C $ProjectDir status --short
+# 2. Check for changes
+$status = & $GitPath -C $ProjectDir status --short 2>&1
 if ([string]::IsNullOrWhiteSpace($status)) {
-    # 无变更，静默退出
+    # No changes, silent exit
     exit 0
 }
 
-# 3. 提交变更
+# 3. Commit changes
 $commitMsg = "auto sync: $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
-& $GitPath -C $ProjectDir commit -m "$commitMsg"
+& $GitPath -C $ProjectDir commit -m "$commitMsg" 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) {
-    Write-Log "git commit 失败 (exit=$LASTEXITCODE)" "ERROR"
+    Write-Log "git commit failed (exit=$LASTEXITCODE)" "ERROR"
     exit 1
 }
 
-# 4. 推送到远程
-& $GitPath -C $ProjectDir push $Remote $Branch
+# 4. Push to remote
+& $GitPath -C $ProjectDir push $Remote $Branch 2>&1 | Out-Null
 if ($LASTEXITCODE -eq 0) {
-    Write-Log "推送成功: $commitMsg" "INFO"
+    Write-Log "Push OK: $commitMsg" "INFO"
     exit 0
 }
 
-# 5. 推送失败，等待10秒后重试
+# 5. Push failed, wait 10s and retry once
 Start-Sleep -Seconds 10
-& $GitPath -C $ProjectDir push $Remote $Branch
+& $GitPath -C $ProjectDir push $Remote $Branch 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) {
-    Write-Log "推送重试后仍然失败 (exit=$LASTEXITCODE)" "ERROR"
+    Write-Log "Push FAILED after retry (exit=$LASTEXITCODE): $commitMsg" "ERROR"
     exit 1
 } else {
-    Write-Log "重试后推送成功: $commitMsg" "INFO"
+    Write-Log "Retry push OK: $commitMsg" "INFO"
 }
