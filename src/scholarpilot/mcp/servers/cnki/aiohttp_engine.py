@@ -255,6 +255,9 @@ class CNKIAiohttpEngine:
             if not text:
                 return ""
             text = text.strip()
+            # 若已是空格分隔的关键词，直接使用（外部已提取）
+            if " " in text:
+                return text
             # 去掉常见学术后缀
             for suffix in ("研究", "分析", "探讨", "实证", "效应", "影响"):
                 if text.endswith(suffix):
@@ -278,9 +281,20 @@ class CNKIAiohttpEngine:
 
         parts = []
         if core_topic:
-            parts.append(f"SU %= '{core_topic}'")
+            # 空格分隔的关键词，每个单独作为 SU %= 条件
+            if " " in core_topic:
+                for kw in core_topic.split():
+                    if kw.strip():
+                        parts.append(f"SU %= '{kw.strip()}'")
+            else:
+                parts.append(f"SU %= '{core_topic}'")
         if core_content and core_content not in core_topic:
-            parts.append(f"SU %= '{core_content}'")
+            if " " in core_content:
+                for kw in core_content.split():
+                    if kw.strip() and kw.strip() not in core_topic:
+                        parts.append(f"SU %= '{kw.strip()}'")
+            else:
+                parts.append(f"SU %= '{core_content}'")
         return " AND ".join(parts) if parts else f"SU %= '{core_topic}'"
 
     @staticmethod

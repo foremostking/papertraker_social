@@ -468,15 +468,113 @@ class ScholarAgent:
 
     # ===== Phase 2: CNKI 检索 + 8维统计 =====
 
+    @staticmethod
+    def _extract_search_keywords(text: str) -> str:
+        """从混合文本中提取 2-3 个核心学术关键词，用于检索.
+
+        从用户输入或 LLM 返回的 topic 中智能提取关键词，
+        解决 LLM 可能返回完整句子而非关键词的问题。
+
+        策略：
+        1. 先清除常见停用词/虚词/功能词
+        2. 用正则匹配学术关键词模式
+        3. 若匹配到 2+ 个关键词，用空格拼接返回
+        4. 否则回退到 CNKI extract_core 逻辑
+
+        Args:
+            text: 原始文本（可能是完整句子或关键词）。
+
+        Returns:
+            空格分隔的核心关键词，如 "财政政策 经济增长"。
+        """
+        if not text:
+            return ""
+        import re
+        # 常见学术关键词正则模式（按优先级排序）
+        KEYWORD_PATTERNS = [
+            r'[\u4e00-\u9fff]{2,4}政策',
+            r'[\u4e00-\u9fff]{2,4}增长',
+            r'[\u4e00-\u9fff]{2,4}效应',
+            r'[\u4e00-\u9fff]{2,6}债务',
+            r'[\u4e00-\u9fff]{2,4}风险',
+            r'[\u4e00-\u9fff]{2,4}影响',
+            r'[\u4e00-\u9fff]{2,4}发展',
+            r'[\u4e00-\u9fff]{2,6}经济',
+            r'[\u4e00-\u9fff]{2,4}财政',
+            r'[\u4e00-\u9fff]{2,4}改革',
+            r'[\u4e00-\u9fff]{2,4}创新',
+            r'[\u4e00-\u9fff]{2,4}投资',
+            r'[\u4e00-\u9fff]{2,4}治理',
+        ]
+        # 停用词和虚词 - 从文本中清除
+        STOP_WORDS = re.compile(
+            r'我想写一篇关于|我想研究|研究|分析|探讨|实证|论文|的|了|和|与|及|或|对|在|从|将|把|被|'
+            r'基于|通过|利用|采用|使用|运用|进行|开展|构建|建立|提出|探讨|分析|考察|检验|验证|'
+            r'一个|一种|一篇|这个|那个|及其|以及|及其|之间|之中|之上|之下|'
+            r'影响|关系|作用|机制|效应|因素|问题|现状|对策|建议|策略'
+        )
+        # 先清除停用词
+        cleaned = STOP_WORDS.sub(' ', text)
+        # 清除多余空格
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+
+        # 在清理后的文本中匹配关键词
+        found = []
+        remaining = cleaned
+        for pattern in KEYWORD_PATTERNS:
+            matches = re.findall(pattern, remaining)
+            for m in matches:
+                if m not in found and len(m) >= 4:
+                    # 过滤以虚词开头的伪关键词
+                    if m[0] in "的对了和与及或":
+                        continue
+                    found.append(m)
+                    remaining = remaining.replace(m, " ", 1)
+
+        if len(found) >= 2:
+            return " ".join(found[:3])
+
+        # 回退：从清理后的文本中提取
+        if cleaned:
+            segments = [s.strip() for s in cleaned.split() if len(s.strip()) >= 4]
+            if len(segments) >= 2:
+                return " ".join(segments[:3])
+            if segments:
+                return segments[0][:12]
+
+        # 最终回退：CNKI extract_core 逻辑
+        text_stripped = text.strip()
+        for suffix in ("研究", "分析", "探讨", "实证", "效应", "影响"):
+            if text_stripped.endswith(suffix):
+                text_stripped = text_stripped[:-len(suffix)]
+        if text_stripped.startswith("中国"):
+            text_stripped = text_stripped[2:]
+        segments = [s.strip() for s in text_stripped.split("的") if s.strip()]
+        if segments:
+            candidates = [s for s in segments if 4 <= len(s) <= 12]
+            if candidates:
+                return " ".join(candidates[:2])
+            return segments[0][:12]
+        return text_stripped[:12]
+
     async def _phase2_literature_search(self) -> None:
         """多源文献检索（CNKI 4层 + Semantic Scholar + arXiv）+ 8维统计分析."""
         self.console.print("\n[bold cyan]━━━ Phase 2: 文献检索与统计分析 ━━━[/bold cyan]")
 
-        topic = self.topic_info.get("topic", "")
+        raw_topic = self.topic_info.get("topic", "")
         region = self.topic_info.get("region", "中国")
-        content = self.topic_info.get("content", "")
+        raw_content = self.topic_info.get("content", "")
         year_start = self.topic_info.get("year_start", "2015")
         year_end = self.topic_info.get("year_end", "2024")
+
+        # 智能提取检索关键词（解决 LLM 返回完整句子的问题）
+        topic = self._extract_search_keywords(raw_topic)
+        content = self._extract_search_keywords(raw_content) if raw_content else ""
+        # region 超过 10 字符时也做关键词提取（避免 LLM 返回完整句子作为 region）
+        region = self._extract_search_keywords(region) if len(region) > 10 else region
+        if not topic and raw_topic:
+            topic = raw_topic[:50]
+        self.console.print(f"  [dim]检索关键词: topic='{topic}', content='{content}'[/dim]")
 
         # ── 全局文献库查重：先看已有多少可复用 ──────────────────
         existing_papers = self.library.search(keyword=topic, limit=200)
@@ -769,27 +867,36 @@ class ScholarAgent:
         """
         # 常见财政学/经济学中文关键词到英文的映射
         CN_EN_MAP = {
-            # 主题
-            "地方政府债务": "local government debt",
-            "债务风险": "debt risk",
-            "零基预算": "zero-based budgeting",
-            "预算改革": "budget reform",
-            "预算绩效": "budget performance",
+            # 主题 - 财政政策
+            "财政政策": "fiscal policy",
             "财政支出": "fiscal expenditure",
             "财政收入": "fiscal revenue",
-            "转移支付": "transfer payment",
-            "税收竞争": "tax competition",
             "财政分权": "fiscal decentralization",
-            "土地财政": "land finance",
-            "政府投资": "government investment",
-            "公共投资": "public investment",
             "财政可持续": "fiscal sustainability",
+            "财政透明度": "fiscal transparency",
+            "税收政策": "tax policy",
+            "税收竞争": "tax competition",
+            "税收负担": "tax burden",
+            "减税降费": "tax reduction",
+            # 主题 - 经济增长
+            "经济增长": "economic growth",
+            "经济发展": "economic development",
+            "高质量发展": "high-quality development",
+            "经济波动": "economic fluctuation",
+            "经济周期": "business cycle",
+            # 主题 - 债务
+            "地方政府债务": "local government debt",
             "地方债": "municipal bond",
             "城投债": "urban investment bond",
             "隐形债务": "implicit debt",
             "隐性债务": "implicit debt",
+            "债务风险": "debt risk",
             "债务置换": "debt swap",
-            "财政透明度": "fiscal transparency",
+            # 主题 - 预算
+            "零基预算": "zero-based budgeting",
+            "预算改革": "budget reform",
+            "预算绩效": "budget performance",
+            "转移支付": "transfer payment",
             "绩效评价": "performance evaluation",
             # 内容
             "空间溢出": "spatial spillover",
@@ -836,6 +943,10 @@ class ScholarAgent:
         }
 
         # 逐段翻译：只保留匹配到的英文关键词，丢弃未翻译的中文残文
+        # 策略：
+        # 1. 若已是空格分隔的关键词（由 _extract_search_keywords 提取），
+        #    对每个关键词单独翻译，避免重叠匹配问题
+        # 2. 否则使用子串匹配（兼容旧逻辑）
         parts = []
         for text in [topic, content, region]:
             if not text:
@@ -844,12 +955,25 @@ class ScholarAgent:
             if text.strip() in CN_EN_MAP:
                 parts.append(CN_EN_MAP[text.strip()])
                 continue
+            # 空格分隔的关键词 → 逐个翻译
+            if " " in text.strip():
+                found_keywords = []
+                for kw in text.strip().split():
+                    kw = kw.strip()
+                    if not kw:
+                        continue
+                    if kw in CN_EN_MAP:
+                        found_keywords.append(CN_EN_MAP[kw])
+                if found_keywords:
+                    parts.append(" ".join(found_keywords))
+                continue
             # 子串匹配：提取所有已知中文关键词的英文翻译
             found_keywords = []
+            remaining = text
             for cn, en in sorted(CN_EN_MAP.items(), key=lambda x: -len(x[0])):
-                if cn in text:
+                if cn in remaining:
                     found_keywords.append(en)
-                    text = text.replace(cn, " ")  # 移除已匹配部分避免重复
+                    remaining = remaining.replace(cn, " ", 1)  # 只替换首次匹配
             if found_keywords:
                 parts.append(" ".join(found_keywords))
 

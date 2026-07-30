@@ -1,4 +1,4 @@
-"""EasyConnect VPN 连通性检测模块.
+"""EasyConnect VPN 连通性检测与会话管理模块.
 
 EasyConnect 是深信服(Sangfor)SSL VPN 客户端,工作在 IP 网络层
 (虚拟网卡 + 路由表修改),非 HTTP 代理。本模块检测 VPN 是否已连接
@@ -9,11 +9,24 @@ EasyConnect 是深信服(Sangfor)SSL VPN 客户端,工作在 IP 网络层
 - EasyConnect VPN 工作在 IP 网络层,通过虚拟网卡劫持流量
 - 两者处于不同层级,天然兼容,Python HTTP 客户端自动遵循 VPN 路由
 
+SSE 心跳机制:
+- EasyConnect 登录时建立到 VPN 服务器的 TCP 长连接 (通常端口 8444)
+- SangforServiceClient 进程通过此连接持续发送心跳包,维持 VPN 隧道
+- SSE 心跳由 VPN 客户端自动维护,Python 脚本无需手动发送
+- 但数据库的 Web 会话会独立过期,需通过图书馆入口刷新
+
+分通道模式说明:
+- VPN 仅路由特定 IP 段 (如 202.201.80.x) 通过隧道
+- CNKI/RESSET/CSMAR 等数据库走 VPN 隧道,IP 认证有效
+- 图书馆网站 (library.lzufe.edu.cn) 不走 VPN 隧道,需单独登录
+- ScienceDirect 等外文库可通过"不登录,直接访问"经 VPN 隧道访问
+
 Usage:
     detector = EasyConnectDetector()
     status = await detector.check_vpn()
     if status.connected:
-        print(f"VPN 已连接,可访问: {status.accessible_databases}")
+        print(f"VPN 已连接,SSE心跳: {status.sse_active}")
+        print(f"可访问: {status.accessible_databases}")
 """
 
 from __future__ import annotations
@@ -61,6 +74,15 @@ class VPNStatus:
     process_running: bool = False
     """EasyConnect 进程是否在运行."""
 
+    sse_active: bool = False
+    """SSE 心跳连接是否活跃(到 VPN 服务器的 TCP 长连接)."""
+
+    sse_connection_count: int = 0
+    """SSE 心跳连接数量."""
+
+    session_status: dict[str, str] = field(default_factory=dict)
+    """各数据库的会话状态(如 {"cnki": "ok", "sciencedirect": "need_login"})."""
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "connected": self.connected,
@@ -70,6 +92,9 @@ class VPNStatus:
             "latency_ms": self.latency_ms,
             "error": self.error,
             "process_running": self.process_running,
+            "sse_active": self.sse_active,
+            "sse_connection_count": self.sse_connection_count,
+            "session_status": self.session_status,
         }
 
 
@@ -111,7 +136,20 @@ EASYCONNECT_PROCESS_NAMES = [
     "EasyConnect.exe",
     "SangforCSClient.exe",
     "SangforVpnClient.exe",
+    "SangforServiceClient.exe",
+    "ECAgent.exe",
 ]
+
+# VPN 服务器地址 (兰州财经大学)
+VPN_SERVER_IP = "202.201.87.130"
+VPN_SERVER_PORT = 8444
+
+# 图书馆数据库导航页
+LIBRARY_PORTAL = "https://library.lzufe.edu.cn/databaseguide/web_dataBaseHome1"
+
+# CNKI 财政专题数据库配置
+CNKI_FINANCE_BASE = "https://szjk.cnki.net"
+CNKI_FINANCE_DIMENSION_ID = "650f537ecab44e9aac409d7bba4c1384"
 
 
 class EasyConnectDetector:
@@ -202,6 +240,52 @@ class EasyConnectDetector:
         except Exception as e:
             logger.debug(f"Route table check failed: {e}")
             return False
+
+    def _check_sse_heartbeat(self) -> tuple[bool, int]:
+        """检测 VPN SSE 心跳连接状态.
+
+        EasyConnect VPN 客户端通过 SSE (Server-Sent Events) 机制持续向
+        VPN 服务器发送心跳包,维持 VPN 隧道。这些连接是到 VPN 服务器的
+        TCP 长连接 (通常在 8444 端口)。
+
+        SSE 心跳由 SangforServiceClient 进程自动维护,无需手动发送。
+        本方法仅检测连接是否存在,不发送任何数据。
+
+        Returns:
+            (SSE 是否活跃, 连接数量).
+        """
+        if platform.system() != "Windows":
+            return False, 0
+
+        try:
+            # 使用 netstat 检测到 VPN 服务器的 ESTABLISHED 连接
+            result = subprocess.run(
+                ["netstat", "-ano"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                encoding="gbk",
+                errors="replace",
+            )
+            count = 0
+            for line in result.stdout.split("\n"):
+                line = line.strip()
+                if "ESTABLISHED" in line and VPN_SERVER_IP in line:
+                    count += 1
+
+            if count > 0:
+                logger.info(
+                    f"SSE heartbeat active: {count} connections to "
+                    f"{VPN_SERVER_IP}:{VPN_SERVER_PORT}"
+                )
+            else:
+                logger.warning(
+                    f"No SSE connections to VPN server {VPN_SERVER_IP}"
+                )
+            return count > 0, count
+        except Exception as e:
+            logger.debug(f"SSE heartbeat check failed: {e}")
+            return False, 0
 
     # ===== 第二级:机构 IP 检测 =====
 
@@ -380,6 +464,9 @@ class EasyConnectDetector:
         status.process_running = self._check_process_running()
         route_ok = self._check_route_table()
 
+        # SSE 心跳检测
+        status.sse_active, status.sse_connection_count = self._check_sse_heartbeat()
+
         if not status.process_running and not route_ok:
             # 进程未运行,VPN 肯定未连接
             status.connected = False
@@ -389,7 +476,8 @@ class EasyConnectDetector:
 
         logger.info(
             f"EasyConnect process: {status.process_running}, "
-            f"route: {route_ok}"
+            f"route: {route_ok}, "
+            f"SSE: {status.sse_active} ({status.sse_connection_count} connections)"
         )
 
         # 第二级:机构 IP 检测
@@ -418,6 +506,13 @@ class EasyConnectDetector:
         # 至少一个数据库可达则认为 VPN 连接成功
         status.connected = len(accessible) > 0
 
+        # 检测各数据库会话状态
+        if status.connected:
+            try:
+                status.session_status = await self.check_session_status()
+            except Exception as e:
+                logger.debug(f"Session status check failed: {e}")
+
         if not status.connected:
             status.error = "No databases accessible despite VPN process running"
 
@@ -440,6 +535,161 @@ class EasyConnectDetector:
         """
         is_ok, _ = await self._probe_database(db_name)
         return is_ok
+
+    async def check_cnki_finance_api(self) -> dict[str, Any]:
+        """检测 CNKI 财政专题数据库 API 是否可访问.
+
+        财政专题数据库通过 VPN IP 认证访问,无需图书馆入口登录。
+        API 端点位于 szjk.cnki.net,使用 dimensionId 标识特定数据库。
+
+        Returns:
+            各 API 端点的检测结果.
+        """
+        import httpx
+
+        configure_no_proxy()
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json",
+            "Referer": f"{CNKI_FINANCE_BASE}/dpi/search-center/",
+        }
+
+        results: dict[str, Any] = {}
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(20.0, connect=15.0),
+            follow_redirects=True,
+            proxy=None,
+            trust_env=False,
+            verify=False,
+        ) as client:
+            # Step 1: 访问首页获取 Cookie
+            try:
+                resp = await client.get(
+                    f"{CNKI_FINANCE_BASE}/dpi/search-center/",
+                    headers=headers,
+                )
+                cookies = dict(resp.cookies)
+            except Exception as e:
+                return {"error": f"Homepage access failed: {e}"}
+
+            # Step 2: 测试 API 端点
+            api_tests = [
+                ("data_counts", "POST",
+                 f"{CNKI_FINANCE_BASE}/numerical-db-building/select/getDataCounts",
+                 {"dimensionId": CNKI_FINANCE_DIMENSION_ID}),
+                ("frequency", "GET",
+                 f"{CNKI_FINANCE_BASE}/numerical-db-building/select/getHaveDataOfFrequency",
+                 {"dimensionId": CNKI_FINANCE_DIMENSION_ID}),
+                ("indicator_tree", "POST",
+                 f"{CNKI_FINANCE_BASE}/numerical-db-building/select/getProjectLibIndexTreeForArea",
+                 {"dimensionId": CNKI_FINANCE_DIMENSION_ID,
+                  "timeFrequency": "year", "regionCode": ""}),
+            ]
+
+            for name, method, url, params in api_tests:
+                try:
+                    if method == "GET":
+                        r = await client.get(
+                            url, params=params,
+                            headers=headers, cookies=cookies,
+                        )
+                    else:
+                        r = await client.post(
+                            url, json=params,
+                            headers={**headers, "Content-Type": "application/json"},
+                            cookies=cookies,
+                        )
+
+                    if r.status_code == 200:
+                        data = r.json()
+                        success = data.get("success", data.get("code") == 200)
+                        result = data.get("result") or data.get("data")
+                        if success and result is not None:
+                            count = len(result) if isinstance(result, list) else 1
+                            results[name] = {"status": "ok", "count": count}
+                        else:
+                            msg = data.get("message", data.get("msg", ""))
+                            results[name] = {"status": "api_error", "message": msg}
+                    elif r.status_code == 403:
+                        results[name] = {"status": "forbidden"}
+                    else:
+                        results[name] = {"status": "error", "code": r.status_code}
+                except Exception as e:
+                    results[name] = {"status": "failed", "error": str(e)[:80]}
+
+        return results
+
+    async def check_session_status(self) -> dict[str, str]:
+        """检测各数据库的会话状态.
+
+        区分两种状态:
+        - "ok": 数据库可达且会话有效 (IP 认证生效)
+        - "forbidden": 数据库可达但会话过期 (需刷新)
+        - "failed": 数据库不可达 (VPN 可能断开)
+
+        Returns:
+            {数据库名: 状态} 字典.
+        """
+        import httpx
+
+        configure_no_proxy()
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+        }
+
+        checks = [
+            ("cnki", "https://www.cnki.net/"),
+            ("cnki_data", "https://data.cnki.net/"),
+            ("cnki_finance", f"{CNKI_FINANCE_BASE}/dpi/search-center/"),
+            ("wanfang", "https://www.wanfangdata.com.cn/"),
+            ("resset", "https://db.resset.com/"),
+            ("csmar", "https://data.csmar.com/"),
+            ("eps", "https://www.epsnet.com.cn/"),
+            ("sciencedirect", "https://www.sciencedirect.com/"),
+            ("springer", "https://link.springer.com/"),
+        ]
+
+        status: dict[str, str] = {}
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0, connect=10.0),
+            follow_redirects=True,
+            proxy=None,
+            trust_env=False,
+            verify=False,
+        ) as client:
+            for name, url in checks:
+                try:
+                    resp = await client.get(url, headers=headers)
+                    if resp.status_code == 200:
+                        # 检查是否需要登录
+                        text_lower = resp.text.lower()
+                        if "请登录" in resp.text or (
+                            "login" in text_lower and "required" in text_lower
+                        ):
+                            status[name] = "need_login"
+                        elif resp.status_code == 403 or "禁止访问" in resp.text:
+                            status[name] = "forbidden"
+                        else:
+                            status[name] = "ok"
+                    elif resp.status_code == 403:
+                        status[name] = "forbidden"
+                    else:
+                        status[name] = f"http_{resp.status_code}"
+                except Exception:
+                    status[name] = "failed"
+
+        return status
 
     async def wait_for_vpn(
         self,
