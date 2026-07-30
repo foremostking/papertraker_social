@@ -118,6 +118,8 @@ async def _dispatch_step(
         return await _execute_section_writing(step, project_path, paper_spec, state)
     elif step.step_type == StepType.CITATION_MANAGEMENT:
         return await _execute_citation_management(step, project_path, state)
+    elif step.step_type == StepType.PDF_DOWNLOAD:
+        return await _execute_pdf_download(step, project_path, state)
     elif step.step_type == StepType.FORMATTING:
         return await _execute_formatting(step, project_path, paper_spec)
     elif step.step_type == StepType.CUSTOM:
@@ -132,6 +134,7 @@ async def _execute_literature_search(
 ) -> dict[str, Any]:
     """执行文献检索步骤."""
     from scholarpilot.tools.search import LiteratureSearchManager
+    from scholarpilot.utils.vpn import get_vpn_detector
 
     topic = paper_spec.get("topic", "")
     region = paper_spec.get("region", "中国")
@@ -139,7 +142,20 @@ async def _execute_literature_search(
     year_start = paper_spec.get("year_start", "2020")
     year_end = paper_spec.get("year_end", "2026")
 
-    manager = LiteratureSearchManager()
+    # 检测 VPN 状态，启用 CNKI/万方 机构 IP 认证
+    detector = get_vpn_detector()
+    vpn_status = await detector.check_vpn()
+    if vpn_status.connected:
+        logger.info(f"VPN connected, enabling institutional IP auth for CNKI/Wanfang")
+    else:
+        logger.warning(f"VPN not connected: {vpn_status.error}")
+
+    manager = LiteratureSearchManager(
+        ss_api_key=get_settings().ss_api_key,
+        wos_api_key=get_settings().wos_api_key,
+        wos_sid=get_settings().wos_sid,
+        vpn_status=vpn_status,
+    )
     try:
         result = await manager.search_all(
             topic=topic,
@@ -156,6 +172,7 @@ async def _execute_literature_search(
             "chinese_count": (
                 result.chinese_result.returned_count if result.chinese_result else 0
             ),
+            "vpn_connected": vpn_status.connected,
         }
     except Exception as e:
         await manager.close()
@@ -412,6 +429,115 @@ async def _execute_formatting(
         "outputs": outputs,
         "status": "completed",
     }
+
+
+async def _execute_pdf_download(
+    step: ExecutionStep,
+    project_path: str,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """执行全文 PDF 下载步骤.
+
+    从文献检索结果中提取论文信息，自动下载 PDF 全文。
+    下载策略：OA 源优先（arXiv/Unpaywall）→ VPN 机构源（出版商直接下载）。
+    VPN 未连接时仅尝试 OA 源，付费源跳过。
+
+    Args:
+        step: 执行步骤.
+        project_path: 项目目录路径.
+        state: 完整状态.
+
+    Returns:
+        下载结果摘要.
+    """
+    from scholarpilot.tools.pdf_downloader import PDFDownloadManager
+    from scholarpilot.utils.vpn import get_vpn_detector
+
+    project_dir = Path(project_path) if project_path else None
+    if not project_dir:
+        return {"status": "skipped", "reason": "no project path"}
+
+    # 从 state 中获取文献检索结果
+    step_results = state.get("step_results", [])
+    papers_to_download: list[dict[str, Any]] = []
+
+    for sr in step_results:
+        if sr.get("step_type") == "literature_search":
+            result_data = sr.get("result", {})
+            # 从检索结果中提取论文信息
+            all_papers = result_data.get("all_papers", [])
+            if not all_papers:
+                # 尝试从 papers 字段获取
+                all_papers = result_data.get("papers", [])
+
+            for paper in all_papers:
+                doi = paper.get("doi", "")
+                title = paper.get("title", "")
+                arxiv_id = paper.get("arxiv_id", "")
+                # 至少需要 DOI 或 arXiv ID 才能下载
+                if doi or arxiv_id:
+                    papers_to_download.append({
+                        "doi": doi,
+                        "title": title,
+                        "arxiv_id": arxiv_id,
+                    })
+            break
+
+    if not papers_to_download:
+        logger.info("No papers with DOI/arXiv ID found for PDF download")
+        return {
+            "status": "completed",
+            "total": 0,
+            "success": 0,
+            "reason": "No papers with DOI/arXiv ID found",
+        }
+
+    # 检测 VPN 状态
+    config = get_settings()
+    detector = get_vpn_detector()
+    vpn_status = await detector.check_vpn()
+
+    if not vpn_status.connected:
+        logger.warning(
+            "VPN 未连接，仅尝试 OA 源下载。"
+            "请通过 EasyConnect 登录 VPN 以访问付费数据库全文资源。"
+        )
+
+    # 设置下载目录
+    download_dir = project_dir / "downloads"
+    if config.pdf_download_dir:
+        download_dir = Path(config.pdf_download_dir)
+    else:
+        download_dir = project_dir / "downloads"
+
+    # 执行批量下载
+    manager = PDFDownloadManager(
+        output_dir=download_dir,
+        max_concurrent=config.pdf_max_concurrent,
+        unpaywall_email=config.unpaywall_email,
+    )
+
+    try:
+        batch_result = await manager.download_batch(
+            papers=papers_to_download,
+            output_dir=download_dir,
+            check_vpn=False,  # 已检测
+        )
+        await manager.close()
+
+        return {
+            "status": "completed",
+            "total": batch_result.total,
+            "success": batch_result.success_count,
+            "failed": batch_result.failed_count,
+            "skipped": batch_result.skipped_count,
+            "total_size_mb": round(batch_result.total_size / 1024 / 1024, 2),
+            "vpn_connected": vpn_status.connected,
+            "download_dir": str(download_dir),
+        }
+    except Exception as e:
+        await manager.close()
+        raise
 
 
 async def _execute_custom_step(

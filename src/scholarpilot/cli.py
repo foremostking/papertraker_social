@@ -3364,6 +3364,327 @@ def init():
 
 
 @app.command()
+def vpn(
+    wait: bool = typer.Option(False, "--wait", "-w", help="等待 VPN 连接成功（轮询 120 秒）"),
+    timeout: int = typer.Option(120, "--timeout", help="等待超时秒数（配合 --wait 使用）"),
+    databases: str = typer.Option("", "--databases", "-d", help="指定探测的数据库（逗号分隔，如 cnki,wanfang,wos）"),
+):
+    """检测 EasyConnect VPN 连接状态和机构数据库可达性.
+
+    \b
+    科研场景：文献检索和全文下载前，确认 VPN 是否已连接。
+    VPN 连接后系统出口 IP 变为机构 IP，可访问 CNKI、万方、WoS 等付费数据库。
+    若 VPN 未连接，全文下载仅尝试 OA 源（arXiv/Unpaywall）。
+
+    \b
+    用法:
+      scholarpilot vpn                    # 检测当前 VPN 状态
+      scholarpilot vpn --wait             # 等待用户启动 EasyConnect 后连接成功
+      scholarpilot vpn --databases cnki   # 仅探测 CNKI
+    """
+    import asyncio
+
+    async def _run():
+        from scholarpilot.utils.vpn import get_vpn_detector
+
+        detector = get_vpn_detector()
+
+        db_list = None
+        if databases:
+            db_list = [d.strip() for d in databases.split(",") if d.strip()]
+
+        if wait:
+            console.print(f"[yellow]等待 VPN 连接（超时 {timeout} 秒）...[/yellow]")
+            console.print("[dim]请启动 EasyConnect 并完成登录[/dim]")
+            status = await detector.wait_for_vpn(
+                timeout=timeout, databases=db_list, poll_interval=5,
+            )
+        else:
+            status = await detector.check_vpn(databases=db_list)
+
+        return status
+
+    status = asyncio.run(_run())
+
+    # 状态面板
+    if status.connected:
+        console.print(Panel(
+            f"[bold green]✓ VPN 已连接[/bold green]\n"
+            f"可达数据库: {', '.join(status.accessible_databases) if status.accessible_databases else '无'}\n"
+            f"检测IP: {status.detected_ip}\n"
+            f"检测时间: {status.check_time}",
+            title="VPN 状态",
+        ))
+
+        # 延迟表格
+        if status.latency_ms:
+            table = Table(title="数据库延迟", show_header=True)
+            table.add_column("数据库", style="cyan")
+            table.add_column("延迟(ms)", justify="right")
+            table.add_column("状态", justify="center")
+            for db, latency in status.latency_ms.items():
+                ok = db in status.accessible_databases
+                table.add_row(
+                    db,
+                    f"{latency:.0f}",
+                    "[green]可达[/green]" if ok else "[red]不可达[/red]",
+                )
+            console.print(table)
+    else:
+        console.print(Panel(
+            f"[bold red]✗ VPN 未连接[/bold red]\n"
+            f"原因: {status.error or '未知'}\n"
+            f"EasyConnect 进程: {'运行中' if status.process_running else '未运行'}\n\n"
+            f"[yellow]请通过 EasyConnect 登录 VPN：[/yellow]\n"
+            f"  程序路径: C:\\Program Files (x86)\\Sangfor\\SSL\\EasyConnect\\EasyConnect.exe\n"
+            f"  登录后重新运行: scholarpilot vpn",
+            title="VPN 状态",
+        ))
+        raise typer.Exit(1)
+
+
+@app.command(name="pdf")
+def pdf_download(
+    doi: str = typer.Option("", "--doi", help="论文 DOI（如 10.1016/j.jfineco.2023.01.001）"),
+    title: str = typer.Option("", "--title", help="论文标题（用于文件命名）"),
+    arxiv_id: str = typer.Option("", "--arxiv", help="arXiv ID（如 2301.00001）"),
+    output_dir: str = typer.Option("", "--output", "-o", help="下载目录（默认 ./downloads）"),
+    no_vpn_check: bool = typer.Option(False, "--no-vpn-check", help="跳过 VPN 检测（仅尝试 OA 源）"),
+):
+    """下载论文全文 PDF.
+
+    \b
+    下载策略（按优先级自动尝试）：
+    1. arXiv（免费，无需 VPN）
+    2. Unpaywall OA 查找（免费，自动发现开放获取版本）
+    3. 出版商直接下载（需 VPN 机构 IP 认证）
+    4. DOI 直接解析（最后手段）
+
+    \b
+    用法:
+      scholarpilot pdf --doi 10.1016/j.jfineco.2023.01.001 --title "Fiscal Policy"
+      scholarpilot pdf --arxiv 2301.00001 --title "Deep Learning Paper"
+      scholarpilot pdf --doi 10.3390/e25010001 --no-vpn-check
+    """
+    import asyncio
+
+    if not doi and not arxiv_id:
+        console.print("[red]请提供 --doi 或 --arxiv 参数[/red]")
+        raise typer.Exit(1)
+
+    out_dir = output_dir if output_dir else "./downloads"
+
+    async def _run():
+        from scholarpilot.tools.pdf_downloader import PDFDownloadManager
+
+        manager = PDFDownloadManager(output_dir=out_dir)
+        try:
+            result = await manager.download(
+                doi=doi,
+                title=title,
+                arxiv_id=arxiv_id,
+                check_vpn=not no_vpn_check,
+            )
+            await manager.close()
+            return result
+        except Exception as e:
+            await manager.close()
+            raise
+
+    result = asyncio.run(_run())
+
+    if result.success:
+        size_kb = result.file_size / 1024
+        size_str = f"{size_kb:.0f} KB" if size_kb < 1024 else f"{size_kb/1024:.1f} MB"
+        console.print(Panel(
+            f"[bold green]✓ 下载成功[/bold green]\n"
+            f"来源: {result.source.value}\n"
+            f"文件: {result.file_path}\n"
+            f"大小: {size_str}\n"
+            f"耗时: {result.download_time:.1f}s\n"
+            f"VPN: {'已使用' if result.vpn_used else '未使用'}",
+            title="PDF 下载结果",
+        ))
+    elif result.status.value == "skipped":
+        console.print(Panel(
+            f"[yellow]⚠ 跳过下载[/yellow]\n"
+            f"原因: {result.error}\n\n"
+            f"VPN 未连接，仅 OA 源可用。如需下载付费全文：\n"
+            f"  1. 启动 EasyConnect 并登录 VPN\n"
+            f"  2. 运行 [cyan]scholarpilot vpn[/cyan] 确认连接\n"
+            f"  3. 重新执行下载命令",
+            title="PDF 下载结果",
+        ))
+    else:
+        console.print(Panel(
+            f"[bold red]✗ 下载失败[/bold red]\n"
+            f"DOI: {result.doi or 'N/A'}\n"
+            f"arXiv: {result.arxiv_id if hasattr(result, 'arxiv_id') else 'N/A'}\n"
+            f"错误: {result.error}\n\n"
+            f"可能原因：\n"
+            f"  - VPN 未连接（付费源需要机构 IP 认证）\n"
+            f"  - 该论文无 OA 版本\n"
+            f"  - 出版商需要额外的 Shibboleth/SSO 登录",
+            title="PDF 下载结果",
+        ))
+        raise typer.Exit(1)
+
+
+@app.command(name="financial-data")
+def financial_data(
+    project: str = typer.Argument(..., help="项目名称"),
+    data_dir: str = typer.Option("", "--dir", "-d", help="数据目录路径（默认项目下 data/ 目录）"),
+    output: str = typer.Option("", "--output", "-o", help="统计输出路径（默认 .scholar/descriptive_stats.json）"),
+    show_table: bool = typer.Option(True, "--table/--no-table", help="是否在终端显示统计表格"),
+):
+    """解析 CSMAR/RESSET 金融数据并生成描述性统计.
+
+    \b
+    科研场景：研究者从 CSMAR/RESSET 下载数据后放入 data/ 目录，
+    本命令自动检测文件格式（CSV/Excel/ZIP/Stata），解析并生成描述性统计，
+    结果保存到 .scholar/descriptive_stats.json，可注入论文实证章节。
+
+    \b
+    支持的数据源:
+      - CSMAR（国泰安）: CSV+TXT 元数据对、ZIP 压缩包
+      - RESSET（锐思）: CSV、Excel、TXT
+      - 通用 CSV/Excel: 自动推断
+
+    \b
+    用法:
+      scholarpilot financial-data my_paper
+      scholarpilot financial-data my_paper --dir /path/to/data --no-table
+      scholarpilot financial-data my_paper --output custom_stats.json
+    """
+    fm = _get_file_manager()
+    project_dir = fm.get_project_dir(project)
+    if not project_dir:
+        console.print(f"[red]项目不存在: {project}[/red]")
+        raise typer.Exit(1)
+
+    # 确定数据目录
+    if data_dir:
+        data_path = Path(data_dir)
+        if not data_path.is_absolute():
+            data_path = project_dir / data_path
+    else:
+        data_path = project_dir / "data"
+
+    if not data_path.exists():
+        console.print(f"[red]数据目录不存在: {data_path}[/red]")
+        console.print("[dim]请将 CSMAR/RESSET 导出的数据文件放入该目录[/dim]")
+        raise typer.Exit(1)
+
+    # 检查目录是否有数据文件
+    supported_exts = {".csv", ".xls", ".xlsx", ".txt", ".zip", ".dta"}
+    data_files = [f for f in data_path.iterdir() if f.is_file() and f.suffix.lower() in supported_exts]
+    if not data_files:
+        console.print(f"[red]目录中未找到数据文件: {data_path}[/red]")
+        console.print(f"[dim]支持的格式: {', '.join(supported_exts)}[/dim]")
+        raise typer.Exit(1)
+
+    console.print(f"[green]发现 {len(data_files)} 个数据文件[/green]")
+    for f in data_files:
+        console.print(f"  [dim]- {f.name}[/dim]")
+
+    # 处理数据
+    try:
+        from scholarpilot.tools.financial_data import FinancialDataProcessor
+    except ImportError as e:
+        console.print(f"[red]金融数据模块导入失败: {e}[/red]")
+        raise typer.Exit(1)
+
+    processor = FinancialDataProcessor()
+
+    console.print("\n[dim]正在解析数据...[/dim]")
+    result = processor.process_directory(data_path)
+
+    if result.errors:
+        console.print(f"[yellow]处理完成，{len(result.errors)} 个错误:[/yellow]")
+        for err in result.errors:
+            console.print(f"  [red]- {err}[/red]")
+
+    if not result.files_processed:
+        console.print("[red]未能成功处理任何文件[/red]")
+        raise typer.Exit(1)
+
+    # 生成综合统计
+    stats = processor.generate_comprehensive_stats(result)
+
+    # 保存
+    if output:
+        output_path = Path(output)
+        if not output_path.is_absolute():
+            output_path = project_dir / output_path
+    else:
+        output_path = project_dir / ".scholar" / "descriptive_stats.json"
+
+    processor.save_stats_to_json(stats, output_path)
+    console.print(f"\n[green]✓ 统计已保存: {output_path}[/green]")
+
+    # 显示摘要
+    summary = stats.get("summary", {})
+    console.print(Panel(
+        f"处理文件: {summary.get('total_files', 0)}\n"
+        f"总观测值: {summary.get('total_observations', 0)}\n"
+        f"数据来源: {', '.join(summary.get('data_sources', ['未知']))}\n"
+        f"处理错误: {summary.get('processing_errors', 0)}",
+        title="数据概览",
+    ))
+
+    # 显示统计表格
+    if show_table:
+        for dataset in stats.get("datasets", []):
+            ds_stats = dataset.get("stats", {})
+            variables = ds_stats.get("variables", {})
+
+            # 仅显示数值型变量
+            numeric_vars = {
+                k: v for k, v in variables.items()
+                if v.get("type") == "numeric"
+            }
+
+            if not numeric_vars:
+                continue
+
+            table = Table(
+                title=f"描述性统计 — {Path(dataset.get('file', '')).name}",
+                show_header=True,
+            )
+            table.add_column("变量", style="cyan", max_width=30)
+            table.add_column("N", justify="right")
+            table.add_column("均值", justify="right")
+            table.add_column("标准差", justify="right")
+            table.add_column("最小值", justify="right")
+            table.add_column("中位数", justify="right")
+            table.add_column("最大值", justify="right")
+
+            labels = dataset.get("column_labels", {})
+            for var_name, var_stats in list(numeric_vars.items())[:20]:
+                label = labels.get(var_name, "")
+                display = f"{var_name}" + (f"\n[dim]{label}[/dim]" if label else "")
+                table.add_row(
+                    display,
+                    str(var_stats.get("count", 0)),
+                    f"{var_stats.get('mean', 0) or 0:.4f}",
+                    f"{var_stats.get('std', 0) or 0:.4f}",
+                    f"{var_stats.get('min', 0) or 0:.4f}",
+                    f"{var_stats.get('median', 0) or 0:.4f}",
+                    f"{var_stats.get('max', 0) or 0:.4f}",
+                )
+
+            console.print(table)
+
+            if len(numeric_vars) > 20:
+                console.print(f"[dim]  ... 还有 {len(numeric_vars) - 20} 个变量未显示[/dim]")
+
+    console.print(
+        f"\n[dim]统计数据将自动注入论文实证章节。"
+        f"也可手动查看: {output_path}[/dim]"
+    )
+
+
+@app.command()
 def examples(
     list_only: bool = typer.Option(False, "--list", "-l", help="仅列出模板名称，不显示详情"),
 ):

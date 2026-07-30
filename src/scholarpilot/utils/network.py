@@ -28,7 +28,23 @@ def configure_no_proxy() -> None:
         "volces.com",
         # 其他国内学术服务
         "www.wanfangdata.com.cn",
+        "s.wanfangdata.com.cn",
         "www.cqvip.com",
+        # Web of Science (中国镜像)
+        "webofscience.clarivate.cn",
+        # ChinaXiv (中科院预印本)
+        "chinaxiv.org",
+        "www.chinaxiv.org",
+        # PubScholar (公共学术OA)
+        "pubscholar.cn",
+        "www.pubscholar.cn",
+        # 国际学术 API（绕过系统代理，直连）
+        "export.arxiv.org",
+        "arxiv.org",
+        "api.semanticscholar.org",
+        "www.semanticscholar.org",
+        "api.openalex.org",
+        "api.unpaywall.org",
         # 本地地址
         "localhost",
         "127.0.0.1",

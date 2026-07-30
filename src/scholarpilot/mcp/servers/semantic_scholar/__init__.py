@@ -194,6 +194,13 @@ class SemanticScholarEngine:
         self.api_key = api_key
         self.timeout = timeout
         self._client: httpx.AsyncClient | None = None
+        if not api_key:
+            logger.warning(
+                "Semantic Scholar API Key 未配置 (SCHOLAR_SS_API_KEY)。"
+                "无 Key 时共享 IP 限流严重 (100次/5分钟)，"
+                "建议申请免费 Key: "
+                "https://www.semanticscholar.org/product/api#api-key-form"
+            )
 
     async def _get_client(self) -> httpx.AsyncClient:
         """获取或创建 HTTP 客户端."""
@@ -229,11 +236,12 @@ class SemanticScholarEngine:
         fields_of_study: str = "",
         open_access_only: bool = False,
         fields: str = DEFAULT_FIELDS,
-        max_retries: int = 3,
+        max_retries: int = 5,
     ) -> SSSearchResult:
         """搜索论文.
 
         内置 429 限流重试机制：遇到 429 时自动等待后重试。
+        无 API Key 时使用指数退避（5s→10s→20s→30s→60s）。
 
         Args:
             query: 纯文本搜索词（不支持特殊语法，连字符用空格替代）。
@@ -272,7 +280,15 @@ class SemanticScholarEngine:
 
                 # 429 限流：等待后重试
                 if response.status_code == 429:
-                    retry_after = int(response.headers.get("Retry-After", "5"))
+                    # 有 API Key 时使用 Retry-After 头，无 Key 时指数退避
+                    if self.api_key:
+                        retry_after = int(response.headers.get("Retry-After", "5"))
+                    else:
+                        # 无 Key 时指数退避: 5, 10, 20, 30, 60 秒
+                        backoff_schedule = [5, 10, 20, 30, 60]
+                        retry_after = backoff_schedule[
+                            min(attempt, len(backoff_schedule) - 1)
+                        ]
                     logger.warning(
                         f"Semantic Scholar 429 rate limited, "
                         f"waiting {retry_after}s (attempt {attempt + 1}/{max_retries + 1})"

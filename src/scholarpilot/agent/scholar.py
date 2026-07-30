@@ -43,6 +43,7 @@ from scholarpilot.mcp.servers.openalex import OpenAlexEngine
 from scholarpilot.tools.chinese_search import ChineseLiteratureManager
 from scholarpilot.utils.file_manager import FileManager
 from scholarpilot.utils.library import GlobalLibrary
+from scholarpilot.utils.vpn import EasyConnectDetector, VPNStatus
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -93,6 +94,7 @@ class ScholarAgent:
         self.project_name = self.project_dir.name
 
         # 文献检索引擎（多源）
+        self._cnki_cookie = cnki_cookie
         self.chinese_manager = ChineseLiteratureManager(
             cnki_cookie=cnki_cookie,
             use_playwright=False,  # 可选启用 Playwright CNKI
@@ -116,6 +118,12 @@ class ScholarAgent:
         # 证据矩阵构建器（Phase 2.5 初始化，Phase 7 使用）
         self.evidence_matrix_builder = None
 
+        # VPN 检测器（EasyConnect 机构访问）
+        self.vpn_detector = EasyConnectDetector(
+            check_timeout=getattr(self.config, "vpn_check_timeout", 10),
+        )
+        self.vpn_status: VPNStatus | None = None
+
         # 非交互模式（用于自动化测试或脚本调用）
         self.non_interactive: bool = False
         self.default_choices: dict[str, int] = {}  # 各交互步骤的默认选择
@@ -129,6 +137,10 @@ class ScholarAgent:
         Args:
             user_input: 用户的自然语言输入（研究想法）。
         """
+        # Phase 0: VPN 检测（EasyConnect 机构访问）
+        if getattr(self.config, "vpn_auto_detect", True):
+            await self._detect_vpn_interactive()
+
         # 检查是否有未完成的数据补交（跳过后重新运行）
         state = self.file_manager.load_project_state(self.project_dir)
         if state and state.get("data_status") == "pending":
@@ -306,6 +318,80 @@ class ScholarAgent:
                 phase_detail=f"异常中断: {e}",
             )
 
+    # ===== Phase 0: VPN 检测 =====
+
+    async def _detect_vpn_interactive(self) -> None:
+        """VPN 连通性检测（Phase 0）.
+
+        检测 EasyConnect VPN 是否已连接,如已连接则启用机构 IP 认证模式。
+        - VPN 连接时: 重新初始化中文管理器为 VPN 模式, 显示可访问数据库
+        - VPN 未连接时(交互模式): 提示用户启动 EasyConnect, 支持轮询等待
+        - VPN 未连接时(非交互模式): 静默降级, 使用开放数据源
+        """
+        vpn_databases_str = getattr(
+            self.config, "vpn_databases", "cnki,wanfang,wos"
+        )
+        databases = [
+            d.strip() for d in vpn_databases_str.split(",") if d.strip()
+        ]
+
+        self.vpn_status = await self.vpn_detector.check_vpn(
+            databases=databases
+        )
+
+        if self.vpn_status.connected:
+            self.console.print(
+                f"[green]VPN 已连接, 可访问机构数据库: "
+                f"{', '.join(self.vpn_status.accessible_databases)}[/green]"
+            )
+            # 重新初始化中文管理器为 VPN 模式
+            self.chinese_manager = ChineseLiteratureManager(
+                cnki_cookie=self._cnki_cookie,
+                use_playwright=False,
+                vpn_status=self.vpn_status,
+            )
+            logger.info(
+                f"VPN connected, databases: "
+                f"{self.vpn_status.accessible_databases}"
+            )
+        else:
+            self.console.print(
+                f"[yellow]未检测到 VPN 连接[/yellow] "
+                f"[dim]({self.vpn_status.error})[/dim]"
+            )
+            if not self.non_interactive:
+                self.console.print(
+                    "[dim]如需访问机构数据库(CNKI全文/万方/WoS), "
+                    "请启动 EasyConnect 并登录。[/dim]"
+                )
+                from rich.prompt import Confirm
+                if Confirm.ask(
+                    "是否已启动 EasyConnect? 等待检测...",
+                    default=False,
+                ):
+                    wait_timeout = getattr(
+                        self.config, "vpn_wait_timeout", 120
+                    )
+                    self.vpn_status = await self.vpn_detector.wait_for_vpn(
+                        timeout=wait_timeout,
+                        databases=databases,
+                    )
+                    if self.vpn_status.connected:
+                        self.console.print("[green]VPN 连接成功![/green]")
+                        self.chinese_manager = ChineseLiteratureManager(
+                            cnki_cookie=self._cnki_cookie,
+                            use_playwright=False,
+                            vpn_status=self.vpn_status,
+                        )
+                    else:
+                        self.console.print(
+                            "[yellow]VPN 检测超时, 将使用开放数据源继续。[/yellow]"
+                        )
+            else:
+                self.console.print(
+                    "  [dim][非交互模式] 使用开放数据源继续[/dim]"
+                )
+
     # ===== Phase 1: 选题分析 =====
 
     async def _phase1_topic_analysis(self, user_input: str) -> None:
@@ -426,6 +512,10 @@ class ScholarAgent:
                 self.console.print(
                     f"  [green]CNKI: 找到 {chinese_result.cnki_count} 篇[/green]"
                 )
+            if chinese_result.wanfang_count > 0:
+                self.console.print(
+                    f"  [green]万方: 找到 {chinese_result.wanfang_count} 篇[/green]"
+                )
             self.console.print(
                 f"  [green]合并去重后: {chinese_result.returned_count} 篇中文文献[/green]"
             )
@@ -531,7 +621,7 @@ class ScholarAgent:
         # 将 ChineseSearchResult 转为 CNKISearchResult 兼容格式
         cnki_compatible = []
         for cr in self.chinese_results:
-            total = cr.ncpssd_count + cr.cnki_count
+            total = cr.ncpssd_count + cr.cnki_count + cr.wanfang_count
             cnki_compatible.append(CNKISearchResult(
                 query=cr.query,
                 total_count=total,
@@ -541,7 +631,10 @@ class ScholarAgent:
         # 显示统计结果
         vol = self.eight_dim_stats.get("literature_volume", {})
         comp = self.eight_dim_stats.get("competition_level", {})
-        chinese_count = sum(r.ncpssd_count + r.cnki_count for r in self.chinese_results)
+        chinese_count = sum(
+            r.ncpssd_count + r.cnki_count + r.wanfang_count
+            for r in self.chinese_results
+        )
         self.console.print(f"  中文文献总量: {chinese_count} 篇")
         ss_count = sum(r.total_count for r in self.ss_results)
         arxiv_count = sum(r.total_count for r in self.arxiv_results)
@@ -566,6 +659,7 @@ class ScholarAgent:
             "chinese_count": chinese_count,
             "ncpssd_count": sum(r.ncpssd_count for r in self.chinese_results),
             "cnki_count": sum(r.cnki_count for r in self.chinese_results),
+            "wanfang_count": sum(r.wanfang_count for r in self.chinese_results),
             "ss_count": ss_count,
             "openalex_count": openalex_count,
             "arxiv_count": arxiv_count,
@@ -628,14 +722,17 @@ class ScholarAgent:
         # arXiv
         for result in getattr(self, "arxiv_results", []):
             for paper in result.papers:
+                # ArxivPaper 没有 year 字段，从 published (ISO日期) 提取
+                published = getattr(paper, "published", "") or ""
+                year_str = published[:4] if len(published) >= 4 else ""
                 papers.append({
                     "title": paper.title,
                     "authors": paper.authors if isinstance(paper.authors, list) else [],
-                    "year": str(paper.year) if paper.year else "",
+                    "year": year_str,
                     "journal": "arXiv",
                     "abstract": getattr(paper, "abstract", "") or "",
                     "source": "arxiv",
-                    "url": getattr(paper, "url", "") or "",
+                    "url": getattr(paper, "abs_url", "") or getattr(paper, "pdf_url", "") or "",
                     "language": "en",
                 })
 
@@ -806,23 +903,34 @@ class ScholarAgent:
         """格式化论文列表用于显示（中文文献 + Semantic Scholar + arXiv）."""
         lines = []
 
-        # 中文文献（NCPSSD + CNKI 合并去重）
+        # 中文文献（CNKI + 万方 + NCPSSD 合并去重）
         for i, result in enumerate(self.chinese_results):
             ncpssd_papers = [p for p in result.papers if p.source == "ncpssd"]
             cnki_papers = [p for p in result.papers if p.source == "cnki"]
+            wanfang_papers = [p for p in result.papers if p.source == "wanfang"]
 
-            if ncpssd_papers:
-                lines.append(f"\n### NCPSSD 中文文献 ({result.ncpssd_count} 篇，显示 {len(ncpssd_papers)} 篇)")
-                for j, paper in enumerate(ncpssd_papers[:10]):
+            if cnki_papers:
+                lines.append(f"\n### CNKI 中文文献 ({result.cnki_count} 篇，显示 {len(cnki_papers)} 篇)")
+                for j, paper in enumerate(cnki_papers[:10]):
                     authors = ", ".join(paper.authors[:3]) if paper.authors else ""
                     lines.append(
                         f"{j+1}. {paper.title} - {authors} "
                         f"({paper.journal}, {paper.year})"
                     )
 
-            if cnki_papers:
-                lines.append(f"\n### CNKI 中文文献 ({result.cnki_count} 篇，显示 {len(cnki_papers)} 篇)")
-                for j, paper in enumerate(cnki_papers[:10]):
+            if wanfang_papers:
+                lines.append(f"\n### 万方中文文献 ({result.wanfang_count} 篇，显示 {len(wanfang_papers)} 篇)")
+                for j, paper in enumerate(wanfang_papers[:10]):
+                    authors = ", ".join(paper.authors[:3]) if paper.authors else ""
+                    ptype = f" [{paper.paper_type}]" if paper.paper_type else ""
+                    lines.append(
+                        f"{j+1}. {paper.title} - {authors} "
+                        f"({paper.journal}, {paper.year}){ptype}"
+                    )
+
+            if ncpssd_papers:
+                lines.append(f"\n### NCPSSD 中文文献 ({result.ncpssd_count} 篇，显示 {len(ncpssd_papers)} 篇)")
+                for j, paper in enumerate(ncpssd_papers[:10]):
                     authors = ", ".join(paper.authors[:3]) if paper.authors else ""
                     lines.append(
                         f"{j+1}. {paper.title} - {authors} "
@@ -1033,7 +1141,8 @@ class ScholarAgent:
         ss_count = sum(r.total_count for r in self.ss_results)
         arxiv_count = sum(r.total_count for r in self.arxiv_results)
         chinese_count = sum(
-            r.ncpssd_count + r.cnki_count for r in self.chinese_results
+            r.ncpssd_count + r.cnki_count + r.wanfang_count
+            for r in self.chinese_results
         )
 
         # 构建上下文

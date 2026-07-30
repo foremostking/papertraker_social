@@ -77,6 +77,43 @@ class Settings(BaseSettings):
     # 默认 ~/.scholarpilot，可通过 SCHOLAR_USER_HOME 覆盖
     user_home_dir: Path = Path.home() / ".scholarpilot"
 
+    # ── EasyConnect VPN 配置 ─────────────────────────────
+    # VPN 检测超时(秒)
+    vpn_check_timeout: int = 10
+    # VPN 连接等待超时(秒,用户手动启动 EasyConnect 后的轮询等待)
+    vpn_wait_timeout: int = 120
+    # 是否在启动时自动检测 VPN
+    vpn_auto_detect: bool = True
+    # 指定机构数据库列表(逗号分隔,如 "cnki,wanfang,wos")
+    vpn_databases: str = "cnki,wanfang,wos"
+
+    # ── 万方数据配置 ─────────────────────────────────────
+    wanfang_enabled: bool = True  # 是否启用万方检索
+    # 万方 Cookie(非 VPN 模式可选)
+    wanfang_cookie: str = ""
+
+    # ── Web of Science 配置 ──────────────────────────────
+    wos_enabled: bool = False  # 默认关闭,需 VPN + 认证
+    # Clarivate API Key(可选,优先使用官方 REST API)
+    wos_api_key: str = ""
+    # WoS Session ID(从浏览器登录后获取,用于 Web Session API)
+    # 获取方法:浏览器登录 WoS → F12 DevTools → Application → Session Storage
+    #          → 查找 SID 值 → 配置为 SCHOLAR_WOS_SID
+    wos_sid: str = ""
+
+    # ── 全文 PDF 下载配置 ────────────────────────────────
+    pdf_download_enabled: bool = False  # 默认关闭
+    pdf_download_dir: str = ""  # 下载目录(默认项目内)
+    pdf_max_concurrent: int = 2  # 最大并发下载数
+    # Unpaywall API 邮箱（免费 OA 论文查找，仅需邮箱用于 polite pool）
+    unpaywall_email: str = "scholarpilot@example.com"
+
+    # ── OA 资源配置 ──────────────────────────────────────
+    # ChinaXiv 预印本（免费，无需认证）
+    chinaxiv_enabled: bool = True
+    # PubScholar OA（免费，SHA1 签名认证）
+    pubscholar_enabled: bool = True
+
     # ── 文献订阅（Feed）配置 ─────────────────────────────
     # 每次推送推荐文献的默认数量，按相关度排序
     feed_max_recommendations: int = 20

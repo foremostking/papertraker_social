@@ -29,8 +29,8 @@ from scholarpilot.utils.network import configure_no_proxy
 
 logger = logging.getLogger(__name__)
 
-# API 端点
-ARXIV_BASE = "http://export.arxiv.org/api/query"
+# API 端点（使用 HTTPS，避免 VPN/代理对 HTTP 的拦截）
+ARXIV_BASE = "https://export.arxiv.org/api/query"
 
 # XML 命名空间
 NAMESPACES = {

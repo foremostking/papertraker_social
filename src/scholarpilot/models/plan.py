@@ -28,6 +28,7 @@ class StepType(str, Enum):
     OUTLINE_GENERATION = "outline_generation"
     SECTION_WRITING = "section_writing"
     CITATION_MANAGEMENT = "citation_management"
+    PDF_DOWNLOAD = "pdf_download"
     REVISION = "revision"
     FORMATTING = "formatting"
     REVIEW = "review"

@@ -376,6 +376,19 @@ class ClaimCalibrator:
                 issue_type_str = "partial_support"
                 logger.info("overreach 二次确认未通过，降级为 partial: %s", claim_text[:50])
 
+        # 证据矩阵交叉验证：partial 升级为 supported
+        # 如果证据矩阵中有与该结论论点匹配的文献支撑，升级为 supported
+        if support_status == "partial" and self.evidence_matrix_data:
+            has_matrix_support = self._check_evidence_matrix_support(
+                claim_text, section_title
+            )
+            if has_matrix_support:
+                support_status = "supported"
+                issue_type_str = "null"
+                logger.info(
+                    "证据矩阵交叉验证：partial 升级为 supported: %s", claim_text[:50]
+                )
+
         return ClaimRecord(
             section_title=section_title,
             claim_text=claim_text,
@@ -806,3 +819,84 @@ class ClaimCalibrator:
                 return "\n".join(lines) if lines else "（该章节无证据映射）"
 
         return "（该章节无证据矩阵映射）"
+
+    def _check_evidence_matrix_support(
+        self,
+        claim_text: str,
+        section_title: str,
+    ) -> bool:
+        """检查证据矩阵中是否有支撑该结论的文献.
+
+        通过关键词匹配判断结论句与证据矩阵中的论点是否相关。
+        如果有匹配的论点且有文献支撑，返回 True。
+
+        Args:
+            claim_text: 结论句文本.
+            section_title: 章节标题.
+
+        Returns:
+            True 如果证据矩阵中有支撑文献.
+        """
+        if not self.evidence_matrix_data:
+            return False
+
+        section_maps = self.evidence_matrix_data.get("section_maps", [])
+        if not section_maps:
+            return False
+
+        # 从结论句中提取关键词（去掉常见停用词）
+        stop_words = {
+            "的", "了", "在", "为", "是", "有", "对", "及", "或", "这", "那",
+            "其", "此", "该", "某", "本", "与", "和", "但", "而", "则", "即",
+            "通过", "可以", "能够", "具有", "存在", "从而", "进而", "因此",
+            "表明", "发现", "指出", "认为", "研究", "表明", "显示",
+        }
+        # 提取2字以上的中文词作为关键词
+        claim_keywords = set()
+        # 简单分词：按标点和空格分割，取2-6字的中文片段
+        segments = re.split(r'[，。；：、！？\s（）\(\)]', claim_text)
+        for seg in segments:
+            seg = seg.strip()
+            if 2 <= len(seg) <= 8 and seg not in stop_words:
+                claim_keywords.add(seg)
+            # 也提取更长的片段中的2-4字子串
+            if len(seg) > 4:
+                for i in range(len(seg) - 1):
+                    sub = seg[i:i+2]
+                    if sub not in stop_words and not sub.isdigit():
+                        claim_keywords.add(sub)
+
+        if not claim_keywords:
+            return False
+
+        # 遍历所有章节的证据条目（不只匹配当前章节，因为论点可能跨章节）
+        for sm in section_maps:
+            for entry in sm.get("evidence_entries", []):
+                arg = entry.get("argument", "")
+                papers = entry.get("paper_ids", [])
+                gap = entry.get("gap_flag", False)
+
+                # 跳过有证据缺口的条目
+                if gap:
+                    continue
+                # 跳过无文献支撑的条目
+                if not papers:
+                    continue
+
+                # 关键词匹配：结论句关键词是否出现在论点中
+                arg_lower = arg.lower()
+                match_count = 0
+                for kw in claim_keywords:
+                    if kw in arg or kw in arg_lower:
+                        match_count += 1
+
+                # 如果有至少2个关键词匹配，认为有证据矩阵支撑
+                if match_count >= 2:
+                    return True
+
+                # 也检查论文ID是否出现在结论句中
+                for pid in papers:
+                    if pid in claim_text:
+                        return True
+
+        return False

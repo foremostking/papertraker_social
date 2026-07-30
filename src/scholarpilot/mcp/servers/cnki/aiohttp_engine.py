@@ -84,6 +84,7 @@ class CNKIAiohttpEngine:
         cookies: dict[str, str] | None = None,
         cookie_str: str = "",
         timeout: int = 30,
+        vpn_mode: bool = False,
     ) -> None:
         """初始化 CNKI aiohttp 引擎.
 
@@ -91,11 +92,22 @@ class CNKIAiohttpEngine:
             cookies: Cookie 字典。
             cookie_str: Cookie 字符串（如 "key1=val1; key2=val2"）。
             timeout: 请求超时秒数。
+            vpn_mode: VPN 机构访问模式。启用后依赖机构 IP 自动认证,
+                      不强制加载 Cookie（CNKI 会自动发放 Session Cookie）。
         """
         self._cookies: dict[str, str] = {}
         self.timeout = timeout
+        self.vpn_mode = vpn_mode
 
-        if cookies:
+        if vpn_mode:
+            # VPN 模式: 机构 IP 认证 + FALLBACK_COOKIE 客户端标识
+            # FALLBACK_COOKIE 提供客户端标识(Ecp_ClientId 等),
+            # 预热时获取 VPN 机构的 Session Cookie(SID_kns_new)
+            self._cookies = dict(self.FALLBACK_COOKIE)
+            logger.info(
+                "CNKI engine in VPN mode (institutional IP + fallback cookie)"
+            )
+        elif cookies:
             self._cookies = cookies
         elif cookie_str:
             self._cookies = self._parse_cookie_string(cookie_str)
@@ -533,6 +545,70 @@ class CNKIAiohttpEngine:
 
     # ===== 检索执行 =====
 
+    async def _warmup_session(self, session: aiohttp.ClientSession) -> None:
+        """VPN 模式预热: 访问 AdvSearch 页面获取机构 Session Cookie.
+
+        CNKI 通过机构 IP 自动认证时,访问 AdvSearch 页面会发放
+        Session Cookie(SID_kns_new, KNS2COOKIE)。预热后
+        session.cookie_jar 会自动保存这些 Cookie,后续检索请求
+        会自动携带(与 self._cookies 中的 FALLBACK_COOKIE 合并)。
+
+        Args:
+            session: aiohttp ClientSession 对象.
+        """
+        warmup_url = self.ADV_SEARCH_URL
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/144.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        }
+        try:
+            async with session.get(
+                warmup_url,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10),
+                allow_redirects=True,
+            ) as response:
+                # session.cookie_jar 自动保存响应中的 Cookie
+                logger.debug(
+                    f"CNKI warmup: HTTP {response.status}, "
+                    f"cookies acquired: {len(session.cookie_jar)}"
+                )
+        except Exception as e:
+            logger.warning(f"CNKI warmup failed (non-fatal): {e}")
+
+    def _detect_institutional_auth(self, html: str) -> bool:
+        """检测响应中是否含机构认证标识.
+
+        VPN 模式下,CNKI 通过机构 IP 自动认证。响应中通常包含
+        机构名称或"机构用户"等标识。
+
+        Args:
+            html: CNKI 响应 HTML.
+
+        Returns:
+            True 如果检测到机构认证标识.
+        """
+        html_lower = html.lower()
+        institutional_indicators = [
+            "institutional",
+            "机构用户",
+            "ip登录",
+            "ip 登录",
+            "单位用户",
+        ]
+        for indicator in institutional_indicators:
+            if indicator.lower() in html_lower:
+                logger.debug(
+                    f"CNKI institutional auth detected (indicator: {indicator})"
+                )
+                return True
+        return False
+
     async def search(
         self,
         query: str,
@@ -634,6 +710,10 @@ class CNKIAiohttpEngine:
         try:
             configure_no_proxy()
             async with aiohttp.ClientSession(trust_env=False) as session:
+                # VPN 模式预热: 访问 AdvSearch 页面获取机构 Session Cookie
+                if self.vpn_mode:
+                    await self._warmup_session(session)
+
                 async with session.post(
                     self.BRIEF_GRID_URL,
                     data=post_data,
@@ -645,10 +725,22 @@ class CNKIAiohttpEngine:
 
                     # 检测验证码
                     if "captcha" in html.lower() or "verify" in html.lower():
-                        logger.warning(
-                            "CNKI returned captcha/verify page. Cookie may be invalid."
-                        )
+                        if self.vpn_mode:
+                            # VPN 模式下验证码较少见,记录但不回退到 Cookie
+                            logger.warning(
+                                "CNKI returned captcha in VPN mode. "
+                                "Institutional IP may not be recognized."
+                            )
+                        else:
+                            logger.warning(
+                                "CNKI returned captcha/verify page. "
+                                "Cookie may be invalid."
+                            )
                         return CNKISearchResult(query=query, total_count=0)
+
+                    # VPN 模式下检测机构认证是否生效
+                    if self.vpn_mode:
+                        self._detect_institutional_auth(html)
 
                     result = self._parse_grid_html(html, query)
                     result.raw_response = html[:5000]
