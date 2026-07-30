@@ -1,4 +1,4 @@
-# ScholarPilot 每日自动同步脚本
+﻿# ScholarPilot 每日自动同步脚本
 # 功能：自动检测变更、提交并推送到 GitHub
 
 $GitPath = "D:\Software\Git\cmd\git.exe"

@@ -253,9 +253,11 @@ class DatabaseRAG:
                     conn.row_factory = sqlite3.Row
                     c = conn.cursor()
                     c.execute(
-                        "SELECT i.indicator_name, i.full_path, i.category_name, "
+                        "SELECT i.indicator_name, i.full_path, c.name as category_name, "
                         "d.name as db_name, d.platform "
-                        "FROM indicators i JOIN databases d ON i.database_id=d.id "
+                        "FROM indicators i "
+                        "JOIN databases d ON i.database_id=d.id "
+                        "LEFT JOIN categories c ON i.category_id=c.id "
                         "WHERE i.indicator_name LIKE ? OR i.full_path LIKE ? "
                         "LIMIT ?",
                         (f"%{keyword}%", f"%{keyword}%", limit),
