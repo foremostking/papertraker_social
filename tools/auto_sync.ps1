@@ -11,7 +11,6 @@ $Branch = "scholarpilot"
 
 # Ensure SSH can find keys in non-interactive (scheduled task) context
 $env:HOME = $env:USERPROFILE
-$env:GIT_SSH_COMMAND = "D:\Software\Git\usr\bin\ssh.exe -o StrictHostKeyChecking=no"
 
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
