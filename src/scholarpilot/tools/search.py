@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -607,7 +608,123 @@ class LiteratureSearchManager:
                     raw=p.to_dict(),
                 ))
 
+        # 跨源去重：按 DOI（大小写不敏感）和归一化标题去重
+        seen_dois: set[str] = set()
+        seen_titles: set[str] = set()
+        deduplicated: list[UnifiedPaper] = []
+
+        for paper in papers:
+            # DOI 去重（大小写不敏感）：若 DOI 已存在则跳过
+            doi_key = paper.doi.strip().lower() if paper.doi else ""
+            if doi_key and doi_key in seen_dois:
+                continue
+            # 归一化标题去重：移除所有非字母数字字符并转为小写
+            normalized_title = re.sub(
+                r'[^a-zA-Z0-9\u4e00-\u9fff]', '', paper.title
+            ).lower()
+            if normalized_title and normalized_title in seen_titles:
+                continue
+            # 记录已见的 DOI 和标题
+            if doi_key:
+                seen_dois.add(doi_key)
+            if normalized_title:
+                seen_titles.add(normalized_title)
+            deduplicated.append(paper)
+
+        papers = deduplicated
+
+        # 主题相关性过滤（如果有可用主题）
+        topic = getattr(result, "topic", "")
+        if topic:
+            papers = self._filter_by_relevance(papers, topic)
+
         return papers
+
+    def _expand_topic_synonyms(self, topic_words: set[str]) -> set[str]:
+        """扩展主题关键词的同义词集.
+
+        根据财政学/经济学/数字化转型等领域常见术语，
+        将主题关键词扩展为包含相关同义词的集合，
+        提升主题相关性匹配的召回率。
+
+        Args:
+            topic_words: 原始主题关键词集合。
+
+        Returns:
+            扩展后的关键词集合（包含原始词与同义词）。
+        """
+        # 同义词映射表：关键词 -> 相关同义词列表
+        synonym_map: dict[str, list[str]] = {
+            "数字化转型": ["数字技术", "数字化", "信息化", "人工智能", "大数据"],
+            "数字化": ["数字技术", "数字化转型", "信息化", "人工智能"],
+            "地方政府债务": ["地方债", "城投债", "隐性债务", "政府债务", "债务风险"],
+            "政府债务": ["地方政府债务", "地方债", "国债", "债务"],
+            "债务风险": ["债务危机", "财政风险", "违约风险"],
+            "财政政策": ["财政支出", "财政收入", "积极财政", "减税"],
+            "财政分权": ["分税制", "财权事权", "转移支付"],
+            "经济增长": ["经济发展", "gdp", "增长"],
+            "高质量发展": ["发展质量", "经济质量", "可持续"],
+            "碳中和": ["碳排放", "碳达峰", "低碳", "绿色"],
+            "digital transformation": ["digital", "digitization", "digitalization", "ai", "big data"],
+            "debt": ["borrowing", "liability", "deficit"],
+            "fiscal": ["budget", "tax", "revenue", "expenditure"],
+        }
+
+        expanded = set(topic_words)
+        for word in topic_words:
+            if word in synonym_map:
+                expanded.update(synonym_map[word])
+
+        return expanded
+
+    def _filter_by_relevance(
+        self,
+        papers: list[UnifiedPaper],
+        topic: str,
+        min_score: float = 0.15,
+    ) -> list[UnifiedPaper]:
+        """根据主题相关性过滤论文.
+
+        提取主题关键词（并扩展同义词），与每篇论文的
+        标题+摘要关键词比对，计算重叠率作为相关性分数，
+        过滤低相关性论文并按相关性降序排序。
+
+        Args:
+            papers: 待过滤的论文列表。
+            topic: 检索主题。
+            min_score: 最低相关性分数阈值，默认 0.15。
+
+        Returns:
+            过滤并按相关性降序排序后的论文列表。若过滤后结果少于 5 篇，
+            返回原始论文列表以避免过度过滤。
+        """
+        # 提取主题关键词（中文连续 2 字以上 / 英文连续 3 字以上）
+        topic_words = set(re.findall(r'[\u4e00-\u9fff]{2,}|[a-zA-Z]{3,}', topic.lower()))
+        if not topic_words:
+            return papers
+
+        # 扩展主题同义词以提升召回率
+        topic_words = self._expand_topic_synonyms(topic_words)
+
+        # 计算每篇论文的相关性分数
+        scored: list[tuple[float, UnifiedPaper]] = []
+        for paper in papers:
+            text = f"{paper.title} {paper.abstract}".lower()
+            paper_words = set(re.findall(r'[\u4e00-\u9fff]{2,}|[a-zA-Z]{3,}', text))
+            overlap = len(topic_words & paper_words)
+            score = overlap / max(len(topic_words), 1)
+            scored.append((score, paper))
+
+        # 过滤低相关性论文
+        filtered = [(s, p) for s, p in scored if s >= min_score]
+
+        # 若过滤后结果过少，返回原始列表（避免过度过滤）
+        if len(filtered) < 5:
+            return papers
+
+        # 按相关性分数降序排序
+        filtered.sort(key=lambda x: x[0], reverse=True)
+        return [p for _, p in filtered]
 
     def format_papers_for_display(self, papers: list[UnifiedPaper], max_display: int = 30) -> str:
         """格式化论文列表用于显示."""

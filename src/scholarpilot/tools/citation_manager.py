@@ -55,6 +55,23 @@ class Citation:
         }
 
 
+# 常见占位假名集合（LLM 生成引用时可能编造的典型虚构姓名）
+_FAKE_NAME_PATTERNS: set[str] = {
+    "张三", "李四", "王五", "赵六", "孙七", "孙八", "周九", "吴十",
+    "钱一", "孙二", "李五一", "李六一", "王七一", "赵八一", "郑十一",
+    "冯十二", "陈十三", "杨二四", "黄二五", "张二六", "李二七", "王二八",
+    "赵二九", "周三十", "吴三一", "郑三二", "冯三三", "陈三四", "杨三五",
+    "张三七", "王三九", "孙四一", "吴四三", "冯四五", "杨四七", "张四九",
+    "王五一", "周五三", "吴五四", "郑五五", "冯五六", "陈五七", "杨五八",
+    "黄五九", "李六一", "未知", "佚名", "匿名", "某某", "XXX", "xxx",
+}
+
+# 常见中文姓氏（用于检测"姓+序数词"假名模式）
+_COMMON_SURNAMES = set("张王李赵刘陈杨黄周吴徐孙朱马胡郭林何高梁郑")
+# 中文序数字符（用于检测"姓+序数词"假名模式）
+_ORDINAL_CHARS = set("一二三四五六七八九十")
+
+
 def _is_valid_zh_author(name: str, non_name_words: set[str]) -> bool:
     """检查中文字符串是否像真实作者名.
 
@@ -82,6 +99,19 @@ def _is_valid_zh_author(name: str, non_name_words: set[str]) -> bool:
     # 常见非姓名高频字（单独出现或组合出现都不像人名）
     non_name_high_freq = set("的了在是为有对及或这与那其此该某本但而则即若")
     if all(c in non_name_high_freq for c in name):
+        return False
+
+    # 占位假名检测
+    # 1. 命中常见占位假名集合（如 张三、李四、佚名、XXX 等）
+    if name in _FAKE_NAME_PATTERNS:
+        return False
+
+    # 2. "姓+序数词"模式：如 张一、李三、王九（姓氏 + 单个序数字符）
+    if len(name) == 2 and name[0] in _COMMON_SURNAMES and name[1] in _ORDINAL_CHARS:
+        return False
+
+    # 3. "姓+重复字"模式：如 张张、李李、王王（单字叠写，非真实姓名）
+    if len(name) == 2 and name[0] == name[1]:
         return False
 
     return True
@@ -250,6 +280,143 @@ def extract_citations_from_text(text: str) -> list[Citation]:
             ))
 
     return citations
+
+
+def build_citations_from_pool(
+    literature_pool: list[dict],
+    full_text: str,
+    existing_citations: list[Citation] | None = None,
+) -> list[Citation]:
+    """从文献池正向构建已验证的引用列表.
+
+    遍历 Phase 2 检索到的真实文献池，检查每篇论文的作者+年份
+    是否在正文中被引用。匹配成功的论文直接构建为已验证的 Citation 对象，
+    避免 LLM 编造的虚假引用混入参考文献。
+
+    Args:
+        literature_pool: Phase 2 检索到的论文列表（dict 格式）.
+        full_text: 论文正文文本.
+        existing_citations: 已从正文提取的引用列表（可选），用于去重.
+
+    Returns:
+        从文献池正向构建的已验证 Citation 列表.
+    """
+    if not literature_pool or not full_text:
+        return []
+
+    # 收集已有引用的作者+年份键，避免重复
+    seen_keys: set[str] = set()
+    if existing_citations:
+        for c in existing_citations:
+            if c.authors:
+                key = f"{c.authors[0].lower()}_{c.year}"
+                seen_keys.add(key)
+
+    pool_citations: list[Citation] = []
+
+    for paper in literature_pool:
+        if not isinstance(paper, dict):
+            continue
+
+        paper_authors = paper.get("authors", [])
+        paper_year = str(paper.get("year", "")).strip()
+
+        if not paper_authors or not paper_year:
+            continue
+
+        # 取第一作者
+        first_author = paper_authors[0] if paper_authors else ""
+        if not first_author:
+            continue
+
+        # 检查第一作者是否在正文中出现
+        # 中文作者：直接搜索姓名
+        # 英文作者：搜索姓氏
+        is_cited = False
+
+        if re.search(r'[\u4e00-\u9fff]', first_author):
+            # 中文作者：在正文中搜索"作者（年份）"或"作者，年份"模式
+            # 也检查作者名是否出现在正文中
+            if first_author in full_text:
+                # 进一步检查是否有年份关联
+                year_patterns = [
+                    f"{first_author}.*?{paper_year}",
+                    f"{first_author}.*?（{paper_year}）",
+                    f"{first_author}.*?({paper_year})",
+                    f"{first_author}.*?，{paper_year}",
+                ]
+                for pat in year_patterns:
+                    if re.search(pat, full_text, re.DOTALL):
+                        is_cited = True
+                        break
+                # 如果作者名出现且年份±1内出现，也算匹配
+                if not is_cited:
+                    try:
+                        py = int(paper_year)
+                        for y in range(py - 1, py + 2):
+                            if str(y) in full_text and first_author in full_text:
+                                is_cited = True
+                                break
+                    except ValueError:
+                        pass
+        else:
+            # 英文作者：搜索姓氏
+            # 从 "First Last" 格式中提取姓氏
+            surname = first_author.split()[-1] if " " in first_author else first_author
+            if surname and len(surname) >= 2:
+                # 搜索姓氏+年份
+                year_patterns = [
+                    f"{surname}.*?{paper_year}",
+                    f"{surname}.*?\\({paper_year}\\)",
+                ]
+                for pat in year_patterns:
+                    if re.search(pat, full_text, re.IGNORECASE | re.DOTALL):
+                        is_cited = True
+                        break
+
+        if not is_cited:
+            continue
+
+        # 去重检查
+        dedup_key = f"{first_author.lower()}_{paper_year}"
+        if dedup_key in seen_keys:
+            continue
+        seen_keys.add(dedup_key)
+
+        # 构建 Citation 对象
+        # 判断语言
+        title = paper.get("title", "")
+        language = "en"
+        if title and re.search(r'[\u4e00-\u9fff]', title):
+            language = "zh"
+        elif first_author and re.search(r'[\u4e00-\u9fff]', first_author):
+            language = "zh"
+
+        # 构建 raw 引用文本
+        if language == "zh":
+            raw = f"{first_author}（{paper_year}）"
+        else:
+            raw = f"{first_author} ({paper_year})"
+
+        citation = Citation(
+            raw=raw,
+            authors=paper_authors[:5],
+            year=paper_year,
+            language=language,
+        )
+
+        # 从论文数据填充完整信息
+        _fill_citation_from_paper(citation, paper, "literature_pool")
+
+        pool_citations.append(citation)
+
+    logger.info(
+        "build_citations_from_pool: 文献池 %d 篇，正向匹配到 %d 篇被引文献",
+        len(literature_pool),
+        len(pool_citations),
+    )
+
+    return pool_citations
 
 
 async def verify_citation(
@@ -707,12 +874,8 @@ def format_cssci(citation: Citation) -> str:
         - 中英文分开，中文在前
     """
     if not citation.verified and not citation.title:
-        # 未验证引用：用已有信息格式化，不显示 [未验证] 标记
-        # 提取作者和年份信息
-        author_str = _format_authors(citation.authors, citation.language) if citation.authors else ""
-        if author_str and citation.year:
-            return f"{author_str}, {citation.year}."
-        return citation.raw
+        # 未验证且无标题：返回空字符串以便在列表中被过滤掉
+        return ""
 
     # 根据作者实际语言选择格式（而非 citation.language）
     # 修复：验证后作者名可能从中文变为英文（CNKI 返回英文论文）
@@ -757,11 +920,8 @@ def format_apa7(citation: Citation) -> str:
         Author, A. A., & Author, B. B. (Year). Title of article. *Journal Name*, Volume(Issue), Pages. https://doi.org/xxx
     """
     if not citation.verified and not citation.title:
-        # 未验证引用：用已有信息格式化
-        author_str = _format_authors(citation.authors, citation.language) if citation.authors else ""
-        if author_str and citation.year:
-            return f"{author_str} ({citation.year})."
-        return citation.raw
+        # 未验证且无标题：返回空字符串以便在列表中被过滤掉
+        return ""
 
     # 作者格式化
     if citation.language == "zh":
@@ -799,6 +959,7 @@ def format_references_list(
     citations: list[Citation],
     style: str = "cssci",
     language_separate: bool = True,
+    exclude_unverified: bool = True,
 ) -> str:
     """生成完整的参考文献列表.
 
@@ -806,10 +967,15 @@ def format_references_list(
         citations: 引用列表.
         style: 格式风格 (cssci / apa7).
         language_separate: 是否中英文分开（CSSCI 要求）.
+        exclude_unverified: 是否排除未验证且无标题的引用（默认 True）.
 
     Returns:
         格式化后的参考文献列表字符串（带编号、换行分隔）.
     """
+    if exclude_unverified:
+        # 过滤掉未验证且无标题的引用
+        citations = [c for c in citations if not (not c.verified and not c.title)]
+
     formatter = format_cssci if style == "cssci" else format_apa7
 
     if language_separate:

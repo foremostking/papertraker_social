@@ -52,6 +52,9 @@ __all__ = [
     "DeAIResult",
     "DeAIEngine",
     "SYNONYM_DICT",
+    "PROTECTED_TERMS",
+    "CONTEXT_PROTECTED",
+    "CROSS_POS_FORBIDDEN",
 ]
 
 
@@ -154,9 +157,7 @@ class DeAIResult(BaseModel):
 SYNONYM_DICT: dict[str, list[str]] = {
     # ---- 动词 ----
     "提出": ["构建", "建立", "创立", "搭建"],
-    "研究": ["探讨", "分析", "考察", "评估"],
     "表明": ["显示", "揭示", "证实", "印证"],
-    "影响": ["作用", "促进", "推动", "驱动"],
     "促进": ["推动", "驱动", "助推", "推进"],
     "提高": ["提升", "增强", "改善", "优化"],
     "降低": ["减少", "弱化", "缩减", "降低"],
@@ -225,7 +226,6 @@ SYNONYM_DICT: dict[str, list[str]] = {
     "模式": ["模式", "范式", "方式", "模式"],
     # ---- 形容词 ----
     "重要的": ["关键的", "核心的", "根本的", "主要的"],
-    "显著的": ["明显的", "突出的", "引人注目的", "可观的"],
     "深入的": ["深刻的", "透彻的", "全面的", "系统的"],
     "广泛的": ["普遍的", "大范围的", "全面的", "广阔的"],
     "复杂的": ["繁复的", "错综的", "多元的", "交织的"],
@@ -260,6 +260,40 @@ SYNONYM_DICT: dict[str, list[str]] = {
     "具体而言": ["具体来看", "详言之", "细究之", "详而言之"],
     "值得注意的是": ["需要指出的是", "尤其值得关注的是", "不可忽略的是", "须强调的是"],
     "不可否认": ["诚然", "毋庸讳言", "坦率地说", "应当承认"],
+}
+
+
+# =============================================================================
+# 学术术语保护机制
+# =============================================================================
+
+# 学术术语保护词表
+PROTECTED_TERMS: set[str] = {
+    "显著", "显著性", "显著地",
+    "正相关", "负相关", "不相关",
+    "异方差", "自相关", "多重共线性",
+    "内生性", "外生性",
+    "固定效应", "随机效应",
+    "工具变量", "滞后项",
+    "实证", "面板数据", "截面数据",
+    "双重差分", "倾向得分匹配",
+    "本研究", "本文", "本节", "本章",
+    "被解释变量", "解释变量", "控制变量", "中介变量", "调节变量",
+}
+
+CONTEXT_PROTECTED: dict[str, list[str]] = {
+    "影响": ["对.*的影响", "影响.*显著", "产生.*影响", "受到.*影响"],
+    "研究": ["本研究", "研究.*表明", "实证研究", "研究设计", "研究方法", "研究结论", "研究贡献", "研究意义"],
+    "分析": ["实证分析", "回归分析", "稳健性分析", "描述性分析", "方差分析", "因子分析"],
+    "显著": ["在.*水平上显著", "显著.*正相关", "显著.*负相关", "系数.*显著"],
+}
+
+CROSS_POS_FORBIDDEN: dict[str, dict[str, list[str]]] = {
+    "影响": {
+        "促进": [r"对.{2,15}的促进", r"促进.*显著"],
+        "推动": [r"对.{2,15}的推动", r"推动.*显著"],
+        "驱动": [r"对.{2,15}的驱动", r"驱动.*显著"],
+    },
 }
 
 
@@ -897,8 +931,11 @@ class DeAIEngine:
                     mid = len(sub_parts) // 2
                     first_half = "，".join(sub_parts[:mid])
                     second_half = "，".join(sub_parts[mid:])
-                    rebuilt.append(first_half.rstrip("。") + "。")
-                    rebuilt.append(second_half)
+                    if self._is_valid_split_point(first_half):
+                        rebuilt.append(first_half.rstrip("。") + "。")
+                        rebuilt.append(second_half)
+                    else:
+                        rebuilt.append(s)
                 else:
                     rebuilt.append(s)
             else:
@@ -907,6 +944,18 @@ class DeAIEngine:
         # 去除每句末尾的句号后再 join，避免 。。 双句号
         rebuilt = [s.rstrip("。") for s in rebuilt]
         return "。".join(rebuilt) + ("。" if not result.rstrip("。").endswith(("！", "？")) else "")
+
+    def _is_valid_split_point(self, first_half: str) -> bool:
+        """检查拆分点是否合理."""
+        bad_endings = ["且", "或", "和", "与", "及", "以及", "但", "但是",
+                       "虽然", "尽管", "由于", "因为", "如果", "除非",
+                       "当", "在", "对", "对于", "关于", "通过", "基于",
+                       "为", "为了", "以"]
+        stripped = first_half.rstrip("，,；;。")
+        for ending in bad_endings:
+            if stripped.endswith(ending):
+                return False
+        return True
 
     def reviewer_perspective(self, text: str) -> str:
         """审稿人视角修订（GPT5.5策略2）.
@@ -965,27 +1014,76 @@ class DeAIEngine:
     def paraphrase_synonym(self, text: str) -> str:
         """同义词替换（降重策略1）.
 
-        基于内置学术同义词库（100+组），根据语境选择最佳替换词。
-
-        Args:
-            text: 原始文本.
-
-        Returns:
-            同义词替换后的文本.
+        基于内置学术同义词库，根据语境选择最佳替换词。
+        增加学术术语保护和上下文感知替换。
         """
         result = text
+
         for original, synonyms in SYNONYM_DICT.items():
-            # 每个词出现多次时，交替使用不同的同义词
+            # 跳过保护词
+            if original in PROTECTED_TERMS:
+                continue
+
             occurrences = list(re.finditer(re.escape(original), result))
             if not occurrences:
                 continue
+
+            # 收集可替换的位置
+            replaceable: list[tuple[int, int, str]] = []
+
             for idx, match in enumerate(occurrences):
-                synonym = synonyms[idx % len(synonyms)]
-                # 从后往前替换以避免偏移问题
                 start = match.start()
                 end = match.end()
+
+                # 检查上下文
+                context = result[max(0, start - 20):min(len(result), end + 20)]
+
+                if self._is_context_protected(original, context):
+                    continue
+
+                # 第一次出现不替换（保持术语一致性）
+                if idx == 0:
+                    continue
+
+                # 选择安全的同义词
+                synonym = self._select_safe_synonym(original, synonyms, idx, context)
+                if synonym is None:
+                    continue
+
+                replaceable.append((start, end, synonym))
+
+            # 从后往前替换
+            for start, end, synonym in reversed(replaceable):
                 result = result[:start] + synonym + result[end:]
+
         return result
+
+    def _is_context_protected(self, word: str, context: str) -> bool:
+        """检查词是否出现在保护上下文中."""
+        if word in PROTECTED_TERMS:
+            return True
+        patterns = CONTEXT_PROTECTED.get(word, [])
+        for pattern in patterns:
+            if re.search(pattern, context):
+                return True
+        return False
+
+    def _select_safe_synonym(self, original: str, synonyms: list[str], occurrence_idx: int, context: str) -> str | None:
+        """选择安全的同义词（通过跨词性和上下文检查）."""
+        forbidden_map = CROSS_POS_FORBIDDEN.get(original, {})
+        safe_synonyms = []
+        for syn in synonyms:
+            forbidden_patterns = forbidden_map.get(syn, [])
+            is_safe = True
+            for pattern in forbidden_patterns:
+                if re.search(pattern, context):
+                    is_safe = False
+                    break
+            if is_safe:
+                safe_synonyms.append(syn)
+        if not safe_synonyms:
+            return None
+        return safe_synonyms[(occurrence_idx - 1) % len(safe_synonyms)]
 
     def paraphrase_restructure(self, text: str) -> str:
         """句式重构（降重策略2）.

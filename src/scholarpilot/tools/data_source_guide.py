@@ -140,14 +140,29 @@ class DataSourceGuide:
         self._rag: Any = None
 
     def _get_rag(self) -> Any:
-        """延迟加载 RAG 知识库."""
+        """延迟加载 RAG 知识库.
+
+        区分 FileNotFoundError（文件缺失）和其他异常，
+        加载成功后验证数据库数量并记录 info 日志。
+        """
         if self._rag is None:
             try:
                 from scholarpilot.tools.database_rag import DatabaseRAG
                 self._rag = DatabaseRAG()
-                logger.info("RAG 知识库已加载")
+
+                # 验证数据库数量
+                try:
+                    all_dbs = self._rag.list_all_databases()
+                    db_count = len(all_dbs)
+                    logger.info("RAG 知识库已加载成功: %d 个机构数据库可用", db_count)
+                except Exception as ve:
+                    logger.warning("RAG 知识库已加载，但数据库数量验证失败: %s", ve)
+
+            except FileNotFoundError as e:
+                logger.error("RAG 知识库文件缺失: %s", e)
+                self._rag = False  # 标记为不可用
             except Exception as e:
-                logger.warning(f"RAG 知识库加载失败，将使用静态数据源: {e}")
+                logger.error("RAG 知识库加载失败（非文件缺失）: %s", e)
                 self._rag = False  # 标记为不可用
         return self._rag if self._rag is not False else None
 
@@ -233,13 +248,22 @@ class DataSourceGuide:
         var_keywords = [v["name"] for v in variables[:5]]
         rag_indicators = self._query_rag_indicators(var_keywords)
 
+        # 检查 RAG 是否实际激活
+        rag_active = self._get_rag() is not None
+
         lines: list[str] = []
         lines.append("# 数据采集指南")
         lines.append("")
         lines.append("> 本指南由 ScholarPilot 根据 SPEC 自动生成，帮助研究者快速定位数据来源。")
-        if rag_databases:
+        if rag_active and rag_databases:
             lines.append(">")
             lines.append(f"> **RAG 知识库已激活**: 覆盖 73 个机构数据库，智能推荐 {len(rag_databases)} 个相关数据库。")
+        elif rag_active and not rag_databases:
+            lines.append(">")
+            lines.append("> **RAG 知识库已激活**: 覆盖 73 个机构数据库，但当前主题未匹配到推荐数据库，请参考下方静态数据源。")
+        else:
+            lines.append(">")
+            lines.append("> ⚠ **RAG 知识库未激活**: 无法加载机构数据库知识库，以下推荐仅基于静态数据源映射。请检查 `database_rag.db` 和 `database_rag.json` 文件是否存在。")
         lines.append("")
 
         # 变量清单
@@ -354,6 +378,28 @@ class DataSourceGuide:
         lines.append("*生成自 ScholarPilot 数据源指南模块*")
 
         return "\n".join(lines)
+
+    def get_rag_recommendations(self, spec_text: str) -> dict[str, Any]:
+        """获取 RAG 推荐结果（结构化数据），供论文撰写上下文注入使用.
+
+        Args:
+            spec_text: 论文 SPEC 文本。
+
+        Returns:
+            包含 databases 和 indicators 两个列表的字典。
+        """
+        research_topic = self._extract_research_topic(spec_text)
+        rag_databases = self._query_rag_databases(research_topic)
+        variables = self._extract_variables(spec_text)
+        var_keywords = [v["name"] for v in variables[:5]]
+        rag_indicators = self._query_rag_indicators(var_keywords)
+
+        return {
+            "rag_active": self._get_rag() is not None,
+            "research_topic": research_topic[:100],
+            "databases": rag_databases,
+            "indicators": rag_indicators,
+        }
 
     def _extract_variables(self, spec_text: str) -> list[dict]:
         """从 SPEC 文本提取变量定义。

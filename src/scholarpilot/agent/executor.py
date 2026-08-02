@@ -173,6 +173,7 @@ async def _execute_literature_search(
                 result.chinese_result.returned_count if result.chinese_result else 0
             ),
             "vpn_connected": vpn_status.connected,
+            "all_papers": [p.to_dict() if hasattr(p, "to_dict") else p for p in result.all_papers],
         }
     except Exception as e:
         await manager.close()
@@ -368,8 +369,65 @@ async def _execute_citation_management(
     if not citations:
         return {"status": "completed", "citations_found": 0}
 
-    # 验证引用（不传引擎则全部标记为 unverified，由后续人工核查）
-    verified_citations = await verify_all_citations(citations, concurrency=3)
+    # 从 state 的 step_results 构建 literature_pool（Phase 2 文献池）
+    literature_pool: list[dict] = []
+    for sr in state.get("step_results", []):
+        if isinstance(sr, dict) and sr.get("step_type") == "literature_search":
+            result_data = sr.get("result", {})
+            if isinstance(result_data, dict):
+                literature_pool = result_data.get("all_papers", [])
+                break
+
+    # 从 paper_spec 构建 topic_keywords
+    paper_spec = state.get("paper_spec", {})
+    topic_keywords = " ".join(filter(None, [
+        paper_spec.get("topic", "") if isinstance(paper_spec, dict) else "",
+        paper_spec.get("region", "") if isinstance(paper_spec, dict) else "",
+    ]))
+
+    # 尝试初始化验证引擎（各自独立容错）
+    cnki_engine = None
+    try:
+        from scholarpilot.mcp.servers.cnki.aiohttp_engine import CNKIAiohttpEngine
+        cnki_engine = CNKIAiohttpEngine()
+    except Exception:
+        pass
+
+    openalex_engine = None
+    try:
+        from scholarpilot.mcp.servers.openalex import OpenAlexEngine
+        openalex_engine = OpenAlexEngine()
+    except Exception:
+        pass
+
+    ss_engine = None
+    try:
+        from scholarpilot.mcp.servers.semantic_scholar import SemanticScholarEngine
+        from scholarpilot.config import get_settings
+        config = get_settings()
+        ss_engine = SemanticScholarEngine(api_key=config.ss_api_key or None)
+    except Exception:
+        pass
+
+    # 验证引用（传入引擎、文献池与主题关键词以提升验证命中率）
+    verified_citations = await verify_all_citations(
+        citations,
+        cnki_engine=cnki_engine,
+        openalex_engine=openalex_engine,
+        ss_engine=ss_engine,
+        concurrency=3,
+        topic_keywords=topic_keywords,
+        literature_pool=literature_pool,
+    )
+
+    # 关闭引擎
+    for engine in [cnki_engine, openalex_engine]:
+        if engine:
+            try:
+                if hasattr(engine, "close"):
+                    await engine.close()
+            except Exception:
+                pass
 
     # 格式化参考文献列表
     ref_list = format_references_list(

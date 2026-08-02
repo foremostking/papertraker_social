@@ -1594,32 +1594,91 @@ class ScholarAgent:
 
         research_type = self.topic_info.get("research_type", "empirical")
 
-        # 1. 调用 LLM 生成数据采集指南
-        self.console.print("[dim]📝 正在生成数据采集指南...[/dim]")
-        from scholarpilot.context.prompts import DATA_COLLECTION_PROMPT, SCHOLAR_SYSTEM_PROMPT
-
-        prompt = DATA_COLLECTION_PROMPT.format(
-            spec_content=spec_content[:6000],  # 截取避免超长
-            research_type=research_type,
-        )
+        # 1. 优先调用 DataSourceGuide（集成 RAG 知识库）生成数据采集指南
+        self.console.print("[dim]📝 正在生成数据采集指南（RAG 增强）...[/dim]")
+        guide_content = None
+        rag_recommendations = None
 
         try:
-            guide_content = await self.llm.chat(
-                messages=[
-                    {"role": "system", "content": SCHOLAR_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                model=self.config.default_writing_model,
-                temperature=0.3,
-            )
+            from scholarpilot.tools.data_source_guide import DataSourceGuide
+            ds_guide = DataSourceGuide(project_dir=self.project_dir)
+            guide_content = ds_guide.generate_guide(spec_content)
+
+            # 检查是否包含 RAG 推荐章节
+            if "RAG 智能推荐数据库" in guide_content:
+                self.console.print("  [green]✓ RAG 知识库已激活，数据采集指南包含智能推荐数据库[/green]")
+            else:
+                self.console.print("  [yellow]⚠ RAG 知识库未激活，指南仅包含静态数据源映射[/yellow]")
+
+            # 获取 RAG 推荐结果（结构化数据），供后续章节撰写使用
+            rag_recommendations = ds_guide.get_rag_recommendations(spec_content)
+            if rag_recommendations and rag_recommendations.get("rag_active"):
+                db_count = len(rag_recommendations.get("databases", []))
+                ind_count = len(rag_recommendations.get("indicators", []))
+                self.console.print(
+                    f"  [dim]RAG 推荐: {db_count} 个数据库, {ind_count} 个指标[/dim]"
+                )
+
         except Exception as e:
-            self.console.print(f"[red]数据采集指南生成失败: {e}[/red]")
-            guide_content = "# 数据采集指南\n\n（生成失败，请参考 SPEC.json 中的变量定义手动采集数据）"
+            self.console.print(f"[yellow]DataSourceGuide 生成失败，降级为 LLM 生成: {e}[/yellow]")
+            guide_content = None
+
+        # 降级：使用 LLM 生成
+        if guide_content is None:
+            self.console.print("[dim]📝 使用 LLM 生成数据采集指南...[/dim]")
+            from scholarpilot.context.prompts import DATA_COLLECTION_PROMPT, SCHOLAR_SYSTEM_PROMPT
+
+            prompt = DATA_COLLECTION_PROMPT.format(
+                spec_content=spec_content[:6000],  # 截取避免超长
+                research_type=research_type,
+            )
+
+            try:
+                guide_content = await self.llm.chat(
+                    messages=[
+                        {"role": "system", "content": SCHOLAR_SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    model=self.config.default_writing_model,
+                    temperature=0.3,
+                )
+            except Exception as e:
+                self.console.print(f"[red]数据采集指南生成失败: {e}[/red]")
+                guide_content = "# 数据采集指南\n\n（生成失败，请参考 SPEC.json 中的变量定义手动采集数据）"
 
         # 保存指南
         guide_path = self.project_dir / "data_collection_guide.md"
         guide_path.write_text(guide_content, encoding="utf-8")
         self.console.print(f"  [green]数据采集指南已保存: {guide_path}[/green]")
+
+        # 修改9: 将 RAG 推荐结果注入 memory，供后续章节撰写时 LLM 引用
+        if rag_recommendations and rag_recommendations.get("rag_active"):
+            # 存储到 self.memory 供后续章节撰写使用
+            rag_context_parts: list[str] = []
+            rag_context_parts.append("## RAG 推荐数据库（来自机构知识库）")
+            for db in rag_recommendations.get("databases", [])[:8]:
+                name = db.get("name", "N/A")
+                platform = db.get("platform", "N/A")
+                access = db.get("access_method", db.get("access", "N/A"))
+                desc = db.get("description", "")[:60] if db.get("description") else ""
+                rag_context_parts.append(f"- {name}（{platform}）: {desc} | 访问: {access}")
+
+            if rag_recommendations.get("indicators"):
+                rag_context_parts.append("\n## RAG 搜索指标")
+                for ind in rag_recommendations.get("indicators", [])[:10]:
+                    ind_name = ind.get("indicator", "N/A")
+                    ind_db = ind.get("database", "N/A")
+                    ind_path = ind.get("full_path", "N/A")[:50]
+                    rag_context_parts.append(f"- {ind_name} @ {ind_db}: {ind_path}")
+
+            rag_context = "\n".join(rag_context_parts)
+
+            # 存储到 ProjectMemory（使用 .add() 方法）
+            self.memory.add("rag_recommendations", rag_recommendations)
+            self.memory.add("rag_context", rag_context)
+
+            logger.info("RAG 推荐结果已注入 memory，可供章节撰写使用")
+            self.console.print("  [dim]RAG 推荐结果已注入论文上下文[/dim]")
 
         # 2. 生成 CSV 模板（基本列：year, region + 从 SPEC 提取变量名）
         from scholarpilot.tools.data_collector import generate_csv_template
@@ -1994,28 +2053,7 @@ class ScholarAgent:
 
         full_text = draft_path.read_text(encoding="utf-8")
 
-        # 1. 提取引用
-        self.console.print("[dim]📖 正在提取正文中的引用...[/dim]")
-        from scholarpilot.tools.citation_manager import (
-            extract_citations_from_text,
-            verify_all_citations,
-            format_references_list,
-            generate_ai_disclosure,
-        )
-
-        citations = extract_citations_from_text(full_text)
-        if not citations:
-            self.console.print("[yellow]未在正文中提取到任何引用[/yellow]")
-            return
-
-        zh_count = sum(1 for c in citations if c.language == "zh")
-        en_count = sum(1 for c in citations if c.language != "zh")
-        self.console.print(
-            f"  [green]提取到 {len(citations)} 条引用"
-            f"（中文 {zh_count}，英文 {en_count}）[/green]"
-        )
-
-        # 2. 构建主题关键词和文献池（用于提高验证准确性）
+        # 0. 先构建文献池（用于哈希ID清洗和正向引用构建）
         topic_info = self.topic_info or {}
         topic_keywords = " ".join(filter(None, [
             topic_info.get("core_topic", ""),
@@ -2042,6 +2080,62 @@ class ScholarAgent:
                 self.console.print(f"  [dim]文献池: {len(literature_pool)} 篇全局文献库文献可供匹配[/dim]")
         except Exception as e:
             logger.debug(f"无法获取文献池: {e}")
+
+        # 修改5: 哈希ID清洗（在提取引用之前执行）
+        if literature_pool:
+            self.console.print("[dim]🔧 正在清洗正文中的哈希ID...[/dim]")
+            full_text = self._replace_hash_ids(full_text, literature_pool)
+            # 保存清洗后的文本
+            draft_path.write_text(full_text, encoding="utf-8")
+
+        # 1. 提取引用
+        self.console.print("[dim]📖 正在提取正文中的引用...[/dim]")
+        from scholarpilot.tools.citation_manager import (
+            extract_citations_from_text,
+            build_citations_from_pool,
+            verify_all_citations,
+            format_references_list,
+            generate_ai_disclosure,
+        )
+
+        citations = extract_citations_from_text(full_text)
+
+        # 修改6: 从文献池正向构建引用（以真实文献为主，文本提取为补充）
+        pool_citations: list = []
+        if literature_pool:
+            self.console.print("[dim]📖 正在从文献池正向构建引用...[/dim]")
+            pool_citations = build_citations_from_pool(
+                literature_pool, full_text, existing_citations=citations
+            )
+            if pool_citations:
+                self.console.print(
+                    f"  [green]文献池正向匹配到 {len(pool_citations)} 条已验证引用[/green]"
+                )
+
+        # 合并：文献池正向构建的引用（已验证）+ 文本提取的引用（需验证）
+        # 文献池引用优先，文本提取引用中与文献池重复的跳过
+        if pool_citations:
+            pool_keys = set()
+            for pc in pool_citations:
+                if pc.authors:
+                    pool_keys.add(f"{pc.authors[0].lower()}_{pc.year}")
+            # 过滤掉与文献池重复的文本提取引用
+            unique_text_citations = [
+                c for c in citations
+                if not (c.authors and f"{c.authors[0].lower()}_{c.year}" in pool_keys)
+            ]
+            citations = pool_citations + unique_text_citations
+
+        if not citations:
+            self.console.print("[yellow]未在正文中提取到任何引用[/yellow]")
+            return
+
+        zh_count = sum(1 for c in citations if c.language == "zh")
+        en_count = sum(1 for c in citations if c.language != "zh")
+        self.console.print(
+            f"  [green]提取到 {len(citations)} 条引用"
+            f"（中文 {zh_count}，英文 {en_count}）[/green]"
+        )
 
         # 3. 验证引用
         self.console.print("[dim]🔍 正在验证引用真实性（文献池 + CNKI + OpenAlex + Semantic Scholar）...[/dim]")
@@ -2165,6 +2259,65 @@ class ScholarAgent:
             "verified": verified_count,
             "unverified": unverified_count,
         })
+
+    def _replace_hash_ids(self, text: str, literature_pool: list[dict]) -> str:
+        """清洗正文中的哈希ID（12位十六进制字符串）.
+
+        LLM 在撰写正文时会从文献摘要中看到 paper_id（如 da3f8aaa5218），
+        并直接用作引用标识残留在正文中。此方法：
+        1. 构建 paper_id → 作者+年份 的映射
+        2. 将正文中的哈希ID替换为"作者（年份）"格式
+        3. 未匹配到作者的残余哈希ID用正则清除引用语句片段
+
+        Args:
+            text: 论文正文文本.
+            literature_pool: 文献池（dict 列表）.
+
+        Returns:
+            清洗后的文本.
+        """
+        import re as _re
+
+        if not literature_pool or not text:
+            return text
+
+        # 构建 paper_id → 作者+年份 映射
+        hash_map: dict[str, str] = {}
+        for paper in literature_pool:
+            if not isinstance(paper, dict):
+                continue
+            paper_id = paper.get("paper_id", "") or paper.get("id", "")
+            if paper_id and len(str(paper_id)) >= 8:
+                authors = paper.get("authors", [])
+                year = str(paper.get("year", ""))
+                if authors and year:
+                    first_author = authors[0]
+                    hash_map[str(paper_id)] = f"{first_author}（{year}）"
+
+        if not hash_map:
+            return text
+
+        # 替换已映射的哈希ID
+        replaced_count = 0
+        for hash_id, replacement in hash_map.items():
+            if hash_id in text:
+                text = text.replace(hash_id, replacement)
+                replaced_count += 1
+
+        # 清除残余的12位十六进制哈希ID（未匹配到文献的）
+        # 匹配独立的12位hex字符串（不包含在更长的hex字符串中）
+        hash_pattern = _re.compile(r'(?<![0-9a-fA-F])[0-9a-f]{12}(?![0-9a-fA-F])')
+        remaining = hash_pattern.findall(text)
+        if remaining:
+            # 将残余哈希ID替换为"（参考文献）"或直接删除
+            text = hash_pattern.sub("（参考文献）", text)
+            replaced_count += len(remaining)
+
+        if replaced_count > 0:
+            logger.info("_replace_hash_ids: 清洗了 %d 处哈希ID", replaced_count)
+            self.console.print(f"  [dim]哈希ID清洗: 替换/清除 {replaced_count} 处[/dim]")
+
+        return text
 
     def _merge_draft(self) -> None:
         """合并所有章节为完整草稿."""
@@ -3192,6 +3345,41 @@ class ScholarAgent:
             )
             self.console.print(
                 f"  [dim]标点清洗: 清除 {_semicolon_period_total} 处；。残留[/dim]"
+            )
+
+        # ---- 4c. 修改15: 增强标点清洗 ----
+        _enhanced_count = 0
+
+        # 1. 修复标点前空格：删除标点前的空白字符
+        polished_full, _n = _re_clean.subn(r'\s+([。，；：、！？）」』])', r'\1', polished_full)
+        _enhanced_count += _n
+
+        # 2. 修复括号格式：英文括号在中文语境中替换为中文括号
+        # 仅在括号内含中文时替换
+        def _fix_paren(m):
+            inner = m.group(1)
+            if _re_clean.search(r'[\u4e00-\u9fff]', inner):
+                return f'（{inner}）'
+            return m.group(0)
+        polished_full_new = _re_clean.sub(r'\(([^)]{1,30})\)', _fix_paren, polished_full)
+        _paren_count = len(_re_clean.findall(r'\(([^)]{1,30})\)', polished_full)) - \
+                       len(_re_clean.findall(r'\(([^)]{1,30})\)', polished_full_new))
+        polished_full = polished_full_new
+        _enhanced_count += max(0, _paren_count)
+
+        # 3. 修复从句中间的句号碎片化：短片段（5-12字）后的句号改为逗号
+        # 仅当句号前是短中文片段且后面紧跟中文内容时
+        polished_full, _n = _re_clean.subn(
+            r'([\u4e00-\u9fff]{5,12})。([\u4e00-\u9fff])',
+            r'\1，\2',
+            polished_full
+        )
+        _enhanced_count += _n
+
+        if _enhanced_count > 0:
+            log.info("Phase 8b 增强标点清洗: 共修复 %d 处", _enhanced_count)
+            self.console.print(
+                f"  [dim]增强标点清洗: 修复 {_enhanced_count} 处（空格/括号/碎片化）[/dim]"
             )
 
         # ---- 5. 保存 full_draft_polished.md（不覆盖原草稿）----

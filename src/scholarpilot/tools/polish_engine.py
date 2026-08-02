@@ -277,16 +277,13 @@ _CHINESE_COLLOQUIAL: dict[str, str] = {
 
 # 中文重复表达同义词库
 _CHINESE_SYNONYMS: dict[str, list[str]] = {
-    "影响": ["作用", "效应", "冲击"],
     "促进": ["推动", "驱动", "助推"],
     "提高": ["提升", "增强", "改善"],
     "降低": ["削减", "弱化", "缩减"],
     "表明": ["显示", "揭示", "证实"],
-    "研究": ["考察", "探讨", "分析"],
     "问题": ["议题", "挑战", "困境"],
     "发展": ["演进", "拓展", "推进"],
     "重要": ["关键", "核心", "至关重要"],
-    "显著": ["明显", "突出", "引人注目"],
 }
 
 # 段落过渡词库
@@ -698,8 +695,11 @@ class PolishEngine:
             polished = "".join(new_parts)
 
         # 3. 减少重复表达（同义词替换）
+        POLISHED_PROTECTED = {"显著", "影响", "研究", "本研究", "本文"}
         word_positions: dict[str, int] = {}
         for word, synonyms in _CHINESE_SYNONYMS.items():
+            if word in POLISHED_PROTECTED:
+                continue
             occurrences = [m.start() for m in re.finditer(re.escape(word), polished)]
             if len(occurrences) > 2:
                 # 保留前2次，后续替换为同义词
