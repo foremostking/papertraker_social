@@ -2,6 +2,7 @@
 
 面向中国金融学实证研究，根据论文 SPEC 中的变量设计，
 匹配推荐数据源（CSMAR/Wind/RESSET/NBS等），生成数据采集指南。
+已集成 RAG 知识库，支持基于73个机构数据库的智能推荐。
 
 作者: ScholarPilot
 """
@@ -11,6 +12,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +137,83 @@ class DataSourceGuide:
             project_dir: 项目目录路径（可选）。
         """
         self.project_dir = project_dir
+        self._rag: Any = None
+
+    def _get_rag(self) -> Any:
+        """延迟加载 RAG 知识库."""
+        if self._rag is None:
+            try:
+                from scholarpilot.tools.database_rag import DatabaseRAG
+                self._rag = DatabaseRAG()
+                logger.info("RAG 知识库已加载")
+            except Exception as e:
+                logger.warning(f"RAG 知识库加载失败，将使用静态数据源: {e}")
+                self._rag = False  # 标记为不可用
+        return self._rag if self._rag is not False else None
+
+    def _query_rag_databases(self, research_topic: str) -> list[dict]:
+        """通过 RAG 查询推荐数据库.
+
+        Args:
+            research_topic: 研究主题.
+
+        Returns:
+            推荐数据库列表.
+        """
+        rag = self._get_rag()
+        if rag is None:
+            return []
+
+        results = rag.find_databases_by_topic(research_topic)
+        # 过滤掉重复的数据库
+        seen = set()
+        unique = []
+        for r in results:
+            key = r.get("db_key", r.get("name", ""))
+            if key not in seen:
+                seen.add(key)
+                unique.append(r)
+        return unique[:10]  # 最多10个
+
+    def _query_rag_indicators(self, keywords: list[str]) -> list[dict]:
+        """通过 RAG 搜索相关指标.
+
+        Args:
+            keywords: 关键词列表.
+
+        Returns:
+            匹配的指标列表.
+        """
+        rag = self._get_rag()
+        if rag is None:
+            return []
+
+        all_indicators = []
+        seen = set()
+        for kw in keywords:
+            indicators = rag.search_indicators(kw, limit=10)
+            for ind in indicators:
+                key = f"{ind.get('indicator', '')}-{ind.get('database', '')}"
+                if key not in seen:
+                    seen.add(key)
+                    all_indicators.append(ind)
+        return all_indicators[:20]
+
+    def _extract_research_topic(self, spec_text: str) -> str:
+        """从 SPEC 文本中提取研究主题."""
+        # 尝试匹配标题或研究主题
+        patterns = [
+            r"(?:研究主题|题目|标题)[：:]\s*(.+?)(?:\n|$)",
+            r"#\s*(.+?)(?:\n|$)",
+            r"(?:本研究|本文|本研究旨在)[\s，,]*(.+?)(?:[。.])",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, spec_text)
+            if match:
+                return match.group(1).strip()
+
+        # 回退：取前200字符作为主题
+        return spec_text[:200].replace("\n", " ").strip()
 
     def generate_guide(self, spec_text: str) -> str:
         """生成数据采集指南（Markdown）。
@@ -148,10 +227,19 @@ class DataSourceGuide:
         variables = self._extract_variables(spec_text)
         source_mapping = self._match_sources(variables)
 
+        # RAG 增强：查询推荐数据库和指标
+        research_topic = self._extract_research_topic(spec_text)
+        rag_databases = self._query_rag_databases(research_topic)
+        var_keywords = [v["name"] for v in variables[:5]]
+        rag_indicators = self._query_rag_indicators(var_keywords)
+
         lines: list[str] = []
         lines.append("# 数据采集指南")
         lines.append("")
         lines.append("> 本指南由 ScholarPilot 根据 SPEC 自动生成，帮助研究者快速定位数据来源。")
+        if rag_databases:
+            lines.append(">")
+            lines.append(f"> **RAG 知识库已激活**: 覆盖 73 个机构数据库，智能推荐 {len(rag_databases)} 个相关数据库。")
         lines.append("")
 
         # 变量清单
@@ -191,8 +279,39 @@ class DataSourceGuide:
             lines.append(f"- **优势领域**: {', '.join(source['strengths'])}")
             lines.append("")
 
+        # RAG 推荐数据库
+        if rag_databases:
+            lines.append("## 四、RAG 智能推荐数据库")
+            lines.append("")
+            lines.append(f"> 基于研究主题「{research_topic[:50]}」从 73 个机构数据库中智能匹配。")
+            lines.append("")
+            lines.append("| 数据库 | 平台 | 分类 | 相关度 | 访问方式 |")
+            lines.append("|---|---|---|---|---|")
+            for db in rag_databases:
+                name = db.get("name", "N/A")[:30]
+                platform = db.get("platform", "N/A")
+                category = db.get("description", "")[:20] if db.get("description") else "N/A"
+                score = db.get("relevance_score", 0)
+                access = db.get("access_method", db.get("access", "N/A"))[:30]
+                lines.append(f"| {name} | {platform} | {category} | {score:.1f} | {access} |")
+            lines.append("")
+
+            # RAG 指标搜索结果
+            if rag_indicators:
+                lines.append("### 相关指标（RAG FTS 搜索）")
+                lines.append("")
+                lines.append("| 指标 | 所在数据库 | 完整路径 |")
+                lines.append("|---|---|---|")
+                for ind in rag_indicators[:10]:
+                    indicator = ind.get("indicator", "N/A")[:20]
+                    database = ind.get("database", "N/A")[:20]
+                    path = ind.get("full_path", "N/A")[:40]
+                    lines.append(f"| {indicator} | {database} | {path} |")
+                lines.append("")
+
+
         # 样本建议
-        lines.append("## 四、样本建议")
+        lines.append("## 五、样本建议")
         lines.append("")
         sample_info = self._extract_sample_info(spec_text)
         if sample_info:
@@ -203,7 +322,7 @@ class DataSourceGuide:
         lines.append("")
 
         # CSV 模板格式
-        lines.append("## 五、CSV 数据模板格式")
+        lines.append("## 六、CSV 数据模板格式")
         lines.append("")
         if variables:
             var_names = [v["name"] for v in variables]
@@ -222,7 +341,7 @@ class DataSourceGuide:
         lines.append("")
 
         # 数据质量要求
-        lines.append("## 六、数据质量要求")
+        lines.append("## 七、数据质量要求")
         lines.append("")
         lines.append("1. **缺失值处理**: 缺失比例 >30% 的变量建议删除，5-30% 用插值法，<5% 用均值填充")
         lines.append("2. **异常值处理**: 连续变量建议 1%/99% 缩尾处理（winsorize）")
