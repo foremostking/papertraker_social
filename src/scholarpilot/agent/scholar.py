@@ -1491,6 +1491,15 @@ class ScholarAgent:
                 section_empirical_data = empirical_data_text
                 self.console.print("[dim]  📊 实证章节：注入真实描述性统计数据[/dim]")
 
+            # 修改9: 注入 RAG 推荐的数据库和指标上下文（供研究设计/数据来源章节引用）
+            rag_context_text = ""
+            try:
+                rag_ctx = self.memory.get("rag_context")
+                if rag_ctx and isinstance(rag_ctx, str):
+                    rag_context_text = rag_ctx
+            except Exception:
+                pass
+
             # 构建上下文（不再传入完整大纲，避免 prompt 过长）
             research_type = self.topic_info.get("research_type", "empirical")
 
@@ -1499,6 +1508,10 @@ class ScholarAgent:
             if previous_summaries:
                 last_summary = previous_summaries[-1]
                 prev_summary_text = last_summary[:300] + "..." if len(last_summary) > 300 else last_summary
+
+            # 将 RAG 推荐上下文追加到证据上下文
+            if rag_context_text:
+                evidence_context = (evidence_context + "\n\n" + rag_context_text) if evidence_context else rag_context_text
 
             ctx = self.context_engine.build_section_writing_context(
                 paper_title=paper_title,
