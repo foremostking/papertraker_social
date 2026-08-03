@@ -192,6 +192,30 @@ class LiteratureSearchManager:
         "数字化转型": "digital transformation",
     }
 
+    # 不相关主题黑名单：命中任一词的论文将被硬过滤丢弃，不受兜底保护
+    _IRRELEVANT_TOPIC_BLOCKLIST: tuple[str, ...] = (
+        # 医学/疫情类
+        "covid-19", "covid19", "coronavirus",
+        "新冠", "疫情", "肺炎", "临床特征", "临床分析", "心理反应",
+        "结核", "tuberculosis", "耐药", "drug resistance",
+        # 农业/机器人类
+        "采摘机器人", "红花", "农业机器人",
+        "harvest robot", "safflower",
+        # 医疗旅游类
+        "医疗旅游", "文化旅游标准化", "medical tourism",
+        # 国际关系/政治类
+        "axis of allies", "us-japan alliance", "国际关系",
+        "antitrust interoperability",
+        # 数据安全/隐私类（与创新绩效无直接关联）
+        "data security and privacy protection", "ctrip",
+        # 药物创新（非企业创新绩效）
+        "pharmaceutical innovation", "药物创新",
+        # 结核病/抗菌类
+        "mycobacterium tuberculosis", "antituberculosis", "drug resistance in",
+        # 内生知识溢出（非企业数字化）
+        "endogenous knowledge spillover",
+    )
+
     def __init__(
         self,
         cnki_cookie: str = "",
@@ -681,7 +705,7 @@ class LiteratureSearchManager:
         self,
         papers: list[UnifiedPaper],
         topic: str,
-        min_score: float = 0.15,
+        min_score: float = 0.25,
     ) -> list[UnifiedPaper]:
         """根据主题相关性过滤论文.
 
@@ -689,14 +713,18 @@ class LiteratureSearchManager:
         标题+摘要关键词比对，计算重叠率作为相关性分数，
         过滤低相关性论文并按相关性降序排序。
 
+        在词重合度计算之前，先对论文的标题+摘要进行硬过滤：
+        命中不相关主题黑名单（``_IRRELEVANT_TOPIC_BLOCKLIST``）的
+        论文直接丢弃，不受"<5 篇放宽阈值"兜底保护。
+
         Args:
             papers: 待过滤的论文列表。
             topic: 检索主题。
-            min_score: 最低相关性分数阈值，默认 0.15。
+            min_score: 最低相关性分数阈值，默认 0.20。
 
         Returns:
             过滤并按相关性降序排序后的论文列表。若过滤后结果少于 5 篇，
-            返回原始论文列表以避免过度过滤。
+            放宽阈值至 0.10 重新过滤，但仍剔除黑名单命中项。
         """
         # 提取主题关键词（中文连续 2 字以上 / 英文连续 3 字以上）
         topic_words = set(re.findall(r'[\u4e00-\u9fff]{2,}|[a-zA-Z]{3,}', topic.lower()))
@@ -706,10 +734,27 @@ class LiteratureSearchManager:
         # 扩展主题同义词以提升召回率
         topic_words = self._expand_topic_synonyms(topic_words)
 
-        # 计算每篇论文的相关性分数
+        # 动态核心主题词：从研究主题中提取，替代旧版硬编码
+        # 使用跨语言关键词扩展（中文→英文翻译），适用于任何研究主题
+        from scholarpilot.tools.citation_manager import _expand_topic_keywords
+        _core_topic_words = _expand_topic_keywords(topic)
+        if not _core_topic_words:
+            # 回退：如果无法提取核心词，跳过标题硬过滤
+            _core_topic_words = topic_words
+
+        # 计算每篇论文的相关性分数（同时进行黑名单硬过滤）
+        # 命中黑名单的论文直接丢弃，不受后续兜底保护
+        blocklist = self._IRRELEVANT_TOPIC_BLOCKLIST
         scored: list[tuple[float, UnifiedPaper]] = []
         for paper in papers:
             text = f"{paper.title} {paper.abstract}".lower()
+            # 硬过滤：命中不相关主题黑名单则直接跳过
+            if any(block_word in text for block_word in blocklist):
+                continue
+            # 标题硬过滤：标题中必须至少包含一个核心主题词
+            title_lower = paper.title.lower()
+            if not any(core in title_lower for core in _core_topic_words):
+                continue
             paper_words = set(re.findall(r'[\u4e00-\u9fff]{2,}|[a-zA-Z]{3,}', text))
             overlap = len(topic_words & paper_words)
             score = overlap / max(len(topic_words), 1)
@@ -718,9 +763,10 @@ class LiteratureSearchManager:
         # 过滤低相关性论文
         filtered = [(s, p) for s, p in scored if s >= min_score]
 
-        # 若过滤后结果过少，返回原始列表（避免过度过滤）
+        # 若过滤后结果过少，放宽阈值至 0.10 重新过滤
+        # （仍剔除黑名单命中项，因为 scored 中已不含这些论文）
         if len(filtered) < 5:
-            return papers
+            filtered = [(s, p) for s, p in scored if s >= 0.10]
 
         # 按相关性分数降序排序
         filtered.sort(key=lambda x: x[0], reverse=True)

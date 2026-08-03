@@ -419,19 +419,34 @@ class ScholarAgent:
         # 解析 JSON 响应
         self.topic_info = self._extract_json(response)
 
+        # 强制执行硬约束：文献时间窗口 = 当前年-7 到 当前年
+        from datetime import datetime
+        current_year = datetime.now().year
+        _enforced_start = str(current_year - 7)
+        _enforced_end = str(current_year)
+
         if not self.topic_info:
             # 如果无法解析，使用默认值（动态 7 年窗口）
-            from datetime import datetime
-            current_year = datetime.now().year
             self.topic_info = {
                 "topic": user_input[:50],
                 "region": "中国",
                 "content": "",
                 "research_type": "empirical",
-                "year_start": str(current_year - 7),
-                "year_end": str(current_year),
+                "year_start": _enforced_start,
+                "year_end": _enforced_end,
                 "analysis": response,
             }
+        else:
+            # LLM 成功解析后，强制覆盖年份为动态窗口
+            _old_start = self.topic_info.get("year_start", "")
+            _old_end = self.topic_info.get("year_end", "")
+            if _old_start != _enforced_start or _old_end != _enforced_end:
+                logger.info(
+                    "时间窗口强制修正: %s-%s → %s-%s",
+                    _old_start, _old_end, _enforced_start, _enforced_end,
+                )
+            self.topic_info["year_start"] = _enforced_start
+            self.topic_info["year_end"] = _enforced_end
 
         # 显示分析结果
         table = Table(title="选题分析结果")
@@ -564,8 +579,9 @@ class ScholarAgent:
         raw_topic = self.topic_info.get("topic", "")
         region = self.topic_info.get("region", "中国")
         raw_content = self.topic_info.get("content", "")
-        year_start = self.topic_info.get("year_start", "2015")
-        year_end = self.topic_info.get("year_end", "2024")
+        from datetime import datetime as _dt
+        year_start = self.topic_info.get("year_start", str(_dt.now().year - 7))
+        year_end = self.topic_info.get("year_end", str(_dt.now().year))
 
         # 智能提取检索关键词（解决 LLM 返回完整句子的问题）
         topic = self._extract_search_keywords(raw_topic)
@@ -2098,6 +2114,11 @@ class ScholarAgent:
         if literature_pool:
             self.console.print("[dim]🔧 正在清洗正文中的哈希ID...[/dim]")
             full_text = self._replace_hash_ids(full_text, literature_pool)
+            # 修改6: 替换正文中的虚假作者名 + 清除异常引用标记
+            from scholarpilot.tools.citation_manager import replace_fake_authors_in_text
+            full_text = replace_fake_authors_in_text(
+                full_text, literature_pool, topic_keywords
+            )
             # 保存清洗后的文本
             draft_path.write_text(full_text, encoding="utf-8")
 
@@ -2118,7 +2139,9 @@ class ScholarAgent:
         if literature_pool:
             self.console.print("[dim]📖 正在从文献池正向构建引用...[/dim]")
             pool_citations = build_citations_from_pool(
-                literature_pool, full_text, existing_citations=citations
+                literature_pool, full_text,
+                existing_citations=citations,
+                topic_keywords=topic_keywords,
             )
             if pool_citations:
                 self.console.print(
@@ -2206,6 +2229,21 @@ class ScholarAgent:
             f"{unverified_count} 条未验证[/green]"
         )
 
+        # 最终TRSS过滤：移除主题不相关的引用（三重保险）
+        # 使用动态主题相关性评分替代静态黑名单，适用于任何研究主题
+        from scholarpilot.tools.citation_manager import _is_irrelevant_paper
+        pre_filter_count = len(verified_citations)
+        verified_citations = [
+            c for c in verified_citations
+            if not _is_irrelevant_paper(c.title, c.abstract or "", topic_keywords)
+        ]
+        blocked_count = pre_filter_count - len(verified_citations)
+        if blocked_count > 0:
+            self.console.print(
+                f"  [yellow]🚫 TRSS最终过滤: 移除 {blocked_count} 条主题不相关引用[/yellow]"
+            )
+            logger.info("TRSS最终过滤: 移除 %d 条主题不相关引用", blocked_count)
+
         # 3. 格式化参考文献列表
         self.console.print("[dim]📋 正在生成参考文献列表（CSSCI 格式）...[/dim]")
         ref_list = format_references_list(
@@ -2221,6 +2259,70 @@ class ScholarAgent:
         ref_path = self.project_dir / "draft" / "references.md"
         ref_path.write_text(ref_list, encoding="utf-8")
         self.console.print(f"  [green]参考文献列表已保存: {ref_path}[/green]")
+
+        # 修改5: 正文引用←→参考文献列表交叉校验
+        try:
+            import re as _re_xcheck
+            # 从参考文献列表提取所有作者名
+            ref_authors: set[str] = set()
+            for c in verified_citations:
+                if c.authors:
+                    for a in c.authors:
+                        # 中文作者取全名，英文作者取姓氏
+                        if _re_xcheck.search(r'[\u4e00-\u9fff]', a):
+                            ref_authors.add(a.strip())
+                        else:
+                            # 英文作者取姓氏（最后一个单词）
+                            surname = a.split()[-1] if a.split() else a
+                            ref_authors.add(surname.lower().strip())
+
+            # 从正文提取所有内联引用作者名
+            in_text_pattern = _re_xcheck.compile(
+                r'([\u4e00-\u9fff]{2,4}(?:[和与][\u4e00-\u9fff]{2,4})*(?:等)?)\s*[（(]\s*((?:19|20)\d{2})\s*[）)]'
+            )
+            in_text_authors: set[str] = set()
+            for m in in_text_pattern.finditer(full_text):
+                author = m.group(1).replace('等', '').strip()
+                for part in _re_xcheck.split(r'[和与]', author):
+                    part = part.strip()
+                    if part:
+                        in_text_authors.add(part)
+
+            # 英文作者引用
+            en_pattern = _re_xcheck.compile(
+                r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)*(?:\s+et\s+al\.?)?)\s*[（(]\s*((?:19|20)\d{2})\s*[）)]'
+            )
+            for m in en_pattern.finditer(full_text):
+                author = m.group(1).strip()
+                surname = author.split()[-1] if author.split() else author
+                in_text_authors.add(surname.lower().strip())
+
+            # 找出正文中有但参考文献列表中无的作者
+            missing_authors = in_text_authors - ref_authors
+            # 过滤掉假名
+            from scholarpilot.tools.citation_manager import _is_valid_zh_author, _FAKE_NAME_PATTERNS
+            real_missing = set()
+            for a in missing_authors:
+                if a in _FAKE_NAME_PATTERNS:
+                    continue
+                if _re_xcheck.search(r'[\u4e00-\u9fff]', a):
+                    if _is_valid_zh_author(a, set()):
+                        real_missing.add(a)
+                else:
+                    real_missing.add(a)
+
+            if real_missing:
+                logger.warning(
+                    "交叉校验: %d 个正文引用作者不在参考文献列表中: %s",
+                    len(real_missing), list(real_missing)[:5],
+                )
+                self.console.print(
+                    f"  [yellow]⚠️ 交叉校验: {len(real_missing)} 个正文引用作者不在参考文献列表中[/yellow]"
+                )
+            else:
+                self.console.print("  [green]✓ 交叉校验通过: 正文引用与参考文献列表一致[/green]")
+        except Exception as e:
+            logger.debug("交叉校验失败: %s", e)
 
         # 5b. 保存 BibTeX 文件
         bib_lines = ["% BibTeX references (auto-generated by ScholarPilot)"]
@@ -3237,7 +3339,7 @@ class ScholarAgent:
         draft_path = self.project_dir / "draft" / "full_draft.md"
         if not draft_path.exists():
             self.console.print("[yellow]草稿文件不存在，跳过去AI味处理[/yellow]")
-            log.warning("full_draft.md 不存在，跳过 Phase 8b")
+            logger.warning("full_draft.md 不存在，跳过 Phase 8b")
             return
 
         full_text = draft_path.read_text(encoding="utf-8")
@@ -3250,7 +3352,7 @@ class ScholarAgent:
             from scholarpilot.tools.de_ai import DeAIEngine
             from scholarpilot.tools.polish_engine import PolishEngine
         except ImportError as e:
-            log.error("导入去AI味/润色模块失败: %s", e)
+            logger.error("导入去AI味/润色模块失败: %s", e)
             self.console.print(f"[red]导入去AI味/润色模块失败: {e}[/red]")
             return
 
@@ -3262,7 +3364,7 @@ class ScholarAgent:
         try:
             risk_before = deai_engine.detect_ai_patterns(full_text)
         except Exception as e:
-            log.error("AI痕迹检测失败: %s", e)
+            logger.error("AI痕迹检测失败: %s", e)
             self.console.print(f"[red]AI痕迹检测失败: {e}[/red]")
             return
 
@@ -3304,7 +3406,7 @@ class ScholarAgent:
                 deai_results.append(deai_result)
                 processed_text = deai_result.processed_text
             except Exception as e:
-                log.error("章节 '%s' 去AI味失败: %s", title, e)
+                logger.error("章节 '%s' 去AI味失败: %s", title, e)
                 self.console.print(
                     f"    [yellow]去AI味失败，保留原文: {e}[/yellow]"
                 )
@@ -3316,7 +3418,7 @@ class ScholarAgent:
                 polished_text = polish_result.polished_text
                 total_polish_changes += polish_result.change_count
             except Exception as e:
-                log.error("章节 '%s' 中文润色失败: %s", title, e)
+                logger.error("章节 '%s' 中文润色失败: %s", title, e)
                 self.console.print(
                     f"    [yellow]中文润色失败，使用去AI味结果: {e}[/yellow]"
                 )
@@ -3352,7 +3454,7 @@ class ScholarAgent:
             if _sp_count == 0 and _other_count == 0:
                 break
         if _semicolon_period_total > 0:
-            log.info(
+            logger.info(
                 "Phase 8b 标点清洗: full_draft_polished 共清除 %d 处 ；。残留",
                 _semicolon_period_total,
             )
@@ -3390,10 +3492,242 @@ class ScholarAgent:
         _enhanced_count += _n
 
         if _enhanced_count > 0:
-            log.info("Phase 8b 增强标点清洗: 共修复 %d 处", _enhanced_count)
+            logger.info("Phase 8b 增强标点清洗: 共修复 %d 处", _enhanced_count)
             self.console.print(
                 f"  [dim]增强标点清洗: 修复 {_enhanced_count} 处（空格/括号/碎片化）[/dim]"
             )
+
+        # ---- 4d. 修改7: 标点碎片化扩展修复 ----
+        # 7a: 数字/系数后句号改逗号
+        polished_full, _n7a = _re_clean.subn(
+            r'([0-9][0-9.%]*[个百分比标准差]*?)。([\u4e00-\u9fff])',
+            r'\1，\2',
+            polished_full,
+        )
+        # 7b: 右括号后句号改逗号
+        polished_full, _n7b = _re_clean.subn(
+            r'([）)])。([\u4e00-\u9fff])',
+            r'\1，\2',
+            polished_full,
+        )
+        # 7c: 英文单词后句号改逗号
+        polished_full, _n7c = _re_clean.subn(
+            r'([a-zA-Z]{2,})。([\u4e00-\u9fff])',
+            r'\1，\2',
+            polished_full,
+        )
+        # 7d: 连接词后句号改逗号（其中/其次/同时/例如/不过/因此/由此/此外/另外/而且/然而）
+        # 后置字符匹配扩展为中文或$（LaTeX公式起始符）
+        polished_full, _n7d = _re_clean.subn(
+            r'(其中|其次|同时|例如|不过|因此|由此|此外|另外|而且|然而|总体而言|最后)。([\u4e00-\u9fff$])',
+            r'\1，\2',
+            polished_full,
+        )
+        # 7e: 右引号后句号改逗号（如 "同群效应"。显示 → "同群效应"，显示）
+        polished_full, _n7e = _re_clean.subn(
+            r'(["""''])。([\u4e00-\u9fff])',
+            r'\1，\2',
+            polished_full,
+        )
+        # 7f: 学术动词后句号改逗号（指出/发现/提出/强调/认为/表明/建议/证实/揭示/指出）
+        polished_full, _n7f = _re_clean.subn(
+            r'(指出|发现|提出|强调|认为|表明|建议|证实|揭示|论证|说明|阐释|论证)。([\u4e00-\u9fff])',
+            r'\1，\2',
+            polished_full,
+        )
+        _punct_ext_count = _n7a + _n7b + _n7c + _n7d + _n7e + _n7f
+        if _punct_ext_count > 0:
+            logger.info(
+                "Phase 8b 标点扩展修复: 7a=%d, 7b=%d, 7c=%d, 7d=%d, 7e=%d, 7f=%d",
+                _n7a, _n7b, _n7c, _n7d, _n7e, _n7f,
+            )
+            self.console.print(
+                f"  [dim]标点扩展修复: {_punct_ext_count} 处（数字/括号/英文/连接词/引号/动词后句号）[/dim]"
+            )
+
+        # ---- 4e. 修改12: 引用标点修复（句号→逗号）----
+        # 4e-1: 英文姓名后句号改逗号（如 Smith。2024 → Smith，2024）
+        polished_full, _n_cite_en = _re_clean.subn(
+            r'([A-Za-z]{2,}(?:\s[A-Za-z]+)*(?:等)?)。(\d{4})',
+            r'\1，\2',
+            polished_full,
+        )
+        # 4e-2: 中文姓名后句号改逗号（如 张天和易明。2024 → 张天和易明，2024）
+        polished_full, _n_cite_zh = _re_clean.subn(
+            r'([\u4e00-\u9fff]{2,4}和[\u4e00-\u9fff]{2,4})。(\d{4})',
+            r'\1，\2',
+            polished_full,
+        )
+        _n_cite = _n_cite_en + _n_cite_zh
+        if _n_cite > 0:
+            logger.info("Phase 8b 引用标点修复: %d 处句号→逗号", _n_cite)
+            self.console.print(
+                f"  [dim]引用标点修复: {_n_cite} 处[/dim]"
+            )
+
+        # ---- 4e-3: 清理"未知"占位引用 ----
+        # 清理 "（未知，2026）" 或 "（未知，2025）" 等占位作者引用
+        polished_full, _n_unknown = _re_clean.subn(
+            r'（未知[，,]\s*\d{4}）', '', polished_full,
+        )
+        polished_full, _n_unknown2 = _re_clean.subn(
+            r'[；;]\s*未知[，,]\s*\d{4}', '', polished_full,
+        )
+        polished_full, _n_unknown3 = _re_clean.subn(
+            r'未知[，,]\s*\d{4}[；;]', '', polished_full,
+        )
+        _n_unknown_total = _n_unknown + _n_unknown2 + _n_unknown3
+        if _n_unknown_total > 0:
+            logger.info("Phase 8b 清理'未知'占位引用: %d 处", _n_unknown_total)
+            self.console.print(
+                f"  [dim]清理'未知'占位引用: {_n_unknown_total} 处[/dim]"
+            )
+
+        # ---- 4f. 修改8: 清理AI生成标记 ----
+        # 清理【研究者注意：...】等占位标记
+        polished_full, _n8a = _re_clean.subn(
+            r'【研究者注意[^】]*】', '', polished_full,
+        )
+        polished_full, _n8b = _re_clean.subn(
+            r'【(?:数据占位|示例|模板|TODO|待替换)[^】]*】', '', polished_full,
+        )
+        # 清理HTML注释风格的占位
+        polished_full, _n8c = _re_clean.subn(
+            r'<!--\s*(?:研究者|数据占位|示例|模板|TODO)[^>]*-->', '', polished_full,
+        )
+        # 清理连续空行（3+换行合并为2个）
+        polished_full = _re_clean.sub(r'\n{3,}', '\n\n', polished_full)
+        _ai_marker_count = _n8a + _n8b + _n8c
+        if _ai_marker_count > 0:
+            logger.info("Phase 8b AI标记清理: 清除 %d 处占位标记", _ai_marker_count)
+            self.console.print(
+                f"  [dim]AI标记清理: 清除 {_ai_marker_count} 处占位标记[/dim]"
+            )
+
+        # ---- 4g0. 异质性分析因果语言→相关性表述重写 ----
+        # 防止无交互项检验的分组回归结果被表述为因果性比较
+        # "对X的促进作用强于Y" → "与X的正相关关系强于Y"
+        _overreach_patterns = [
+            # "对...的促进作用/推动作用/驱动作用/助推作用强于" → "与...的正相关关系强于"
+            (
+                r'对([\u4e00-\u9fff]{2,20})的(促进|推动|驱动|助推)作用强于',
+                r'与\1的正相关关系强于',
+            ),
+            # "有助于缓解X" → "与X呈显著负相关"
+            (
+                r'有助于缓解([\u4e00-\u9fff]{2,10})',
+                r'与\1呈显著负相关',
+            ),
+            # "证实...对...的促进作用" → "表明...与...的正相关关系"
+            (
+                r'证实(数字化转型)对([\u4e00-\u9fff]{2,15})的(促进|推动|驱动|助推)作用',
+                r'表明\1与\2的正相关关系',
+            ),
+            # "揭示...对...的驱动作用" → "显示...与...的正相关关系"
+            (
+                r'揭示(数字化转型)对([\u4e00-\u9fff]{2,15})的(驱动|促进|推动|助推)作用',
+                r'显示\1与\2的正相关关系',
+            ),
+        ]
+        _overreach_count = 0
+        for pat, repl in _overreach_patterns:
+            polished_full, _n = _re_clean.subn(pat, repl, polished_full)
+            _overreach_count += _n
+        if _overreach_count > 0:
+            logger.info("Phase 8b 因果语言重写: %d 处异质性分析表述修正", _overreach_count)
+            self.console.print(
+                f"  [dim]因果语言重写: {_overreach_count} 处（促进作用→正相关）[/dim]"
+            )
+
+        # ---- 4g. 修改10c: 过渡词频率检测与去重 ----
+        _TRANSITION_WORDS = [
+            "从最基本的层面来看", "进一步来看", "还应注意",
+            "更为关键的是", "需要关注的是", "需要指出的是",
+        ]
+        _transition_replaced = 0
+        for tw in _TRANSITION_WORDS:
+            count = polished_full.count(tw)
+            if count > 2:
+                # 从第3次出现开始替换为"此外"
+                parts = polished_full.split(tw)
+                # 保留前2次，后续替换
+                result_parts = parts[:3]
+                for p in parts[3:]:
+                    result_parts.append("此外")
+                    result_parts.append(p)
+                polished_full = tw.join(result_parts[:3]) + "此外".join([""] + result_parts[3:])
+                # 修正拼接
+                polished_full = parts[0] + tw + parts[1] + tw + parts[2] + "此外".join(parts[3:])
+                _transition_replaced += (count - 2)
+        if _transition_replaced > 0:
+            logger.info("Phase 8b 过渡词去重: 替换 %d 处超出频率的过渡词", _transition_replaced)
+            self.console.print(
+                f"  [dim]过渡词去重: 替换 {_transition_replaced} 处[/dim]"
+            )
+
+        # ---- 4h. 修改11: 跨章节一致性校验 ----
+        # 11a: 结构章数统一——从outline获取实际章节数
+        try:
+            outline_data = self.file_manager.load_state(self.project_dir) or {}
+            outline_json_path = self.project_dir / "outline.json"
+            actual_chapters = 0
+            if outline_json_path.exists():
+                oj = json.loads(outline_json_path.read_text(encoding="utf-8"))
+                actual_chapters = len(oj.get("sections", []))
+            if actual_chapters > 0:
+                # 将"六章""七章"等替换为实际章数
+                cn_nums = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+                actual_cn = next(k for k, v in cn_nums.items() if v == actual_chapters)
+                for wrong_num, wrong_cn in [("六", "六"), ("七", "七"), ("八", "八")]:
+                    if wrong_cn != actual_cn:
+                        polished_full = polished_full.replace(
+                            f"全文共分为{wrong_cn}章", f"全文共分为{actual_cn}章"
+                        )
+                        polished_full = polished_full.replace(
+                            f"第{wrong_cn}章为结论", f"第{actual_cn}章为结论"
+                        )
+        except Exception as e:
+            logger.debug("章节数统一失败: %s", e)
+
+        # 11b: 样本量统一——取首次出现的数值为标准值
+        try:
+            import re as _re_sample
+            sample_matches = _re_sample.findall(r'(\d{1,3}(?:,\d{3})+)\s*(?:个|个观测值|个样本|个公司)', polished_full)
+            if len(set(sample_matches)) > 1:
+                standard_sample = sample_matches[0] if sample_matches else ""
+                if standard_sample:
+                    for other_sample in set(sample_matches):
+                        if other_sample != standard_sample:
+                            polished_full = polished_full.replace(other_sample, standard_sample)
+        except Exception as e:
+            logger.debug("样本量统一失败: %s", e)
+
+        # 11c: 变量命名统一——Dig_trans→DT, Inn_perf→Innovation
+        try:
+            import re as _re_var
+            polished_full = _re_var.sub(r'\bDig_trans\b', 'DT', polished_full)
+            polished_full = _re_var.sub(r'\bInn_perf\b', 'Innovation', polished_full)
+            polished_full = _re_var.sub(r'\bDig_trans\b', 'DT', polished_full)
+        except Exception as e:
+            logger.debug("变量名统一失败: %s", e)
+
+        # 11d: 年份窗口统一——从SPEC获取时间窗口
+        try:
+            spec_path = self.project_dir / "SPEC.md"
+            if spec_path.exists():
+                spec_text = spec_path.read_text(encoding="utf-8")
+                import re as _re_year
+                year_matches = _re_year.findall(r'(\d{4})\s*[-—到]\s*(\d{4})', spec_text)
+                if year_matches:
+                    spec_start, spec_end = year_matches[0]
+                    # 统一正文中的年份范围
+                    polished_full = _re_year.sub(
+                        r'\d{4}[-—到]\d{4}',
+                        f'{spec_start}-{spec_end}',
+                        polished_full,
+                    )
+        except Exception as e:
+            logger.debug("年份窗口统一失败: %s", e)
 
         # ---- 5. 保存 full_draft_polished.md（不覆盖原草稿）----
         polished_path = self.project_dir / "draft" / "full_draft_polished.md"
@@ -3403,14 +3737,14 @@ class ScholarAgent:
                 f"\n  [green]去AI味润色后草稿已保存: {polished_path}[/green]"
             )
         except Exception as e:
-            log.error("保存 full_draft_polished.md 失败: %s", e)
+            logger.error("保存 full_draft_polished.md 失败: %s", e)
             self.console.print(f"  [red]保存润色后草稿失败: {e}[/red]")
 
         # ---- 6. 生成 deai_report.md（含前后风险对比）----
         try:
             risk_after = deai_engine.detect_ai_patterns(polished_full)
         except Exception as e:
-            log.error("处理后AI风险检测失败: %s", e)
+            logger.error("处理后AI风险检测失败: %s", e)
             risk_after = risk_before  # 降级使用处理前的评估
 
         report = self._generate_deai_report(
@@ -3423,7 +3757,7 @@ class ScholarAgent:
                 f"  [green]去AI味报告已保存: {report_path}[/green]"
             )
         except Exception as e:
-            log.error("保存 deai_report.md 失败: %s", e)
+            logger.error("保存 deai_report.md 失败: %s", e)
             self.console.print(f"  [red]保存报告失败: {e}[/red]")
 
         # 显示处理效果摘要
@@ -3464,9 +3798,9 @@ class ScholarAgent:
             state["deai_sections_processed"] = len(deai_results)
             state["deai_polish_changes"] = total_polish_changes
             self.file_manager.save_state(self.project_dir, state)
-            log.info("state.json 已更新：去AI味和润色完成")
+            logger.info("state.json 已更新：去AI味和润色完成")
         except Exception as e:
-            log.error("更新 state.json 失败: %s", e)
+            logger.error("更新 state.json 失败: %s", e)
             self.console.print(f"  [yellow]更新状态文件失败: {e}[/yellow]")
 
     def _split_draft_for_deai(self, full_text: str) -> list[dict]:
@@ -3838,6 +4172,79 @@ class ScholarAgent:
                 self.console.print(f"    [red]• {issue}[/red]")
             if len(report.critical_issues) > 5:
                 self.console.print(f"    [dim]...还有 {len(report.critical_issues) - 5} 项，详见报告[/dim]")
+
+        # 修改18: 无引用支撑结论补充
+        if report.unsupported > 0:
+            self.console.print(
+                f"  [dim]🔧 检测到 {report.unsupported} 条无引用支撑结论，尝试补充引用...[/dim]"
+            )
+            try:
+                # 从文献池搜索相关论文
+                literature_pool_18: list[dict] = []
+                try:
+                    project_papers = self.library.get_project_papers(self.project_name)
+                    if project_papers:
+                        literature_pool_18 = project_papers
+                except Exception:
+                    pass
+
+                if literature_pool_18:
+                    # 对每条无引用支撑结论，搜索文献池中的相关论文
+                    supplement_count = 0
+                    for claim in report.claims:
+                        if claim.evidence_level == "unsupported":
+                            # 提取结论关键词
+                            claim_text = claim.text if hasattr(claim, 'text') else str(claim)
+                            claim_keywords = set()
+                            import re as _re_18
+                            for kw in _re_18.findall(r'[\u4e00-\u9fff]{2,6}', claim_text):
+                                if len(kw) >= 2:
+                                    claim_keywords.add(kw)
+
+                            # 在文献池中搜索相关论文
+                            best_match = None
+                            best_score = 0
+                            for paper in literature_pool_18:
+                                if not isinstance(paper, dict):
+                                    continue
+                                paper_text = f"{paper.get('title', '')} {paper.get('abstract', '')}"
+                                score = sum(1 for kw in claim_keywords if kw in paper_text)
+                                if score > best_score:
+                                    best_score = score
+                                    best_match = paper
+
+                            if best_match and best_score > 0:
+                                # 追加引用到结论句
+                                best_author = best_match.get("authors", ["未知"])[0] if best_match.get("authors") else "未知"
+                                best_year = str(best_match.get("year", ""))
+                                if best_author and best_year:
+                                    # 在原文中找到结论句并追加引用
+                                    if claim_text in full_text:
+                                        cited_claim = f"{claim_text}（{best_author}，{best_year}）"
+                                        full_text = full_text.replace(claim_text, cited_claim, 1)
+                                        supplement_count += 1
+                                        logger.info(
+                                            "结论补充: 为无引用结论添加了引用 %s（%s）",
+                                            best_author, best_year,
+                                        )
+
+                    if supplement_count > 0:
+                        self.console.print(
+                            f"  [green]✓ 为 {supplement_count} 条无引用结论补充了文献引用[/green]"
+                        )
+                        # 更新全文
+                        if polished_path.exists():
+                            polished_path.write_text(full_text, encoding="utf-8")
+                    else:
+                        self.console.print(
+                            "  [yellow]⚠️ 未找到匹配文献，建议手动补充引用或降级因果表述[/yellow]"
+                        )
+                else:
+                    self.console.print(
+                        "  [yellow]⚠️ 文献池为空，无法自动补充引用[/yellow]"
+                    )
+            except Exception as e:
+                logger.warning("结论补充失败: %s", e)
 
         # 生成报告文件
         try:

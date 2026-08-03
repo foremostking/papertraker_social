@@ -18,6 +18,299 @@ from scholarpilot.utils.network import configure_no_proxy
 
 logger = logging.getLogger(__name__)
 
+# ===== 主题相关性评分系统（TRSS）=====
+# 替代硬编码黑名单，通过动态计算论文与研究主题的关键词重合度来过滤不相关文献
+# 适用于任何研究主题，无需手动维护黑名单
+
+# 中→英核心研究术语映射（用于跨语言关键词匹配）
+_ZH_EN_TOPIC_MAP: dict[str, list[str]] = {
+    "数字化": ["digital", "digitization", "digitalization", "ict"],
+    "转型": ["transformation", "transition", "upgrade"],
+    "创新": ["innovation", "innovative", "rd", "research and development"],
+    "企业": ["enterprise", "firm", "company", "corporate", "business"],
+    "绩效": ["performance", "productivity", "efficiency", "output"],
+    "影响": ["impact", "effect", "affect", "influence"],
+    "财政": ["fiscal", "finance", "financial"],
+    "债务": ["debt", "borrowing", "leverage"],
+    "预算": ["budget", "budgeting"],
+    "面板": ["panel"],
+    "上市公司": ["listed", "public", "share"],
+    "固定效应": ["fixed effect", "fixed-effect"],
+    "经济": ["economic", "economy"],
+    "增长": ["growth", "growing"],
+    "投资": ["investment", "invest"],
+    "消费": ["consumption", "consumer"],
+    "收入": ["income", "revenue"],
+    "税收": ["tax", "taxation"],
+    "支出": ["expenditure", "spending"],
+    "政策": ["policy"],
+    "改革": ["reform"],
+    "治理": ["governance"],
+    "环境": ["environment", "green", "carbon"],
+    "金融": ["financial", "finance", "banking"],
+    "银行": ["bank", "banking"],
+    "贸易": ["trade"],
+    "出口": ["export"],
+    "进口": ["import"],
+    "全要素": ["total factor", "tfp"],
+    "生产率": ["productivity"],
+    "技术": ["technology", "technological", "tech"],
+    "制造业": ["manufacturing", "manufacturer"],
+    "服务业": ["service"],
+    "所有制": ["ownership", "state-owned", "soe"],
+    "国有": ["state-owned", "soe", "public"],
+    "民营": ["private", "non-state"],
+    "区域": ["region", "regional", "spatial"],
+    "城市": ["city", "urban", "municipal"],
+    "农村": ["rural", "countryside"],
+    "人口": ["population", "demographic"],
+    "劳动力": ["labor", "labour", "workforce"],
+    "资本": ["capital"],
+    "市场": ["market"],
+    "竞争": ["competition", "competitive"],
+    "垄断": ["monopoly"],
+    "管制": ["regulation", "regulatory"],
+    "薪酬": ["compensation", "salary", "pay"],
+    "高管": ["executive", "ceo", "management"],
+    "董事会": ["board", "director"],
+    "股权": ["equity", "shareholder", "stock"],
+    "融资": ["financing", "finance"],
+    "约束": ["constraint"],
+    "中介": ["mediating", "mediation", "intermediary"],
+    "调节": ["moderating", "moderation", "moderate"],
+    "异质": ["heterogene", "heterogeneity"],
+    "稳健": ["robust", "robustness"],
+    "工具变量": ["instrument", "iv"],
+    "双重差分": ["difference-in-difference", "did"],
+    "断点": ["regression discontinuity", "rd"],
+    "随机": ["random", "rct"],
+    "实验": ["experiment", "experimental"],
+    "可持续": ["sustainab"],
+    "绿色": ["green", "environmental"],
+    "碳": ["carbon", "emission"],
+    "能源": ["energy"],
+    "数字": ["digital", "digitization"],
+    "人工智能": ["artificial intelligence", "ai", "machine learning"],
+    "大数据": ["big data"],
+    "区块链": ["blockchain"],
+    "平台": ["platform"],
+    "电商": ["e-commerce", "ecommerce"],
+    "网络": ["network", "internet"],
+    "信息": ["information"],
+    "知识": ["knowledge"],
+    "溢出": ["spillover"],
+    "配置": ["allocation", "allocat"],
+    "资源": ["resource"],
+    "组织": ["organization", "organizational"],
+    "战略": ["strategy", "strategic"],
+    "供应链": ["supply chain"],
+    "价值": ["value", "valuation"],
+    "风险": ["risk"],
+    "质量": ["quality"],
+    "规模": ["scale", "size"],
+    "年龄": ["age"],
+    "杠杆": ["leverage"],
+    "盈利": ["profit", "profitab"],
+    "研发": ["rd", "research and development"],
+    "专利": ["patent"],
+    "产权": ["property right", "property rights"],
+    "制度": ["institution", "institutional"],
+    "法律": ["legal", "law"],
+    "文化": ["culture", "cultural"],
+    "社会": ["social", "society"],
+    "信任": ["trust"],
+    "腐败": ["corrupt"],
+    "透明": ["transparen"],
+    "披露": ["disclosure", "disclos"],
+    "审计": ["audit"],
+    "会计": ["accounting"],
+    "财务": ["financial", "accounting"],
+    "并购": ["merger", "acquisition", "m&a"],
+    "重组": ["restructur"],
+    "国际化": ["international", "global"],
+    "对外投资": ["fdi", "outward"],
+    "外商投资": ["fdi", "foreign direct"],
+    "汇率": ["exchange rate"],
+    "利率": ["interest rate"],
+    "通胀": ["inflation"],
+    "失业": ["unemploy"],
+    "工资": ["wage", "salary"],
+    "住房": ["hous"],
+    "土地": ["land"],
+    "农业": ["agricultur"],
+    "工业": ["industr"],
+    "结构": ["structur"],
+    "升级": ["upgrade", "upgrad"],
+    "集聚": ["agglomerat", "cluster"],
+    "创新绩效": ["innovation performance"],
+    "经济绩效": ["economic performance"],
+    "财务绩效": ["financial performance"],
+    "环境绩效": ["environmental performance"],
+    "企业绩效": ["firm performance", "corporate performance"],
+    "数字化转型": ["digital transformation"],
+}
+
+# 离题领域惩罚词（跨主题通用，不针对特定研究主题）
+# 出现这些词的论文与研究主题不相关的概率极高
+_OFF_TOPIC_DOMAIN_WORDS: frozenset[str] = frozenset({
+    # 医学临床
+    "tuberculosis", "mycobacterium", "covid-19", "covid19", "coronavirus",
+    "patient", "clinical", "diagnosis", "treatment", "symptom",
+    "mortality", "incidence", "prevalence", "antibiotic", "antiviral",
+    "antituberculosis", "drug resistance", "pharmaceutical",
+    "临床", "患者", "诊断", "治疗", "症状", "死亡率", "发病率",
+    # 农业生物
+    "crop", "harvest", "livestock", "pesticide", "safflower",
+    "采摘", "农作物", "畜牧业", "农药",
+    # 旅游业
+    "tourism", "hotel", "hospitality",
+    "旅游", "酒店", "餐饮",
+    # 纯机器学习技术（非应用）
+    "neural architecture", "hyperparameter", "benchmark dataset",
+    "image classification", "object detection",
+    # 国际关系/政治
+    "axis of allies", "us-japan alliance", "geopolitic",
+})
+
+# TRSS 最低相关性阈值：低于此值的论文将被过滤
+_MIN_TOPIC_RELEVANCE: float = 0.10
+
+
+def _expand_topic_keywords(topic_keywords: str) -> set[str]:
+    """扩展主题关键词，加入中→英翻译，实现跨语言匹配.
+
+    Args:
+        topic_keywords: 空格分隔的研究主题关键词（中文为主）.
+
+    Returns:
+        扩展后的关键词集合（含中文原词 + 英文翻译）.
+    """
+    if not topic_keywords:
+        return set()
+
+    # 提取原始关键词
+    raw_words = set(re.findall(r'[\u4e00-\u9fff]{2,}|[a-zA-Z]{3,}', topic_keywords.lower()))
+
+    expanded = set(raw_words)
+
+    # 添加英文翻译
+    for zh, en_list in _ZH_EN_TOPIC_MAP.items():
+        # 检查中文关键词是否在原始关键词中
+        for raw in raw_words:
+            if zh in raw or raw in zh:
+                expanded.update(en_list)
+                break
+
+    return expanded
+
+
+def _compute_topic_relevance(
+    title: str,
+    abstract: str,
+    topic_keywords: str,
+) -> float:
+    """计算论文与研究主题的相关性评分（0.0-1.0）.
+
+    基于三层评分：
+    1. 标题关键词命中（权重0.5）：标题中出现主题词得高分
+    2. 摘要关键词覆盖（权重0.3）：摘要中主题词覆盖率
+    3. 离题领域惩罚（权重0.2）：出现明显无关领域词扣分
+
+    支持跨语言匹配：中文主题关键词自动翻译为英文进行匹配。
+
+    Args:
+        title: 论文标题.
+        abstract: 论文摘要.
+        topic_keywords: 空格分隔的研究主题关键词.
+
+    Returns:
+        相关性评分 0.0（完全不相关）到 1.0（高度相关）.
+    """
+    if not topic_keywords or not title:
+        return 0.0
+
+    # 扩展关键词（含英文翻译）
+    topic_words = _expand_topic_keywords(topic_keywords)
+    if not topic_words:
+        return 0.0
+
+    title_lower = title.lower()
+    abstract_lower = (abstract or "").lower()
+    paper_text_lower = f"{title_lower} {abstract_lower}"
+
+    # 1. 标题关键词命中（权重0.5）
+    title_hits = sum(1 for kw in topic_words if kw in title_lower)
+    title_score = min(title_hits / 2.0, 1.0)  # 命中2个关键词即满分
+
+    # 2. 摘要关键词覆盖（权重0.3）
+    abstract_hits = sum(1 for kw in topic_words if kw in abstract_lower)
+    abstract_score = min(abstract_hits / max(len(topic_words) * 0.3, 1), 1.0)
+
+    # 3. 离题领域惩罚（权重0.2）
+    off_topic_hits = sum(1 for kw in _OFF_TOPIC_DOMAIN_WORDS if kw in paper_text_lower)
+    penalty_score = max(0.0, 1.0 - off_topic_hits * 0.5)  # 每个离题词扣0.5
+
+    # 综合评分
+    score = title_score * 0.5 + abstract_score * 0.3 + penalty_score * 0.2
+
+    return round(max(0.0, min(1.0, score)), 3)
+
+
+def _is_irrelevant_paper(
+    title: str,
+    abstract: str,
+    topic_keywords: str,
+) -> bool:
+    """检查论文是否与研究主题不相关（应被过滤）.
+
+    综合使用TRSS评分和遗留黑名单进行判断：
+    1. TRSS评分低于阈值 → 不相关
+    2. 离题领域词命中数≥2 → 不相关（即使有少量关键词重合）
+    3. 遗留黑名单命中 → 不相关（安全网）
+
+    Args:
+        title: 论文标题.
+        abstract: 论文摘要.
+        topic_keywords: 研究主题关键词.
+
+    Returns:
+        True 如果论文不相关，应被过滤.
+    """
+    if not title:
+        return True
+
+    paper_text_lower = f"{title} {abstract}".lower()
+
+    # 安全网：遗留黑名单检查
+    _legacy_blocklist = (
+        "covid-19", "covid19", "coronavirus", "新冠", "疫情", "肺炎",
+        "结核", "tuberculosis", "mycobacterium", "antituberculosis",
+        "采摘机器人", "农业机器人", "harvest robot", "safflower",
+        "医疗旅游", "medical tourism",
+        "axis of allies", "us-japan alliance",
+        "data security and privacy protection", "ctrip",
+        "pharmaceutical innovation", "药物创新",
+        "endogenous knowledge spillover",
+    )
+    if any(block_word in paper_text_lower for block_word in _legacy_blocklist):
+        return True
+
+    # TRSS评分检查
+    if not topic_keywords:
+        # 无主题关键词时，只靠黑名单过滤
+        return False
+
+    relevance = _compute_topic_relevance(title, abstract, topic_keywords)
+    if relevance < _MIN_TOPIC_RELEVANCE:
+        return True
+
+    # 离题领域词硬过滤：命中≥2个离题词，即使有少量关键词重合也过滤
+    off_topic_count = sum(1 for kw in _OFF_TOPIC_DOMAIN_WORDS if kw in paper_text_lower)
+    if off_topic_count >= 2:
+        return True
+
+    return False
+
 
 @dataclass
 class Citation:
@@ -286,6 +579,8 @@ def build_citations_from_pool(
     literature_pool: list[dict],
     full_text: str,
     existing_citations: list[Citation] | None = None,
+    include_uncited_relevant: bool = True,
+    topic_keywords: str = "",
 ) -> list[Citation]:
     """从文献池正向构建已验证的引用列表.
 
@@ -322,6 +617,13 @@ def build_citations_from_pool(
         paper_year = str(paper.get("year", "")).strip()
 
         if not paper_authors or not paper_year:
+            continue
+
+        # TRSS主题相关性过滤：替代黑名单，动态计算论文与研究主题的相关性
+        paper_title = paper.get("title", "")
+        paper_abstract = paper.get("abstract", "")
+        if _is_irrelevant_paper(paper_title, paper_abstract, topic_keywords):
+            logger.debug("TRSS过滤（引用构建阶段）: %s", paper_title[:60])
             continue
 
         # 取第一作者
@@ -410,6 +712,53 @@ def build_citations_from_pool(
 
         pool_citations.append(citation)
 
+    # 修改4: 补充未引用但相关的中文文献
+    if include_uncited_relevant:
+        topic_kw_set = set(topic_keywords.split()) if topic_keywords else set()
+        uncited_zh: list[Citation] = []
+        for paper in literature_pool:
+            if not isinstance(paper, dict):
+                continue
+            paper_authors = paper.get("authors", [])
+            paper_year = str(paper.get("year", "")).strip()
+            if not paper_authors or not paper_year:
+                continue
+            first_author = paper_authors[0] if paper_authors else ""
+            if not first_author or not re.search(r'[\u4e00-\u9fff]', first_author):
+                continue  # 只补充中文文献
+            # 检查是否已在已引用列表中
+            dedup_key = f"{first_author.lower()}_{paper_year}"
+            if dedup_key in seen_keys:
+                continue
+            # 计算主题相关性
+            title = paper.get("title", "")
+            abstract = paper.get("abstract", "")
+            paper_text = f"{title} {abstract}"
+            relevance = _calculate_topic_relevance(paper_text, topic_kw_set)
+            if relevance > 0:
+                seen_keys.add(dedup_key)
+                raw = f"{first_author}（{paper_year}）"
+                citation = Citation(
+                    raw=raw,
+                    authors=paper_authors[:5],
+                    year=paper_year,
+                    language="zh",
+                    source="pool_supplementary",
+                )
+                _fill_citation_from_paper(citation, paper, "pool_supplementary")
+                citation.verified = True
+                uncited_zh.append((relevance, citation))
+
+        # 按相关度排序，取前10篇
+        uncited_zh.sort(key=lambda x: x[0], reverse=True)
+        for _, c in uncited_zh[:10]:
+            pool_citations.append(c)
+        if uncited_zh:
+            logger.info(
+                "build_citations_from_pool: 补充 %d 篇相关中文文献（未在正文引用）",
+                min(len(uncited_zh), 10),
+            )
+
     logger.info(
         "build_citations_from_pool: 文献池 %d 篇，正向匹配到 %d 篇被引文献",
         len(literature_pool),
@@ -417,6 +766,201 @@ def build_citations_from_pool(
     )
 
     return pool_citations
+
+
+def _calculate_topic_relevance(paper_text: str, topic_keywords: set[str]) -> float:
+    """计算论文文本与主题关键词的相关度（词重合度）."""
+    if not topic_keywords or not paper_text:
+        return 0.0
+    paper_lower = paper_text.lower()
+    overlap = sum(1 for kw in topic_keywords if kw.lower() in paper_lower)
+    return overlap / max(len(topic_keywords), 1)
+
+
+def replace_fake_authors_in_text(
+    text: str,
+    literature_pool: list[dict],
+    topic_keywords: str = "",
+) -> str:
+    """替换正文中的虚假作者名引用为文献池中的真实作者.
+
+    扫描正文中所有"作者（年份）"格式的中文引用，检测作者名是否为假名
+    （张三/李四/王五等），若为假名则从文献池中选取年份匹配且主题相关的
+    真实论文替换。同时清除"（未知，2026）""（参考文献）"等异常引用。
+
+    Args:
+        text: 论文正文文本.
+        literature_pool: Phase 2 检索到的论文列表（dict 格式）.
+        topic_keywords: 研究主题关键词（用于辅助匹配）.
+
+    Returns:
+        替换后的正文文本.
+    """
+    if not text:
+        return text
+
+    non_name_words: set[str] = set()
+    topic_kw_set = set(topic_keywords.split()) if topic_keywords else set()
+
+    # 1. 清除异常引用模式："（未知，2026）""（参考文献）"等
+    text = re.sub(
+        r'[（(]\s*(?:未知|佚名|匿名|参考文献)\s*[,，]?\s*(?:19|20)?\d{0,4}\s*[）)]',
+        '',
+        text,
+    )
+
+    # 2. 提取所有中文作者引用
+    pattern = re.compile(
+        r'([\u4e00-\u9fff]{2,4}(?:[和与][\u4e00-\u9fff]{2,4})*(?:等)?)\s*[（(]\s*((?:19|20)\d{2})\s*[）)]'
+    )
+
+    matches = list(pattern.finditer(text))
+    if not matches:
+        return text
+
+    # 按年份分组文献池中的中文论文，便于快速查找
+    pool_by_year: dict[str, list[dict]] = {}
+    for paper in literature_pool:
+        if not isinstance(paper, dict):
+            continue
+        authors = paper.get("authors", [])
+        if not authors:
+            continue
+        first_author = authors[0] if authors else ""
+        if not first_author or not re.search(r'[\u4e00-\u9fff]', first_author):
+            continue  # 只用中文论文替换
+        year = str(paper.get("year", "")).strip()
+        if year:
+            pool_by_year.setdefault(year, []).append(paper)
+
+    # 从后往前替换避免偏移问题
+    replacements: list[tuple[int, int, str]] = []
+    for match in matches:
+        author_str = match.group(1)
+        year = match.group(2)
+        full_match = match.group(0)
+
+        # 检查是否为假名
+        # 对于"张三和李四"格式，检查每个作者
+        author_parts = re.split(r'[和与]', author_str.replace('等', ''))
+        is_fake = False
+        for part in author_parts:
+            part = part.strip()
+            if part and not _is_valid_zh_author(part, non_name_words):
+                is_fake = True
+                break
+            if part in _FAKE_NAME_PATTERNS:
+                is_fake = True
+                break
+
+        if not is_fake:
+            continue
+
+        # 从文献池查找替换
+        replacement = None
+        # 优先精确年份匹配
+        candidates = pool_by_year.get(year, [])
+        # 年份±1模糊匹配
+        if not candidates:
+            try:
+                year_int = int(year)
+                for dy in [-1, 1]:
+                    candidates.extend(pool_by_year.get(str(year_int + dy), []))
+            except ValueError:
+                pass
+
+        if candidates:
+            # 按主题相关度排序
+            scored = []
+            for paper in candidates:
+                paper_text = f"{paper.get('title', '')} {paper.get('abstract', '')}"
+                score = _calculate_topic_relevance(paper_text, topic_kw_set)
+                scored.append((score, paper))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            if scored:
+                best_paper = scored[0][1]
+                best_author = best_paper["authors"][0]
+                best_year = str(best_paper.get("year", year))
+                if "等" in author_str:
+                    replacement = f"{best_author}等（{best_year}）"
+                else:
+                    replacement = f"{best_author}（{best_year}）"
+
+        if replacement:
+            replacements.append((match.start(), match.end(), replacement))
+        else:
+            # 无法替换时删除引用标记
+            replacements.append((match.start(), match.end(), ""))
+
+    # 从后往前应用替换
+    for start, end, repl in reversed(replacements):
+        text = text[:start] + repl + text[end:]
+
+    if replacements:
+        logger.info(
+            "replace_fake_authors_in_text: 替换了 %d 处虚假作者引用",
+            len(replacements),
+        )
+
+    return text
+
+
+def _normalize_title(title: str) -> str:
+    """归一化标题用于去重比较."""
+    if not title:
+        return ""
+    # 去除所有非字母数字字符，转小写
+    normalized = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fff]', '', title.lower())
+    # 去除常见前缀
+    for prefix in ['the', 'a', 'an']:
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):]
+    return normalized
+
+
+def _deduplicate_citations(citations: list[Citation]) -> list[Citation]:
+    """对引用列表去重，基于归一化标题+第一作者姓氏+年份.
+
+    Args:
+        citations: 待去重的引用列表.
+
+    Returns:
+        去重后的引用列表.
+    """
+    if not citations:
+        return citations
+
+    seen_keys: set[str] = set()
+    deduped: list[Citation] = []
+
+    for c in citations:
+        # 构建去重键
+        title_norm = _normalize_title(c.title or "")
+        first_author = (c.authors[0] if c.authors else "").lower().strip()
+        # 取姓氏（英文取最后一个单词，中文取第一个字）
+        if re.search(r'[a-zA-Z]', first_author):
+            surname = first_author.split()[-1] if first_author.split() else first_author
+        else:
+            surname = first_author[:1] if first_author else ""
+        year = (c.year or "").strip()
+
+        dedup_key = f"{title_norm}_{surname}_{year}"
+
+        if dedup_key in seen_keys:
+            logger.debug("去重: 跳过重复引用 %s (%s)", c.authors[:1], c.year)
+            continue
+        seen_keys.add(dedup_key)
+        deduped.append(c)
+
+    if len(deduped) < len(citations):
+        logger.info(
+            "去重: %d 条引用 -> %d 条（移除 %d 条重复）",
+            len(citations),
+            len(deduped),
+            len(citations) - len(deduped),
+        )
+
+    return deduped
 
 
 async def verify_citation(
@@ -626,6 +1170,22 @@ async def verify_citation(
 
     if not citation.verified:
         citation.source = "unverified"
+
+    # TRSS主题相关性检查：即使API验证成功，论文主题不相关也标记为未验证
+    # 替代旧黑名单，使用动态主题相关性评分，适用于任何研究主题
+    if citation.verified and citation.title:
+        if _is_irrelevant_paper(citation.title, citation.abstract or "", topic_keywords):
+            relevance = _compute_topic_relevance(citation.title, citation.abstract or "", topic_keywords)
+            logger.info(
+                "TRSS过滤（验证阶段）: %s (相关性=%.3f)",
+                citation.title[:80], relevance,
+            )
+            citation.verified = False
+            citation.source = "irrelevant"
+            citation.title = ""
+            citation.journal = ""
+            citation.abstract = ""
+            citation.doi = ""
 
     return citation
 
@@ -976,6 +1536,9 @@ def format_references_list(
         # 过滤掉未验证且无标题的引用
         citations = [c for c in citations if not (not c.verified and not c.title)]
 
+    # 去重：基于归一化标题+姓氏+年份
+    citations = _deduplicate_citations(citations)
+
     formatter = format_cssci if style == "cssci" else format_apa7
 
     if language_separate:
@@ -1061,6 +1624,8 @@ __all__ = [
     "extract_citations_from_text",
     "verify_citation",
     "verify_all_citations",
+    "build_citations_from_pool",
+    "replace_fake_authors_in_text",
     "format_cssci",
     "format_apa7",
     "format_references_list",

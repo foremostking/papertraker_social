@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import re
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -124,6 +125,107 @@ VARIABLE_KEYWORD_MAP = {
 }
 
 
+# 经济学通用指标关键词（用于扩展 RAG 指标搜索，提升召回率）
+ECONOMICS_INDICATOR_KEYWORDS = [
+    # 创新与研发
+    "创新", "专利", "研发投入", "全要素生产率", "数字化转型指数", "研发强度",
+    # 企业财务与治理
+    "企业规模", "资产负债率", "盈利能力", "股权集中度", "营业收入", "资产周转率",
+    # 宏观经济
+    "GDP",
+]
+
+# 标准经济学指标模板（RAG 搜索完全无结果时的回退方案）
+# 涵盖创新研发、企业财务、公司治理、宏观经济等常见实证研究指标，
+# 供研究者在 RAG 知识库未命中时参考。
+STANDARD_ECONOMICS_INDICATORS = [
+    {
+        "indicator": "国内生产总值(GDP)",
+        "database": "国家统计局/万得Wind",
+        "category": "宏观经济",
+        "full_path": "宏观经济 > 国内生产总值 > GDP",
+        "platform": "NBS/Wind",
+    },
+    {
+        "indicator": "全要素生产率(TFP)",
+        "database": "CSMAR/万得Wind",
+        "category": "效率与生产率",
+        "full_path": "企业研究 > 效率分析 > 全要素生产率",
+        "platform": "CSMAR/Wind",
+    },
+    {
+        "indicator": "研发投入(R&D)",
+        "database": "CSMAR/CNRDS",
+        "category": "创新与研发",
+        "full_path": "公司研究 > 创新专利 > 研发投入",
+        "platform": "CSMAR/CNRDS",
+    },
+    {
+        "indicator": "研发强度",
+        "database": "CSMAR/CNRDS",
+        "category": "创新与研发",
+        "full_path": "公司研究 > 创新专利 > 研发强度(研发支出/营业收入)",
+        "platform": "CSMAR/CNRDS",
+    },
+    {
+        "indicator": "专利申请数",
+        "database": "CSMAR/CNRDS",
+        "category": "创新与研发",
+        "full_path": "公司研究 > 创新专利 > 专利申请数",
+        "platform": "CSMAR/CNRDS",
+    },
+    {
+        "indicator": "数字化转型指数",
+        "database": "CNRDS/CSMAR",
+        "category": "数字化转型",
+        "full_path": "公司研究 > 数字化转型 > 数字化转型指数",
+        "platform": "CNRDS/CSMAR",
+    },
+    {
+        "indicator": "企业规模",
+        "database": "CSMAR",
+        "category": "企业特征",
+        "full_path": "公司研究 > 企业特征 > 企业规模(总资产对数)",
+        "platform": "CSMAR",
+    },
+    {
+        "indicator": "资产负债率",
+        "database": "CSMAR",
+        "category": "财务指标",
+        "full_path": "公司研究 > 财务指标 > 资产负债率(总负债/总资产)",
+        "platform": "CSMAR",
+    },
+    {
+        "indicator": "盈利能力(ROA/ROE)",
+        "database": "CSMAR",
+        "category": "财务指标",
+        "full_path": "公司研究 > 财务指标 > 盈利能力(ROA/ROE)",
+        "platform": "CSMAR",
+    },
+    {
+        "indicator": "股权集中度",
+        "database": "CSMAR",
+        "category": "公司治理",
+        "full_path": "公司研究 > 公司治理 > 股权集中度(第一大股东持股比)",
+        "platform": "CSMAR",
+    },
+    {
+        "indicator": "营业收入",
+        "database": "CSMAR/万得Wind",
+        "category": "财务指标",
+        "full_path": "公司研究 > 财务指标 > 营业收入",
+        "platform": "CSMAR/Wind",
+    },
+    {
+        "indicator": "资产周转率",
+        "database": "CSMAR",
+        "category": "财务指标",
+        "full_path": "公司研究 > 财务指标 > 资产周转率(营业收入/总资产)",
+        "platform": "CSMAR",
+    },
+]
+
+
 class DataSourceGuide:
     """数据源指南生成器。
 
@@ -169,6 +271,9 @@ class DataSourceGuide:
     def _query_rag_databases(self, research_topic: str) -> list[dict]:
         """通过 RAG 查询推荐数据库.
 
+        使用主题词查询，再拆分为子关键词逐一查询补充，
+        确保推荐数量不低于3个。
+
         Args:
             research_topic: 研究主题.
 
@@ -179,10 +284,27 @@ class DataSourceGuide:
         if rag is None:
             return []
 
+        # 主题词查询
         results = rag.find_databases_by_topic(research_topic)
+
+        # 拆分主题词为子关键词，逐一查询补充
+        import re as _re
+        sub_keywords = _re.findall(r'[\u4e00-\u9fff]{2,4}', research_topic)
+        seen_keys = {r.get("db_key", r.get("name", "")) for r in results}
+
+        for kw in sub_keywords[:5]:  # 最多查询前5个子关键词
+            if kw in ("企业", "研究", "影响", "分析", "基于"):
+                continue  # 跳过过于宽泛的词
+            extra = rag.find_databases_by_topic(kw)
+            for r in extra:
+                key = r.get("db_key", r.get("name", ""))
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    results.append(r)
+
         # 过滤掉重复的数据库
-        seen = set()
         unique = []
+        seen = set()
         for r in results:
             key = r.get("db_key", r.get("name", ""))
             if key not in seen:
@@ -193,26 +315,97 @@ class DataSourceGuide:
     def _query_rag_indicators(self, keywords: list[str]) -> list[dict]:
         """通过 RAG 搜索相关指标.
 
+        在传入的 topic 关键词基础上，自动合并经济学通用指标关键词以扩大召回。
+        搜索策略：优先使用 FTS5 全文搜索；若 FTS 无结果，则回退到 LIKE 模糊匹配，
+        降低匹配阈值以提升召回率。当所有搜索均无结果时，返回标准经济学指标模板，
+        而非空列表。
+
         Args:
-            keywords: 关键词列表.
+            keywords: 关键词列表（通常来自 SPEC 变量名）。
 
         Returns:
-            匹配的指标列表.
+            匹配的指标列表；若无任何匹配则返回标准经济学指标模板。
         """
         rag = self._get_rag()
         if rag is None:
-            return []
+            # RAG 不可用时直接返回标准指标模板
+            return list(STANDARD_ECONOMICS_INDICATORS)
 
-        all_indicators = []
-        seen = set()
-        for kw in keywords:
+        # 合并 topic 关键词与经济学通用指标关键词（去重，保持原顺序）
+        merged_keywords: list[str] = []
+        for kw in [*keywords, *ECONOMICS_INDICATOR_KEYWORDS]:
+            if kw and kw not in merged_keywords:
+                merged_keywords.append(kw)
+
+        all_indicators: list[dict] = []
+        seen: set[str] = set()
+
+        for kw in merged_keywords:
+            # 1. 优先使用 FTS5 全文搜索
             indicators = rag.search_indicators(kw, limit=10)
+
+            # 2. FTS 无结果时，回退到 LIKE 模糊匹配（降低匹配阈值）
+            if not indicators:
+                indicators = self._like_search_indicators(rag, kw, limit=10)
+
             for ind in indicators:
                 key = f"{ind.get('indicator', '')}-{ind.get('database', '')}"
                 if key not in seen:
                     seen.add(key)
                     all_indicators.append(ind)
+
+        # 3. 所有搜索均无结果，返回标准经济学指标模板
+        if not all_indicators:
+            logger.info(
+                "RAG 指标搜索无结果，返回标准经济学指标模板（%d 项）",
+                len(STANDARD_ECONOMICS_INDICATORS),
+            )
+            return list(STANDARD_ECONOMICS_INDICATORS)
+
         return all_indicators[:20]
+
+    def _like_search_indicators(
+        self, rag: Any, keyword: str, limit: int = 10
+    ) -> list[dict]:
+        """使用 LIKE 模糊匹配搜索指标（FTS5 无结果时的回退方案）。
+
+        直接查询 SQLite 数据库，对指标名称和完整路径进行模糊匹配，
+        匹配阈值低于 FTS5，可提升召回率。
+
+        Args:
+            rag: 已加载的 DatabaseRAG 实例。
+            keyword: 搜索关键词。
+            limit: 最多返回结果数。
+
+        Returns:
+            匹配的指标列表。
+        """
+        results: list[dict] = []
+        try:
+            with sqlite3.connect(str(rag.db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                c.execute(
+                    "SELECT i.indicator_name, i.full_path, c.name as category_name, "
+                    "d.name as db_name, d.platform "
+                    "FROM indicators i "
+                    "JOIN databases d ON i.database_id=d.id "
+                    "LEFT JOIN categories c ON i.category_id=c.id "
+                    "WHERE i.indicator_name LIKE ? OR i.full_path LIKE ? "
+                    "LIMIT ?",
+                    (f"%{keyword}%", f"%{keyword}%", limit),
+                )
+                for row in c.fetchall():
+                    results.append({
+                        "indicator": row["indicator_name"],
+                        "database": row["db_name"],
+                        "category": row["category_name"],
+                        "full_path": row["full_path"],
+                        "platform": row["platform"],
+                    })
+        except Exception as e:
+            logger.warning("LIKE 模糊匹配指标失败 (keyword=%s): %s", keyword, e)
+        return results
 
     def _extract_research_topic(self, spec_text: str) -> str:
         """从 SPEC 文本中提取研究主题."""

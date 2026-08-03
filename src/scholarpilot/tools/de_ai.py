@@ -53,6 +53,7 @@ __all__ = [
     "DeAIEngine",
     "SYNONYM_DICT",
     "PROTECTED_TERMS",
+    "TERM_LOCK_PREFIXES",
     "CONTEXT_PROTECTED",
     "CROSS_POS_FORBIDDEN",
 ]
@@ -161,7 +162,6 @@ SYNONYM_DICT: dict[str, list[str]] = {
     "促进": ["推动", "驱动", "助推", "推进"],
     "提高": ["提升", "增强", "改善", "优化"],
     "降低": ["减少", "弱化", "缩减", "降低"],
-    "发展": ["演进", "拓展", "推进", "增长"],
     "实现": ["达到", "完成", "落实", "实现"],
     "发现": ["发现", "识别", "观察到", "观测到"],
     "认为": ["指出", "认为", "提出", "强调"],
@@ -279,6 +279,18 @@ PROTECTED_TERMS: set[str] = {
     "双重差分", "倾向得分匹配",
     "本研究", "本文", "本节", "本章",
     "被解释变量", "解释变量", "控制变量", "中介变量", "调节变量",
+}
+
+# 复合术语锁定前缀表：当锁定前缀后紧跟被锁定的词时，该词不可被同义词替换。
+# 例如 "数字经济" + "发展" -> "数字经济发展" 中的 "发展" 不应替换。
+TERM_LOCK_PREFIXES: dict[str, list[str]] = {
+    "数字经济": ["发展", "转型", "化"],
+    "产权": ["性质", "改革", "结构"],
+    "一定": ["水平", "时间", "程度", "条件"],
+    "大多数": ["制", "情况", "情形"],
+    "创新": ["绩效", "能力", "活动"],
+    "数字": ["技术", "化", "经济"],
+    "技术": ["创新", "进步", "水平"],
 }
 
 CONTEXT_PROTECTED: dict[str, list[str]] = {
@@ -772,15 +784,11 @@ class DeAIEngine:
         # 不替换章节标题中的序数词（如"第一章""第一部分"）
         breakers = [
             # 带逗号的论述序数词
-            ("首先，", "从最基本的层面来看，"),
-            ("其次，", "进一步来看，"),
-            ("最后，", "更为关键的是，"),
             ("第一，", "先看"),
             ("第二，", "再看"),
-            ("第三，", "还应注意"),
             ("第一.", "先看"),
             ("第二.", "再看"),
-            ("第三.", "还应注意"),
+            ("第三.", "此外"),
             # 带句号的"一是""二是""三是"（行内列举）
             ("一是，", "一方面，"),
             ("二是，", "另一方面，"),
@@ -814,7 +822,7 @@ class DeAIEngine:
         # 替换套路化过渡词为更自然的表达
         transition_replacements = [
             ("综上所述", "总的来看"),
-            ("值得注意的是", "需要关注的是"),
+            ("值得注意的是", "需要指出的是"),
             ("显而易见", "可以看到"),
             ("毋庸置疑", "可以确定的是"),
             ("不难看出", "可以看到"),
@@ -841,8 +849,26 @@ class DeAIEngine:
         result = text
 
         # 将绝对化表述改为条件化表述
+        # 但跳过复合术语中的"一定"（如"一定程度""一定水平""一定条件"等）
+        _locked_suffixes_for_yiding = {"程", "水", "条", "意", "时"}
         for absolute, conditional in _ABSOLUTE_TO_CONDITIONAL.items():
-            result = result.replace(absolute, conditional)
+            if absolute == "一定":
+                # 逐位置替换，跳过"一定"后紧跟锁定字的情况
+                _search_pos = 0
+                while True:
+                    _idx = result.find("一定", _search_pos)
+                    if _idx == -1:
+                        break
+                    # 检查"一定"后面是否紧跟锁定字
+                    _next_char = result[_idx + 2:_idx + 3] if _idx + 2 < len(result) else ""
+                    if _next_char and _next_char in _locked_suffixes_for_yiding:
+                        _search_pos = _idx + 2
+                        continue
+                    # 执行替换
+                    result = result[:_idx] + conditional + result[_idx + 2:]
+                    _search_pos = _idx + len(conditional)
+            else:
+                result = result.replace(absolute, conditional)
 
         return result
 
@@ -866,7 +892,7 @@ class DeAIEngine:
             ("然而", "不过"),
             ("此外", "同时"),
             ("综上所述", "总的来看"),
-            ("值得注意的是", "需要关注的是"),
+            ("值得注意的是", "需要指出的是"),
             ("不可否认", "应当承认"),
             ("显而易见", "可以看到"),
             ("毋庸置疑", "可以确定的是"),
@@ -880,12 +906,8 @@ class DeAIEngine:
 
         # 2. 打破三段式结构
         breakers = [
-            ("首先，", "从最基本的层面来看，"),
-            ("其次，", "进一步来看，"),
-            ("最后，", "更为关键的是，"),
             ("第一，", "先看"),
             ("第二，", "再看"),
-            ("第三，", "还应注意"),
         ]
         for old, new in breakers:
             result = result.replace(old, new)
@@ -1041,6 +1063,11 @@ class DeAIEngine:
                 if self._is_context_protected(original, context):
                     continue
 
+                # 复合术语保护：检查匹配位置前是否为锁定前缀
+                # （如"数字经济"后的"发展"不应被替换）
+                if self._is_term_lock_prefix(original, result, start):
+                    continue
+
                 # 第一次出现不替换（保持术语一致性）
                 if idx == 0:
                     continue
@@ -1066,6 +1093,29 @@ class DeAIEngine:
         for pattern in patterns:
             if re.search(pattern, context):
                 return True
+        return False
+
+    def _is_term_lock_prefix(self, word: str, text: str, start: int) -> bool:
+        """检查匹配位置前是否为锁定前缀（复合术语保护）.
+
+        当 word 是某个锁定前缀的被锁定词时，取匹配位置前 4-6 个字符，
+        若其中包含对应的锁定前缀（如 "数字经济" 后的 "发展"），
+        则判定为复合术语的一部分，不应替换。
+
+        Args:
+            word: 待替换的词.
+            text: 全文文本.
+            start: 匹配在文本中的起始位置.
+
+        Returns:
+            True 表示该位置受锁定前缀保护，应跳过替换.
+        """
+        for prefix_word, locked_suffixes in TERM_LOCK_PREFIXES.items():
+            if word in locked_suffixes:
+                # 取匹配位置前 4-6 个字符
+                prefix_before = text[max(0, start - 6):start]
+                if prefix_word in prefix_before:
+                    return True
         return False
 
     def _select_safe_synonym(self, original: str, synonyms: list[str], occurrence_idx: int, context: str) -> str | None:
