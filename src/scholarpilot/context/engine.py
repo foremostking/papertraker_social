@@ -103,13 +103,14 @@ class ContextEngine:
         user_input: str,
         history: list[dict[str, str]] | None = None,
         role: str | None = None,
+        discipline: str = "学术研究",
     ) -> ContextWindow:
         """构建选题分析的上下文窗口."""
         from scholarpilot.context.prompts import TOPIC_ANALYSIS_PROMPT, get_role_prompt
 
         return ContextWindow(
-            system_prompt=get_role_prompt(role or "topic_analysis"),
-            task_prompt=TOPIC_ANALYSIS_PROMPT.format(user_input=user_input),
+            system_prompt=get_role_prompt(role or "topic_analysis", discipline=discipline),
+            task_prompt=TOPIC_ANALYSIS_PROMPT.format(user_input=user_input, discipline=discipline),
             profile_context=self._get_profile_context(),
             user_context=user_input,
             history=self._trim_history(history or []),
@@ -128,6 +129,7 @@ class ContextEngine:
         key_papers: str = "",
         history: list[dict[str, str]] | None = None,
         role: str | None = None,
+        discipline: str = "学术研究",
     ) -> ContextWindow:
         """构建论文规格生成的上下文窗口."""
         from scholarpilot.context.prompts import SPEC_GENERATION_PROMPT, get_role_prompt
@@ -145,7 +147,7 @@ class ContextEngine:
         )
 
         return ContextWindow(
-            system_prompt=get_role_prompt(role or "spec_generation"),
+            system_prompt=get_role_prompt(role or "spec_generation", discipline=discipline),
             task_prompt=task,
             profile_context=self._get_profile_context(),
             history=self._trim_history(history or []),
@@ -160,6 +162,7 @@ class ContextEngine:
         target_journal: str = "CSSCI核心期刊",
         history: list[dict[str, str]] | None = None,
         role: str | None = None,
+        discipline: str = "学术研究",
     ) -> ContextWindow:
         """构建大纲生成的上下文窗口."""
         from scholarpilot.context.prompts import OUTLINE_GENERATION_PROMPT, get_role_prompt
@@ -173,7 +176,7 @@ class ContextEngine:
         )
 
         return ContextWindow(
-            system_prompt=get_role_prompt(role or "outline"),
+            system_prompt=get_role_prompt(role or "outline", discipline=discipline),
             task_prompt=task,
             project_context=spec_content,
             history=self._trim_history(history or []),
@@ -187,6 +190,7 @@ class ContextEngine:
         research_gaps: str = "",
         history: list[dict[str, str]] | None = None,
         role: str | None = None,
+        discipline: str = "学术研究",
     ) -> ContextWindow:
         """构建文献综述的上下文窗口."""
         from scholarpilot.context.prompts import REVIEW_WRITING_PROMPT, get_role_prompt
@@ -199,7 +203,7 @@ class ContextEngine:
         )
 
         return ContextWindow(
-            system_prompt=get_role_prompt(role or "section_writing"),
+            system_prompt=get_role_prompt(role or "section_writing", discipline=discipline),
             task_prompt=task,
             literature_context=papers_list,
             history=self._trim_history(history or []),
@@ -222,6 +226,7 @@ class ContextEngine:
         evidence_context: str = "",
         history: list[dict[str, str]] | None = None,
         role: str | None = None,
+        discipline: str = "学术研究",
     ) -> ContextWindow:
         """构建章节撰写的上下文窗口.
 
@@ -254,7 +259,7 @@ class ContextEngine:
             task += f"\n\n## 本章论点与证据\n{evidence_context}"
 
         return ContextWindow(
-            system_prompt=get_role_prompt(role or "section_writing"),
+            system_prompt=get_role_prompt(role or "section_writing", discipline=discipline),
             task_prompt=task,
             project_context=outline,
             history=self._trim_history(history or []),
@@ -266,6 +271,7 @@ class ContextEngine:
         project_state: dict[str, Any],
         history: list[dict[str, str]] | None = None,
         role: str | None = None,
+        discipline: str = "学术研究",
     ) -> ContextWindow:
         """构建执行计划生成的上下文窗口."""
         from scholarpilot.context.prompts import PLAN_GENERATION_PROMPT, get_role_prompt
@@ -276,7 +282,7 @@ class ContextEngine:
         )
 
         return ContextWindow(
-            system_prompt=get_role_prompt(role),
+            system_prompt=get_role_prompt(role, discipline=discipline),
             task_prompt=task,
             user_context=user_input,
             history=self._trim_history(history or []),
@@ -299,6 +305,7 @@ class ContextEngine:
         edit_instruction: str,
         history: list[dict[str, str]] | None = None,
         role: str | None = None,
+        discipline: str = "学术研究",
     ) -> ContextWindow:
         """构建段落级编辑的上下文窗口."""
         from scholarpilot.context.prompts import PARAGRAPH_EDIT_PROMPT, get_role_prompt
@@ -314,7 +321,7 @@ class ContextEngine:
         )
 
         return ContextWindow(
-            system_prompt=get_role_prompt(role or "section_writing"),
+            system_prompt=get_role_prompt(role or "section_writing", discipline=discipline),
             task_prompt=task,
             profile_context=self._get_profile_context(),
             history=self._trim_history(history or []),
@@ -327,6 +334,7 @@ class ContextEngine:
         paper_summary: str,
         history: list[dict[str, str]] | None = None,
         role: str | None = None,
+        discipline: str = "学术研究",
     ) -> ContextWindow:
         """构建审稿意见解析的上下文窗口."""
         from scholarpilot.context.prompts import REVIEW_ANALYSIS_PROMPT, get_role_prompt
@@ -338,7 +346,7 @@ class ContextEngine:
         )
 
         return ContextWindow(
-            system_prompt=get_role_prompt(role or "claim_calibration"),
+            system_prompt=get_role_prompt(role or "claim_calibration", discipline=discipline),
             task_prompt=task,
             profile_context=self._get_profile_context(),
             history=self._trim_history(history or []),
@@ -350,6 +358,7 @@ class ContextEngine:
         diff_summary: str,
         history: list[dict[str, str]] | None = None,
         role: str | None = None,
+        discipline: str = "学术研究",
     ) -> ContextWindow:
         """构建审稿意见回复函生成的上下文窗口."""
         from scholarpilot.context.prompts import REVIEW_RESPONSE_PROMPT, get_role_prompt
@@ -360,7 +369,7 @@ class ContextEngine:
         )
 
         return ContextWindow(
-            system_prompt=get_role_prompt(role or "claim_calibration"),
+            system_prompt=get_role_prompt(role or "claim_calibration", discipline=discipline),
             task_prompt=task,
             profile_context=self._get_profile_context(),
             history=self._trim_history(history or []),

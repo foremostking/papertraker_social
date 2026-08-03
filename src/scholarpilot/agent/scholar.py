@@ -108,6 +108,7 @@ class ScholarAgent:
         # 状态
         self.history: list[dict[str, str]] = []
         self.topic_info: dict[str, Any] = {}
+        self.discipline: str = "经济学"  # 学科领域，由 Phase 1 选题分析填充
         self.chinese_results: list[Any] = []  # ChineseSearchResult 列表
         self.ss_results: list[Any] = []  # SSSearchResult 列表
         self.arxiv_results: list[Any] = []  # ArxivSearchResult 列表
@@ -178,6 +179,7 @@ class ScholarAgent:
                 completed_sections = progress.get("completed_sections", [])
                 # 从项目记忆恢复运行时状态
                 self.topic_info = self.memory.get("topic_analysis", {}) or {}
+                self.discipline = self.topic_info.get("discipline", "经济学")
                 self.eight_dim_stats = self.memory.get("eight_dim_stats", {}) or {}
                 self.feasibility = self.memory.get("feasibility", {}) or {}
                 self.console.print(
@@ -432,6 +434,7 @@ class ScholarAgent:
                 "region": "中国",
                 "content": "",
                 "research_type": "empirical",
+                "discipline": "经济学",
                 "year_start": _enforced_start,
                 "year_end": _enforced_end,
                 "analysis": response,
@@ -448,6 +451,11 @@ class ScholarAgent:
             self.topic_info["year_start"] = _enforced_start
             self.topic_info["year_end"] = _enforced_end
 
+        # 提取学科领域（Phase 1 新增）：优先使用 LLM 输出的 discipline，
+        # 若未输出则回退到默认值"经济学"
+        self.discipline = self.topic_info.get("discipline") or "经济学"
+        self.topic_info["discipline"] = self.discipline
+
         # 显示分析结果
         table = Table(title="选题分析结果")
         table.add_column("要素", style="cyan")
@@ -456,8 +464,35 @@ class ScholarAgent:
         table.add_row("区域/对象", self.topic_info.get("region", ""))
         table.add_row("研究内容", self.topic_info.get("content", ""))
         table.add_row("研究类型", self.topic_info.get("research_type", ""))
+        table.add_row("学科领域", self.discipline)
         table.add_row("时间范围", f"{self.topic_info.get('year_start', '')}-{self.topic_info.get('year_end', '')}")
         self.console.print(table)
+
+        # RAG 知识库查询：评估数据可得性（Phase 1 增强）
+        # 在选题阶段即查询机构数据库覆盖情况，为后续 SPEC 生成提供数据支撑
+        try:
+            from scholarpilot.tools.data_source_guide import DataSourceGuide
+            ds_guide = DataSourceGuide(project_dir=self.project_dir)
+            rag_topic = " ".join(filter(None, [
+                self.topic_info.get("topic", ""),
+                self.topic_info.get("region", ""),
+                self.topic_info.get("content", ""),
+            ])) or user_input[:100]
+            rag_dbs = ds_guide._query_rag_databases(rag_topic)
+            if rag_dbs:
+                db_names = [db.get("name", db.get("db_key", "")) for db in rag_dbs[:5]]
+                self.console.print(
+                    f"  [dim]📚 RAG 知识库: 覆盖该主题的数据库 {len(rag_dbs)} 个"
+                    f"（{', '.join(db_names[:3])}...）[/dim]"
+                )
+                # 存入 memory，供 Phase 3 SPEC 生成时使用
+                self.memory.add("rag_database_coverage", {
+                    "topic": rag_topic,
+                    "databases": rag_dbs[:8],
+                    "db_count": len(rag_dbs),
+                })
+        except Exception as e:
+            logger.debug(f"Phase 1 RAG 查询失败(非致命): {e}")
 
         # 保存到记忆
         self.memory.add("topic_analysis", self.topic_info)
@@ -466,6 +501,7 @@ class ScholarAgent:
         meta_updates = {
             "topic": self.topic_info.get("topic", ""),
             "research_type": self.topic_info.get("research_type", ""),
+            "discipline": self.discipline,
         }
         # 若画像中有期刊偏好，回填到元数据
         preferred_journal = self.profile.get_preference("target_journal")
@@ -1277,6 +1313,27 @@ class ScholarAgent:
         # 格式化关键论文
         key_papers = self._format_papers_for_display()
 
+        # RAG 知识库注入（Phase 3 增强）：将数据库覆盖信息注入 SPEC 生成上下文
+        # 使 SPEC 中的"数据来源"和"变量测量"部分基于实际可得的机构数据库
+        try:
+            rag_coverage = self.memory.get("rag_database_coverage")
+            if rag_coverage and rag_coverage.get("databases"):
+                rag_dbs = rag_coverage["databases"]
+                rag_text_parts = ["\n## 机构数据库覆盖（RAG 知识库）"]
+                rag_text_parts.append(f"已探查到 {rag_coverage.get('db_count', 0)} 个数据库覆盖该研究主题：")
+                for db in rag_dbs[:6]:
+                    name = db.get("name", db.get("db_key", ""))
+                    platform = db.get("platform", db.get("type", ""))
+                    desc = db.get("description", db.get("desc", ""))[:80]
+                    rag_text_parts.append(f"- {name}（{platform}）: {desc}")
+                rag_text_parts.append("\n请在 SPEC 的数据来源部分优先推荐以上数据库。")
+                key_papers += "\n".join(rag_text_parts)
+                self.console.print(
+                    f"  [dim]📚 RAG 注入: {len(rag_dbs)} 个数据库覆盖信息已加入 SPEC 上下文[/dim]"
+                )
+        except Exception as e:
+            logger.debug(f"Phase 3 RAG 注入失败(非致命): {e}")
+
         # 多源检索计数
         ss_count = sum(r.total_count for r in self.ss_results)
         arxiv_count = sum(r.total_count for r in self.arxiv_results)
@@ -1298,6 +1355,7 @@ class ScholarAgent:
             competition_level=f"{comp.get('level', 'unknown')} - {comp.get('assessment', '')}",
             feasibility_result=json.dumps(self.feasibility, ensure_ascii=False, indent=2),
             key_papers=key_papers,
+            discipline=self.discipline,
             history=[],  # SPEC 生成不传历史，避免消息序列混乱导致空响应
         )
 
@@ -1336,6 +1394,7 @@ class ScholarAgent:
             literature_summary=self._format_papers_for_display(),
             user_thoughts="",
             target_journal="CSSCI核心期刊",
+            discipline=self.discipline,
             history=[],  # 大纲生成不传历史，避免消息序列混乱导致空响应
         )
 
@@ -1543,6 +1602,7 @@ class ScholarAgent:
                 previous_sections=prev_summary_text,
                 empirical_data=section_empirical_data,
                 evidence_context=evidence_context,
+                discipline=self.discipline,
                 history=[],  # 章节撰写不传历史，避免 prompt 膨胀
             )
 
@@ -1961,6 +2021,7 @@ class ScholarAgent:
                 relevant_papers="（基于用户提交的真实数据重新生成）",
                 previous_sections="（前序章节不变）",
                 empirical_data=empirical_data_text,
+                discipline=self.discipline,
                 history=[],  # 不传历史，避免 prompt 膨胀
             )
 
@@ -2130,9 +2191,22 @@ class ScholarAgent:
             verify_all_citations,
             format_references_list,
             generate_ai_disclosure,
+            detect_classic_methodology_citations,
         )
 
         citations = extract_citations_from_text(full_text)
+
+        # 检测并补充经典方法论文献（如 Rogers, Kaplan, Baron 等）
+        # 这些文献常被 LLM 引用但不在 Phase 2 文献池中
+        classic_citations = detect_classic_methodology_citations(
+            full_text, existing_citations=citations
+        )
+        if classic_citations:
+            self.console.print(
+                f"  [green]📚 经典方法论文献补充: {len(classic_citations)} 篇"
+                f"（Rogers/Kaplan/Baron 等）[/green]"
+            )
+            citations.extend(classic_citations)
 
         # 修改6: 从文献池正向构建引用（以真实文献为主，文本提取为补充）
         pool_citations: list = []
@@ -2210,6 +2284,25 @@ class ScholarAgent:
             literature_pool=literature_pool,
         )
 
+        # 动态补充验证：对未验证的英文引用进行最后兜底
+        # 仅用作者名+年份搜索（不加主题词），适用于经典方法论文献
+        unverified_en = [
+            c for c in verified_citations
+            if not c.verified and c.language == "en" and c.authors
+        ]
+        if unverified_en and (openalex_engine or ss_engine):
+            self.console.print(
+                f"  [dim]🔍 动态补充验证: {len(unverified_en)} 条未验证英文引用[/dim]"
+            )
+            from scholarpilot.tools.citation_manager import supplement_unverified_english_citations
+            verified_citations = await supplement_unverified_english_citations(
+                verified_citations,
+                openalex_engine=openalex_engine,
+                ss_engine=ss_engine,
+            )
+            new_verified = sum(1 for c in verified_citations if c.verified)
+            supplemented = new_verified - verified_count if 'verified_count' in dir() else 0
+
         # 关闭引擎
         if cnki_engine:
             try:
@@ -2229,20 +2322,52 @@ class ScholarAgent:
             f"{unverified_count} 条未验证[/green]"
         )
 
-        # 最终TRSS过滤：移除主题不相关的引用（三重保险）
-        # 使用动态主题相关性评分替代静态黑名单，适用于任何研究主题
-        from scholarpilot.tools.citation_manager import _is_irrelevant_paper
+        # 最终语义过滤：使用嵌入语义相似度移除主题不相关引用
+        # 第三代方案：智谱 embedding-3 语义向量余弦相似度
+        # 降级策略：API不可用时自动回退到TRSS关键词匹配
+        from scholarpilot.tools.citation_manager import get_semantic_filter
+        sf = get_semantic_filter()
+        # 语义过滤使用完整主题描述（而非截取的关键词），提高嵌入精度
+        semantic_topic = " ".join(filter(None, [
+            topic_info.get("core_topic", ""),
+            topic_info.get("region", ""),
+            topic_info.get("content", ""),
+        ])) or topic_keywords
         pre_filter_count = len(verified_citations)
-        verified_citations = [
-            c for c in verified_citations
-            if not _is_irrelevant_paper(c.title, c.abstract or "", topic_keywords)
-        ]
-        blocked_count = pre_filter_count - len(verified_citations)
+        kept_citations, filtered_citations, filter_method = await sf.filter_papers(
+            verified_citations, semantic_topic,
+            threshold=sf.FINAL_THRESHOLD,
+        )
+        blocked_count = pre_filter_count - len(kept_citations)
         if blocked_count > 0:
+            method_label = "语义嵌入" if filter_method == "semantic" else "TRSS降级"
             self.console.print(
-                f"  [yellow]🚫 TRSS最终过滤: 移除 {blocked_count} 条主题不相关引用[/yellow]"
+                f"  [yellow]🚫 {method_label}过滤: 移除 {blocked_count} 条主题不相关引用[/yellow]"
             )
-            logger.info("TRSS最终过滤: 移除 %d 条主题不相关引用", blocked_count)
+            logger.info(
+                "%s最终过滤: 移除 %d 条主题不相关引用 (阈值=%.2f)",
+                method_label, blocked_count, sf.FINAL_THRESHOLD,
+            )
+        verified_citations = kept_citations
+
+        # Cross-Encoder 精排：对 Bi-Encoder 保留的引用进行精确重排序
+        # 两阶段架构第二阶段：Bi-Encoder 初筛 → Cross-Encoder 精排
+        # 最终阶段只重排序（不影响引用数量），移除由 Bi-Encoder 负责
+        if len(verified_citations) > 5:
+            try:
+                from scholarpilot.tools.citation_manager import get_cross_encoder_reranker
+                reranker = get_cross_encoder_reranker()
+                reranked_cits, dropped_cits, rmethod = await reranker.rerank(
+                    verified_citations, semantic_topic, drop_bottom=False,
+                )
+                if rmethod != "skipped":
+                    rmethod_label = "BGE本地" if rmethod == "local_bge" else "LLM"
+                    self.console.print(
+                        f"  [cyan]🎯 {rmethod_label}精排: 引用已按相关性重排序[/cyan]"
+                    )
+                    verified_citations = reranked_cits
+            except Exception as re:
+                logger.warning(f"Cross-Encoder精排异常(非致命): {re}")
 
         # 3. 格式化参考文献列表
         self.console.print("[dim]📋 正在生成参考文献列表（CSSCI 格式）...[/dim]")
@@ -3529,17 +3654,26 @@ class ScholarAgent:
             r'\1，\2',
             polished_full,
         )
-        # 7f: 学术动词后句号改逗号（指出/发现/提出/强调/认为/表明/建议/证实/揭示/指出）
+        # 7f: 学术动词后句号改逗号（指出/发现/提出/强调/认为/表明/建议/证实/揭示/论证/说明/阐释）
+        # 扩展动词列表：增加分析/认为/强调/指出/发现/提出/检验/验证/考察/探讨/构建/建立/采用/使用
+        # 动态化改造：合并去重后新增确认/排除/支持/否定/证明/概述/总结/归纳/推断/预测/
+        #   评估/测量/测定/量化/比较/对比/区分/识别/观察/记录/描述/界定/分类/划分
         polished_full, _n7f = _re_clean.subn(
-            r'(指出|发现|提出|强调|认为|表明|建议|证实|揭示|论证|说明|阐释|论证)。([\u4e00-\u9fff])',
+            r'(指出|发现|提出|强调|认为|表明|建议|证实|揭示|论证|说明|阐释|分析|检验|验证|考察|探讨|构建|建立|采用|使用|运用|存在|具有|呈现|体现|显示|反映|确认|排除|支持|否定|证明|概述|总结|归纳|推断|预测|评估|测量|测定|量化|比较|对比|区分|识别|观察|记录|描述|界定|分类|划分)。([\u4e00-\u9fff])',
             r'\1，\2',
             polished_full,
         )
-        _punct_ext_count = _n7a + _n7b + _n7c + _n7d + _n7e + _n7f
+        # 7f2: 动词后句号改逗号 — 补充动词不在句首的情况（如"上述分析。""实证发现。"）
+        polished_full, _n7f2 = _re_clean.subn(
+            r'([\u4e00-\u9fff]{2,8}(?:指出|发现|提出|强调|认为|表明|建议|证实|揭示|论证|说明|阐释|分析|检验|验证|考察|探讨|构建|建立|确认|排除|支持|否定|证明|概述|总结|归纳|推断|预测|评估|测量|测定|量化|比较|对比|区分|识别|观察|记录|描述|界定|分类|划分))。([\u4e00-\u9fff])',
+            r'\1，\2',
+            polished_full,
+        )
+        _punct_ext_count = _n7a + _n7b + _n7c + _n7d + _n7e + _n7f + _n7f2
         if _punct_ext_count > 0:
             logger.info(
-                "Phase 8b 标点扩展修复: 7a=%d, 7b=%d, 7c=%d, 7d=%d, 7e=%d, 7f=%d",
-                _n7a, _n7b, _n7c, _n7d, _n7e, _n7f,
+                "Phase 8b 标点扩展修复: 7a=%d, 7b=%d, 7c=%d, 7d=%d, 7e=%d, 7f=%d, 7f2=%d",
+                _n7a, _n7b, _n7c, _n7d, _n7e, _n7f, _n7f2,
             )
             self.console.print(
                 f"  [dim]标点扩展修复: {_punct_ext_count} 处（数字/括号/英文/连接词/引号/动词后句号）[/dim]"
@@ -3613,20 +3747,135 @@ class ScholarAgent:
                 r'对([\u4e00-\u9fff]{2,20})的(促进|推动|驱动|助推)作用强于',
                 r'与\1的正相关关系强于',
             ),
+            # "对...的促进作用/推动作用/驱动作用/助推作用弱于" → "与...的正相关关系弱于"
+            (
+                r'对([\u4e00-\u9fff]{2,20})的(促进|推动|驱动|助推)作用弱于',
+                r'与\1的正相关关系弱于',
+            ),
+            # "对...的影响/作用大于/小于" → "与...的相关性高于/低于"
+            (
+                r'对([\u4e00-\u9fff]{2,20})的影响大于',
+                r'与\1的相关性高于',
+            ),
+            (
+                r'对([\u4e00-\u9fff]{2,20})的影响小于',
+                r'与\1的相关性低于',
+            ),
+            # "对...的作用大于/小于" → "与...的相关性高于/低于"
+            (
+                r'对([\u4e00-\u9fff]{2,20})的作用大于',
+                r'与\1的相关性高于',
+            ),
+            (
+                r'对([\u4e00-\u9fff]{2,20})的作用小于',
+                r'与\1的相关性低于',
+            ),
             # "有助于缓解X" → "与X呈显著负相关"
             (
                 r'有助于缓解([\u4e00-\u9fff]{2,10})',
                 r'与\1呈显著负相关',
             ),
-            # "证实...对...的促进作用" → "表明...与...的正相关关系"
+            # "证实X对Y的促进作用" → "表明X与Y的正相关关系"（X/Y为任意中文术语，适配任何研究主题）
             (
-                r'证实(数字化转型)对([\u4e00-\u9fff]{2,15})的(促进|推动|驱动|助推)作用',
+                r'证实([\u4e00-\u9fff]{2,10})对([\u4e00-\u9fff]{2,15})的(促进|推动|驱动|助推)作用',
                 r'表明\1与\2的正相关关系',
             ),
-            # "揭示...对...的驱动作用" → "显示...与...的正相关关系"
+            # "揭示X对Y的驱动作用" → "显示X与Y的正相关关系"（适配任何研究主题）
             (
-                r'揭示(数字化转型)对([\u4e00-\u9fff]{2,15})的(驱动|促进|推动|助推)作用',
+                r'揭示([\u4e00-\u9fff]{2,10})对([\u4e00-\u9fff]{2,15})的(驱动|促进|推动|助推)作用',
                 r'显示\1与\2的正相关关系',
+            ),
+            # "...促进作用弱于..." → "...正相关关系弱于..."（无"对...的"前缀的情况）
+            (
+                r'(促进|推动|驱动|助推)作用弱于',
+                r'正相关关系弱于',
+            ),
+            # "...促进作用强于..." → "...正相关关系强于..."（无"对...的"前缀的情况）
+            (
+                r'(促进|推动|驱动|助推)作用强于',
+                r'正相关关系强于',
+            ),
+            # "约为"比较句式 → "接近"（避免精确数值断言）
+            (
+                r'约为([\d.]+)',
+                r'接近\1',
+            ),
+            # "X导致Y" → "X与Y存在相关关系"（通用因果断言改写，适配任何主题）
+            (
+                r'([\u4e00-\u9fff]{2,10})导致了([\u4e00-\u9fff]{2,10})的',
+                r'\1与\2存在相关关系，体现在\2的',
+            ),
+            # "X引起Y" → "X与Y显著相关"
+            (
+                r'([\u4e00-\u9fff]{2,10})引起了([\u4e00-\u9fff]{2,10})',
+                r'\1与\2显著相关',
+            ),
+            # "X决定Y" → "X与Y密切相关"
+            (
+                r'([\u4e00-\u9fff]{2,10})决定了([\u4e00-\u9fff]{2,10})',
+                r'\1与\2密切相关',
+            ),
+            # "X使得Y" → "X与Y呈正相关"
+            (
+                r'([\u4e00-\u9fff]{2,10})使得([\u4e00-\u9fff]{2,10})',
+                r'\1与\2呈正相关',
+            ),
+            # "X促使Y" → "X与Y呈正相关"
+            (
+                r'([\u4e00-\u9fff]{2,10})促使([\u4e00-\u9fff]{2,10})',
+                r'\1与\2呈正相关',
+            ),
+            # 通用因果动词检测：推动/拉动/引发/诱发/造就/抑制/阻碍/削弱/加剧/恶化
+            # 这些动词在实证论文中表达因果关系，应改为相关性表述
+            # "X推动了Y" → "X与Y呈正相关"
+            (
+                r'([\u4e00-\u9fff]{2,10})推动了([\u4e00-\u9fff]{2,10})',
+                r'\1与\2呈正相关',
+            ),
+            # "X拉动了Y" → "X与Y呈正相关"
+            (
+                r'([\u4e00-\u9fff]{2,10})拉动了([\u4e00-\u9fff]{2,10})',
+                r'\1与\2呈正相关',
+            ),
+            # "X引发了Y" → "X与Y显著相关"
+            (
+                r'([\u4e00-\u9fff]{2,10})引发了([\u4e00-\u9fff]{2,10})',
+                r'\1与\2显著相关',
+            ),
+            # "X诱发了Y" → "X与Y存在关联"
+            (
+                r'([\u4e00-\u9fff]{2,10})诱发了([\u4e00-\u9fff]{2,10})',
+                r'\1与\2存在关联',
+            ),
+            # "X造就了Y" → "X与Y密切相关"
+            (
+                r'([\u4e00-\u9fff]{2,10})造就了([\u4e00-\u9fff]{2,10})',
+                r'\1与\2密切相关',
+            ),
+            # "X抑制了Y" → "X与Y呈负相关"
+            (
+                r'([\u4e00-\u9fff]{2,10})抑制了([\u4e00-\u9fff]{2,10})',
+                r'\1与\2呈负相关',
+            ),
+            # "X阻碍了Y" → "X与Y呈负相关"
+            (
+                r'([\u4e00-\u9fff]{2,10})阻碍了([\u4e00-\u9fff]{2,10})',
+                r'\1与\2呈负相关',
+            ),
+            # "X削弱了Y" → "X与Y呈负相关"
+            (
+                r'([\u4e00-\u9fff]{2,10})削弱了([\u4e00-\u9fff]{2,10})',
+                r'\1与\2呈负相关',
+            ),
+            # "X加剧了Y" → "X与Y呈正相关"
+            (
+                r'([\u4e00-\u9fff]{2,10})加剧了([\u4e00-\u9fff]{2,10})',
+                r'\1与\2呈正相关',
+            ),
+            # "X恶化了Y" → "X与Y呈负相关"
+            (
+                r'([\u4e00-\u9fff]{2,10})恶化了([\u4e00-\u9fff]{2,10})',
+                r'\1与\2呈负相关',
             ),
         ]
         _overreach_count = 0
@@ -3643,9 +3892,32 @@ class ScholarAgent:
         _TRANSITION_WORDS = [
             "从最基本的层面来看", "进一步来看", "还应注意",
             "更为关键的是", "需要关注的是", "需要指出的是",
+            "值得注意的是", "不容忽视的是", "显而易见的是",
+            "毋庸置疑的是", "不言而喻的是", "从现实层面来看",
+            "从理论层面来看", "从实践层面来看", "从宏观层面来看",
+            "从微观层面来看", "从整体来看", "从长远来看",
+            "从短期来看", "在此基础上", "与此同时",
+            "除此之外", "更重要的是", "更值得注意的是",
+            "令人瞩目的是", "引人深思的是", "发人深省的是",
         ]
+        # 通用过渡词模式：检测任何"从X来看/X层面来看/值得注意的是X的是"等模式
+        # 动态化改造：减少对固定词表的依赖，通过模式匹配发现未知过渡词
+        _transition_pattern = re.compile(
+            r'(从[\u4e00-\u9fff]{2,8}来看|从[\u4e00-\u9fff]{2,8}层面来看|'
+            r'[\u4e00-\u9fff]{2,6}的是[，,]|'
+            r'需要[\u4e00-\u9fff]{1,6}的是|值得注意的是|'
+            r'显而易见的是|毋庸置疑的是|不言而喻的是|'
+            r'令人[\u4e00-\u9fff]{2,4}的是|'
+            r'更为[\u4e00-\u9fff]{2,4}的是)'
+        )
+
+        # 收集所有检测到的过渡词（已知列表 + 通用模式动态发现）
+        _all_transitions: set[str] = set(_TRANSITION_WORDS)
+        for _m in _transition_pattern.finditer(polished_full):
+            _all_transitions.add(_m.group(1))
+
         _transition_replaced = 0
-        for tw in _TRANSITION_WORDS:
+        for tw in _all_transitions:
             count = polished_full.count(tw)
             if count > 2:
                 # 从第3次出现开始替换为"此外"

@@ -746,9 +746,10 @@ class ClaimCalibrator:
                 # 模糊匹配：引用字符串中的作者姓或年份出现在参考文献中
                 is_matched = False
                 for cite in citations:
-                    cite_lower = cite.lower()
+                    cite_str = str(cite)
+                    cite_lower = cite_str.lower()
                     # 匹配年份
-                    if ref_year and ref_year in cite:
+                    if ref_year and ref_year in cite_str:
                         is_matched = True
                         break
                     # 匹配中文作者姓（2-4字完整匹配）
@@ -756,11 +757,11 @@ class ClaimCalibrator:
                         author_parts = ref_authors.replace("、", " ").replace(",", " ").replace("&", " ").replace(" and ", " ").split()
                         for ap in author_parts:
                             ap_stripped = ap.strip()
-                            if len(ap_stripped) >= 2 and ap_stripped in cite:
+                            if len(ap_stripped) >= 2 and ap_stripped in cite_str:
                                 is_matched = True
                                 break
                             # 也检查前2字匹配（针对"张三等"情况）
-                            if len(ap_stripped) >= 2 and ap_stripped[:2] in cite:
+                            if len(ap_stripped) >= 2 and ap_stripped[:2] in cite_str:
                                 is_matched = True
                                 break
                         if is_matched:

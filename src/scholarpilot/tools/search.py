@@ -21,9 +21,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
+
+try:
+    import litellm
+    # 避免 litellm 拉取模型成本表时触发 SSL 警告
+    litellm.model_cost_default_url = ""
+    _LITELLM_AVAILABLE = True
+except ImportError:  # pragma: no cover - litellm 为可选依赖
+    litellm = None  # type: ignore[assignment]
+    _LITELLM_AVAILABLE = False
 
 from scholarpilot.mcp.servers.cnki import CNKISearchResult, CNKIPaper
 from scholarpilot.mcp.servers.semantic_scholar import (
@@ -134,7 +144,9 @@ class LiteratureSearchManager:
         )
     """
 
-    # 财政学/经济学常见术语中英映射表
+    # 降级缓存：此表为 LLM 动态翻译失败（无 API Key / 调用异常）时的降级回退方案，
+    # 主要翻译机制为 LLM 动态翻译（见 _translate_to_english_llm）。
+    # 仅覆盖财政学/经济学常见术语，无法覆盖任意学科；LLM 可用时将被优先调用。
     TERM_MAP: dict[str, str] = {
         # 核心概念
         "地方政府债务": "local government debt",
@@ -193,6 +205,9 @@ class LiteratureSearchManager:
     }
 
     # 不相关主题黑名单：命中任一词的论文将被硬过滤丢弃，不受兜底保护
+    # 注意：此黑名单为语义过滤（SemanticRelevanceFilter）的补充兜底，仅包含
+    # 跨学科通用不相关主题（医学/农业/政治等），不含任何特定研究主题的过滤项。
+    # 主题相关性判断主要依赖嵌入语义相似度，此列表仅处理明显跨域噪声。
     _IRRELEVANT_TOPIC_BLOCKLIST: tuple[str, ...] = (
         # 医学/疫情类
         "covid-19", "covid19", "coronavirus",
@@ -204,16 +219,10 @@ class LiteratureSearchManager:
         # 医疗旅游类
         "医疗旅游", "文化旅游标准化", "medical tourism",
         # 国际关系/政治类
-        "axis of allies", "us-japan alliance", "国际关系",
+        "axis of allies", "us-japan alliance",
         "antitrust interoperability",
-        # 数据安全/隐私类（与创新绩效无直接关联）
-        "data security and privacy protection", "ctrip",
-        # 药物创新（非企业创新绩效）
-        "pharmaceutical innovation", "药物创新",
         # 结核病/抗菌类
         "mycobacterium tuberculosis", "antituberculosis", "drug resistance in",
-        # 内生知识溢出（非企业数字化）
-        "endogenous knowledge spillover",
     )
 
     def __init__(
@@ -263,21 +272,23 @@ class LiteratureSearchManager:
         # 保存 VPN 状态
         self.vpn_status = vpn_status
 
-    def _translate_to_english(self, text: str) -> str:
-        """将中文术语翻译为英文（基于术语映射表）.
+        # LLM 翻译/同义词扩展缓存：text -> result
+        # 用于避免对同一中文文本重复调用 LLM，降低延迟与费用
+        self._translation_cache: dict[str, str] = {}
+        self._synonym_cache: dict[str, list[str]] = {}
 
-        对于映射表中已有的术语，直接替换。对于未映射的中文，
-        保留原文（Semantic Scholar 也能处理部分中文搜索）。
+        # 智谱 GLM-4 配置：从环境变量读取 API Key
+        self._zhipu_api_key: str = os.environ.get("SCHOLAR_ZHIPU_API_KEY", "")
+        self._zhipu_model: str = "openai/glm-4"
+        self._zhipu_api_base: str = "https://open.bigmodel.cn/api/paas/v4/"
 
-        Args:
-            text: 中文文本。
+    def _translate_to_english_static(self, text: str) -> str:
+        """基于静态 TERM_MAP 的降级翻译（同步）.
 
-        Returns:
-            英文搜索词。
+        对于映射表中已有的术语，直接替换；对于未映射的中文，保留原文
+        （Semantic Scholar 也能处理部分中文搜索）。
         """
         result = text
-        # 按中文短语长度降序排列，避免短词先替换导致长词匹配失败
-        sorted_terms = sorted(self.TERM_MAP.keys(), key=len, reverse=True)
         for cn_term, en_term in self.TERM_MAP.items():
             if cn_term in result:
                 result = result.replace(cn_term, en_term)
@@ -285,6 +296,84 @@ class LiteratureSearchManager:
         # 清理多余空格
         result = " ".join(result.split())
         return result
+
+    async def _translate_to_english_llm(self, text: str) -> Optional[str]:
+        """通过 LLM（智谱 GLM-4）将中文文本翻译为英文学术搜索词.
+
+        使用 litellm.acompletion 调用智谱 GLM-4 模型，使任意学科的中英文翻译
+        都能工作，不再受限于静态 TERM_MAP 的覆盖范围。
+
+        Args:
+            text: 中文文本（研究主题/区域/内容）。
+
+        Returns:
+            翻译后的纯英文短语；失败或不可用时返回 None，由调用方回退到静态映射。
+        """
+        if not text or not text.strip():
+            return None
+
+        # 命中缓存直接返回，避免重复调用 LLM
+        if text in self._translation_cache:
+            return self._translation_cache[text]
+
+        # 若 litellm 不可用或未配置 API Key，直接返回 None 走静态降级
+        if not _LITELLM_AVAILABLE or not self._zhipu_api_key:
+            return None
+
+        prompt = (
+            "你是一位学术文献检索专家。请将下面的中文研究主题翻译为英文学术搜索词，"
+            "用于在 Semantic Scholar / arXiv / Web of Science 等英文文献库中检索。\n"
+            "要求：\n"
+            "1. 输出纯英文短语，使用学术界通用术语；\n"
+            "2. 不要添加任何解释、标点符号前缀或引号；\n"
+            "3. 保持简洁，保留关键概念之间的逻辑关系（如 AND 连接）；\n"
+            "4. 若输入已是英文，原样输出。\n\n"
+            f"中文输入：{text}\n"
+            "英文输出："
+        )
+
+        try:
+            response = await litellm.acompletion(  # type: ignore[union-attr]
+                model=self._zhipu_model,
+                api_base=self._zhipu_api_base,
+                api_key=self._zhipu_api_key,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=128,
+                timeout=15,
+            )
+            en_text = response["choices"][0]["message"]["content"].strip()
+            # 清理：去掉可能的引号、换行与多余空格
+            en_text = en_text.strip('"\'` \n\r\t')
+            en_text = " ".join(en_text.split())
+            if not en_text:
+                return None
+            # 缓存结果
+            self._translation_cache[text] = en_text
+            return en_text
+        except Exception as e:
+            logger.debug("LLM 翻译失败，将回退到静态 TERM_MAP: %s", e)
+            return None
+
+    async def _translate_to_english(self, text: str) -> str:
+        """将中文术语翻译为英文（LLM 优先，静态 TERM_MAP 降级）.
+
+        优先调用 LLM（智谱 GLM-4）进行动态翻译，使任意学科的中英文翻译都能工作；
+        LLM 不可用或调用失败时，回退到静态 TERM_MAP 术语映射表。
+
+        Args:
+            text: 中文文本。
+
+        Returns:
+            英文搜索词。
+        """
+        # 优先：LLM 动态翻译
+        en_text = await self._translate_to_english_llm(text)
+        if en_text:
+            return en_text
+
+        # 降级：静态 TERM_MAP 替换
+        return self._translate_to_english_static(text)
 
     async def close(self) -> None:
         """关闭所有引擎."""
@@ -390,7 +479,49 @@ class LiteratureSearchManager:
             result.arxiv_result = arxiv_result
 
         # 整合所有论文
-        result.all_papers = self._merge_papers(result)
+        result.all_papers = await self._merge_papers(result)
+
+        # 语义嵌入过滤（第三代 Bi-Encoder 初筛 + 第四代 Cross-Encoder 精排）
+        # 两阶段架构：Bi-Encoder 快速初筛 → Cross-Encoder 精确重排序
+        if result.all_papers and topic and len(result.all_papers) > 10:
+            try:
+                from scholarpilot.tools.citation_manager import get_semantic_filter
+                sf = get_semantic_filter()
+                # 检索阶段使用宽松阈值，只过滤最不相关的
+                kept, filtered, method = await sf.filter_papers(
+                    result.all_papers, topic,
+                    threshold=sf.SEARCH_THRESHOLD,
+                )
+                if method == "semantic" and filtered:
+                    logger.info(
+                        "语义过滤(检索阶段): %d篇 → %d篇 (过滤%d篇, 阈值=%.2f)",
+                        len(result.all_papers), len(kept),
+                        len(filtered), sf.SEARCH_THRESHOLD,
+                    )
+                elif method == "trss_fallback":
+                    logger.info("语义过滤降级到TRSS: 保留%d篇", len(kept))
+
+                # Cross-Encoder 精排：对 Bi-Encoder 保留的论文进行精确重排序
+                if method in ("semantic", "trss_fallback") and len(kept) > 5:
+                    try:
+                        from scholarpilot.tools.citation_manager import get_cross_encoder_reranker
+                        reranker = get_cross_encoder_reranker()
+                        reranked, dropped, rmethod = await reranker.rerank(
+                            kept, topic, drop_bottom=True,
+                        )
+                        if rmethod != "skipped" and dropped:
+                            logger.info(
+                                "Cross-Encoder精排(检索阶段%s): %d篇→%d篇 (移除%d篇)",
+                                rmethod, len(kept), len(reranked), len(dropped),
+                            )
+                        kept = reranked
+                    except Exception as re:
+                        logger.warning(f"Cross-Encoder精排异常(非致命): {re}")
+
+                result.all_papers = kept
+            except Exception as e:
+                logger.warning(f"语义过滤异常(非致命): {e}")
+
         result.total_count = len(result.all_papers)
 
         return result
@@ -421,10 +552,10 @@ class LiteratureSearchManager:
 
         自动将中文主题翻译为英文，因为 Semantic Scholar 主要是英文文献库。
         """
-        # 翻译为英文
-        en_topic = self._translate_to_english(topic)
-        en_region = self._translate_to_english(region)
-        en_content = self._translate_to_english(content)
+        # 翻译为英文（LLM 优先，静态 TERM_MAP 降级）
+        en_topic = await self._translate_to_english(topic)
+        en_region = await self._translate_to_english(region)
+        en_content = await self._translate_to_english(content)
 
         query = SemanticScholarEngine.build_query_from_topic(
             topic=en_topic, region=en_region, content=en_content,
@@ -445,8 +576,8 @@ class LiteratureSearchManager:
 
         自动将中文主题翻译为英文，因为 arXiv 主要是英文预印本库。
         """
-        # 翻译为英文
-        en_topic = self._translate_to_english(topic)
+        # 翻译为英文（LLM 优先，静态 TERM_MAP 降级）
+        en_topic = await self._translate_to_english(topic)
 
         # 构建 arXiv 查询串（使用经济学分类）
         query = ArxivEngine.build_query(
@@ -472,10 +603,10 @@ class LiteratureSearchManager:
         自动将中文主题翻译为英文，因为 WoS 主要是英文文献库。
         使用 WoS 查询语言 (WQL) 构建检索式。
         """
-        # 翻译为英文
-        en_topic = self._translate_to_english(topic)
-        en_region = self._translate_to_english(region)
-        en_content = self._translate_to_english(content)
+        # 翻译为英文（LLM 优先，静态 TERM_MAP 降级）
+        en_topic = await self._translate_to_english(topic)
+        en_region = await self._translate_to_english(region)
+        en_content = await self._translate_to_english(content)
 
         # 构建 WoS 查询式
         query = WoSEngine.build_query_from_topic(
@@ -520,7 +651,7 @@ class LiteratureSearchManager:
             lang="zh",
         )
 
-    def _merge_papers(self, result: UnifiedSearchResult) -> list[UnifiedPaper]:
+    async def _merge_papers(self, result: UnifiedSearchResult) -> list[UnifiedPaper]:
         """整合来自不同源的论文为统一列表."""
         papers: list[UnifiedPaper] = []
 
@@ -660,24 +791,19 @@ class LiteratureSearchManager:
         # 主题相关性过滤（如果有可用主题）
         topic = getattr(result, "topic", "")
         if topic:
-            papers = self._filter_by_relevance(papers, topic)
+            papers = await self._filter_by_relevance(papers, topic)
 
         return papers
 
-    def _expand_topic_synonyms(self, topic_words: set[str]) -> set[str]:
-        """扩展主题关键词的同义词集.
+    def _expand_topic_synonyms_static(self, topic_words: set[str]) -> set[str]:
+        """基于静态 synonym_map 的降级同义词扩展（同步）.
 
-        根据财政学/经济学/数字化转型等领域常见术语，
-        将主题关键词扩展为包含相关同义词的集合，
-        提升主题相关性匹配的召回率。
-
-        Args:
-            topic_words: 原始主题关键词集合。
-
-        Returns:
-            扩展后的关键词集合（包含原始词与同义词）。
+        将主题关键词扩展为包含相关同义词的集合，提升主题相关性匹配的召回率。
+        仅覆盖财政学/经济学/数字化转型等领域常见术语。
         """
-        # 同义词映射表：关键词 -> 相关同义词列表
+        # 降级缓存：此表为 LLM 同义词扩展失败（无 API Key / 调用异常）时的降级回退方案，
+        # 主要同义词扩展机制为 LLM 动态生成（见 _expand_topic_synonyms 中的 LLM 分支）。
+        # 仅覆盖财政学/经济学/数字化转型等领域常见术语；LLM 可用时将被优先调用。
         synonym_map: dict[str, list[str]] = {
             "数字化转型": ["数字技术", "数字化", "信息化", "人工智能", "大数据"],
             "数字化": ["数字技术", "数字化转型", "信息化", "人工智能"],
@@ -701,7 +827,94 @@ class LiteratureSearchManager:
 
         return expanded
 
-    def _filter_by_relevance(
+    async def _expand_topic_synonyms_llm(
+        self, topic_words: set[str],
+    ) -> Optional[set[str]]:
+        """通过 LLM（智谱 GLM-4）生成同义词扩展.
+
+        给定研究主题关键词，调用 LLM 生成 5-10 个相关同义词/近义词（中英文均可），
+        替代静态 synonym_map，使任意学科的主题都能进行同义词扩展。
+
+        Args:
+            topic_words: 原始主题关键词集合。
+
+        Returns:
+            扩展后的关键词集合（包含原始词与 LLM 生成的同义词）；
+            失败或不可用时返回 None，由调用方回退到静态 synonym_map。
+        """
+        if not topic_words:
+            return None
+
+        # 缓存键：排序后的关键词拼接，保证同一组关键词不重复调用 LLM
+        cache_key = "|".join(sorted(topic_words))
+        if cache_key in self._synonym_cache:
+            return set(topic_words) | set(self._synonym_cache[cache_key])
+
+        # 若 litellm 不可用或未配置 API Key，直接返回 None 走静态降级
+        if not _LITELLM_AVAILABLE or not self._zhipu_api_key:
+            return None
+
+        words_str = "、".join(sorted(topic_words))
+        prompt = (
+            "你是一位学术文献检索专家。给定以下研究主题关键词，"
+            "请生成 5-10 个相关的同义词或近义词（中英文均可），"
+            "用于扩展文献检索的召回率。\n"
+            "要求：\n"
+            "1. 每行输出一个词，不要编号、不要解释；\n"
+            "2. 涵盖该主题在学术界常用的不同表达方式；\n"
+            "3. 同时包含中文和英文术语（如适用）。\n\n"
+            f"主题关键词：{words_str}\n"
+            "同义词/近义词："
+        )
+
+        try:
+            response = await litellm.acompletion(  # type: ignore[union-attr]
+                model=self._zhipu_model,
+                api_base=self._zhipu_api_base,
+                api_key=self._zhipu_api_key,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=256,
+                timeout=15,
+            )
+            content = response["choices"][0]["message"]["content"].strip()
+            # 解析：按行分割，去掉编号前缀与多余空白
+            synonyms: list[str] = []
+            for line in content.splitlines():
+                line = line.strip().strip('"\'` \n\r\t')
+                # 去掉可能的编号前缀 "1. "、"1、"、"1) " 等
+                line = re.sub(r'^\d+[\.\)、]\s*', '', line)
+                if line and line not in synonyms:
+                    synonyms.append(line)
+            if not synonyms:
+                return None
+            self._synonym_cache[cache_key] = synonyms
+            return set(topic_words) | set(synonyms)
+        except Exception as e:
+            logger.debug("LLM 同义词扩展失败，将回退到静态 synonym_map: %s", e)
+            return None
+
+    async def _expand_topic_synonyms(self, topic_words: set[str]) -> set[str]:
+        """扩展主题关键词的同义词集（LLM 优先，静态 synonym_map 降级）.
+
+        优先调用 LLM（智谱 GLM-4）动态生成同义词，使任意学科的主题都能扩展；
+        LLM 不可用或调用失败时，回退到静态 synonym_map 术语映射表。
+
+        Args:
+            topic_words: 原始主题关键词集合。
+
+        Returns:
+            扩展后的关键词集合（包含原始词与同义词）。
+        """
+        # 优先：LLM 动态生成
+        expanded = await self._expand_topic_synonyms_llm(topic_words)
+        if expanded:
+            return expanded
+
+        # 降级：静态 synonym_map
+        return self._expand_topic_synonyms_static(topic_words)
+
+    async def _filter_by_relevance(
         self,
         papers: list[UnifiedPaper],
         topic: str,
@@ -731,8 +944,8 @@ class LiteratureSearchManager:
         if not topic_words:
             return papers
 
-        # 扩展主题同义词以提升召回率
-        topic_words = self._expand_topic_synonyms(topic_words)
+        # 扩展主题同义词以提升召回率（LLM 优先，静态 synonym_map 降级）
+        topic_words = await self._expand_topic_synonyms(topic_words)
 
         # 动态核心主题词：从研究主题中提取，替代旧版硬编码
         # 使用跨语言关键词扩展（中文→英文翻译），适用于任何研究主题

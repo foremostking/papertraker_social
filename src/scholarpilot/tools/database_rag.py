@@ -142,10 +142,28 @@ class DatabaseRAG:
                     fuzzy_matches.append((db_key, 0.7))
 
         # 从 SQLite topic_mapping 表查找
+        # 双向匹配：1) topic_mapping中的topic包含在用户输入中 2) 用户输入包含topic_mapping中的topic
         try:
             with sqlite3.connect(str(self.db_path)) as conn:
                 conn.row_factory = sqlite3.Row
                 c = conn.cursor()
+                # 方向1: topic_mapping中的topic是用户输入的子串（如"预算"在"零基预算改革"中）
+                c.execute(
+                    "SELECT database_id, topic, relevance_score FROM topic_mapping "
+                    "WHERE ? LIKE '%' || topic || '%'",
+                    (topic,),
+                )
+                for row in c.fetchall():
+                    db_id = row["database_id"]
+                    score = row["relevance_score"]
+                    c.execute("SELECT db_key, name FROM databases WHERE id=?", (db_id,))
+                    db_row = c.fetchone()
+                    if db_row:
+                        pair = (db_row["db_key"], score)
+                        if pair not in exact_matches:
+                            fuzzy_matches.append(pair)
+
+                # 方向2: 用户输入是topic_mapping中topic的子串（原有逻辑）
                 c.execute(
                     "SELECT database_id, topic, relevance_score FROM topic_mapping "
                     "WHERE topic LIKE ?",
@@ -154,13 +172,10 @@ class DatabaseRAG:
                 for row in c.fetchall():
                     db_id = row["database_id"]
                     score = row["relevance_score"]
-                    # 获取 db_key
-                    c.execute(
-                        "SELECT name FROM databases WHERE id=?", (db_id,)
-                    )
+                    c.execute("SELECT db_key, name FROM databases WHERE id=?", (db_id,))
                     db_row = c.fetchone()
                     if db_row:
-                        pair = (db_row["name"], score)
+                        pair = (db_row["db_key"], score)
                         if pair not in exact_matches:
                             fuzzy_matches.append(pair)
         except Exception as e:
@@ -186,6 +201,10 @@ class DatabaseRAG:
                         break
 
             if db_info:
+                # 过滤非研究类库（research_relevant=False）
+                if db_info.get("research_relevant") is False:
+                    continue
+
                 results.append({
                     "db_key": db_key,
                     "name": db_info.get("name", db_key),
@@ -196,6 +215,7 @@ class DatabaseRAG:
                     "relevance_score": score,
                     "topics": db_info.get("topics", []),
                     "access_method": db_info.get("access_method", ""),
+                    "research_relevant": db_info.get("research_relevant", True),
                 })
 
         return results
@@ -227,8 +247,9 @@ class DatabaseRAG:
                 c = conn.cursor()
 
                 # FTS5 搜索
-                # 对中文关键词,使用模糊匹配 (前缀搜索)
-                fts_query = keyword
+                # 对中文关键词,使用前缀通配符匹配（FTS5的unicode61分词器对中文按字分词）
+                # "税收" -> "税收*" 可匹配 "税收收入"
+                fts_query = f'"{keyword}" OR {keyword}*'
                 c.execute(
                     "SELECT indicator_name, full_path, category_name, db_name, platform "
                     "FROM indicators_fts "
@@ -317,6 +338,7 @@ class DatabaseRAG:
                 "topics": info.get("topics", []),
                 "category_count": len(info.get("categories", [])),
                 "access_method": info.get("access_method", ""),
+                "research_relevant": info.get("research_relevant", True),
             })
 
         return results
@@ -370,14 +392,17 @@ class DatabaseRAG:
             }
 
         # 3. 搜索相关指标
+        # 用关键词分解搜索（完整研究主题不会匹配到按关键词存储的指标）
         key_indicators: list[dict[str, Any]] = []
-        for db in databases[:3]:  # 对前3个数据库搜索指标
-            db_name = db["name"]
-            # 用研究主题搜索指标
-            indicators = self.search_indicators(research_topic, limit=10)
-            key_indicators.extend(
-                ind for ind in indicators if ind["database"] == db_name
-            )
+        keywords = self._extract_keywords(research_topic)
+        seen_ind_keys: set[str] = set()
+        for kw in keywords:
+            indicators = self.search_indicators(kw, limit=10)
+            for ind in indicators:
+                ind_key = f"{ind.get('indicator', '')}-{ind.get('database', '')}"
+                if ind_key not in seen_ind_keys:
+                    seen_ind_keys.add(ind_key)
+                    key_indicators.append(ind)
 
         # 4. 构建 API 调用方案
         api_calls = self._build_api_calls(databases[:3])

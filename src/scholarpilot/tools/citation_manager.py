@@ -150,27 +150,50 @@ _ZH_EN_TOPIC_MAP: dict[str, list[str]] = {
     "数字化转型": ["digital transformation"],
 }
 
-# 离题领域惩罚词（跨主题通用，不针对特定研究主题）
-# 出现这些词的论文与研究主题不相关的概率极高
-_OFF_TOPIC_DOMAIN_WORDS: frozenset[str] = frozenset({
-    # 医学临床
-    "tuberculosis", "mycobacterium", "covid-19", "covid19", "coronavirus",
+# ===== 统一不相关主题安全网 =====
+# 此常量合并了原 _OFF_TOPIC_DOMAIN_WORDS（TRSS 离题惩罚词）、
+# _is_irrelevant_paper 中的 _legacy_blocklist（遗留黑名单）以及
+# search.py 中的 _IRRELEVANT_TOPIC_BLOCKLIST 三处重复定义。
+#
+# 注意：此安全网是语义过滤器（SemanticRelevanceFilter）的补充兜底，
+# 主题相关性判断主要依赖嵌入语义相似度，此列表仅处理明显跨域噪声。
+# TODO: 在语义过滤稳定运行后移除此安全网
+_IRRELEVANT_DOMAIN_WORDS: frozenset[str] = frozenset({
+    # 医学/疫情类
+    "tuberculosis", "mycobacterium", "mycobacterium tuberculosis",
+    "covid-19", "covid19", "coronavirus",
     "patient", "clinical", "diagnosis", "treatment", "symptom",
     "mortality", "incidence", "prevalence", "antibiotic", "antiviral",
-    "antituberculosis", "drug resistance", "pharmaceutical",
-    "临床", "患者", "诊断", "治疗", "症状", "死亡率", "发病率",
-    # 农业生物
-    "crop", "harvest", "livestock", "pesticide", "safflower",
-    "采摘", "农作物", "畜牧业", "农药",
+    "antituberculosis", "drug resistance", "drug resistance in",
+    "pharmaceutical", "pharmaceutical innovation",
+    "新冠", "疫情", "肺炎", "结核", "耐药",
+    "临床", "临床特征", "临床分析", "心理反应",
+    "患者", "诊断", "治疗", "症状", "死亡率", "发病率",
+    "药物创新",
+    # 农业/机器人类
+    "crop", "harvest", "harvest robot", "livestock", "pesticide", "safflower",
+    "采摘", "采摘机器人", "农作物", "畜牧业", "农药",
+    "红花", "农业机器人",
     # 旅游业
     "tourism", "hotel", "hospitality",
     "旅游", "酒店", "餐饮",
+    "医疗旅游", "medical tourism", "文化旅游标准化",
     # 纯机器学习技术（非应用）
     "neural architecture", "hyperparameter", "benchmark dataset",
     "image classification", "object detection",
-    # 国际关系/政治
+    # 国际关系/政治类
     "axis of allies", "us-japan alliance", "geopolitic",
+    "antitrust interoperability",
+    # 其他噪声
+    "data security and privacy protection", "ctrip",
+    "endogenous knowledge spillover",
 })
+
+# 离题领域惩罚词（跨主题通用，不针对特定研究主题）
+# 出现这些词的论文与研究主题不相关的概率极高
+# 向后兼容别名：引用统一常量 _IRRELEVANT_DOMAIN_WORDS
+# TODO: 在语义过滤稳定运行后移除此安全网
+_OFF_TOPIC_DOMAIN_WORDS: frozenset[str] = _IRRELEVANT_DOMAIN_WORDS
 
 # TRSS 最低相关性阈值：低于此值的论文将被过滤
 _MIN_TOPIC_RELEVANCE: float = 0.10
@@ -312,6 +335,564 @@ def _is_irrelevant_paper(
     return False
 
 
+# ===== 语义嵌入相关性过滤器（第三代方案）=====
+# 基于智谱 embedding-3 模型，将论文和研究主题编码为高维向量，
+# 通过余弦相似度判断语义相关性，从根本上解决黑名单/关键词匹配的局限性。
+# 降级策略：API不可用时自动回退到TRSS关键词匹配。
+
+class SemanticRelevanceFilter:
+    """基于嵌入语义相似度的文献相关性过滤器.
+
+    使用智谱 embedding-3 模型将研究主题和论文编码为向量，
+    通过余弦相似度判断相关性，从根本上解决黑名单/关键词匹配的局限性：
+    - 语义级理解：同义不同形也能匹配（如"信息化建设"≈"数字化转型"）
+    - 零维护：不需要手动维护任何词表或黑名单
+    - 自动泛化：适配任何研究主题
+    - 跨语言：embedding-3 支持中英多语言
+
+    降级策略：API不可用时自动回退到TRSS关键词匹配。
+    """
+
+    # 类级缓存：主题文本 → 向量
+    _topic_cache: dict[str, list[float]] = {}
+    # 类级缓存：论文文本哈希 → 向量
+    _paper_cache: dict[str, list[float]] = {}
+    # API可用性标记（None=未检测, True/False=已检测）
+    _api_available: bool | None = None
+
+    # 默认相似度阈值：低于此值的论文被判定为不相关
+    DEFAULT_THRESHOLD: float = 0.35
+    # 检索阶段宽松阈值（只过滤最不相关的）
+    SEARCH_THRESHOLD: float = 0.28
+    # 最终过滤阶段严格阈值（考虑很多Citation只有标题没有摘要，适当降低）
+    FINAL_THRESHOLD: float = 0.33
+
+    def __init__(
+        self,
+        api_key: str = "",
+        api_base: str = "https://open.bigmodel.cn/api/paas/v4/",
+        model: str = "embedding-3",
+    ) -> None:
+        self.api_key = api_key
+        self.api_base = api_base
+        self.model = model
+
+    async def _get_embedding(self, text: str) -> list[float] | None:
+        """获取单条文本的嵌入向量，失败返回None."""
+        cache_key = text[:500]
+        if cache_key in self._topic_cache:
+            return self._topic_cache[cache_key]
+
+        try:
+            import litellm
+            litellm.model_cost_default_url = ""
+            response = await litellm.aembedding(
+                model=f"openai/{self.model}",
+                input=[text[:2000]],  # 截断超长文本
+                api_key=self.api_key,
+                api_base=self.api_base,
+            )
+            vec = response.data[0]["embedding"]
+            self._topic_cache[cache_key] = vec
+            self._api_available = True
+            return vec
+        except Exception as e:
+            logger.warning(f"Embedding API调用失败: {e}")
+            self._api_available = False
+            return None
+
+    async def _get_embeddings_batch(
+        self, texts: list[str]
+    ) -> list[list[float] | None]:
+        """批量获取嵌入向量，减少API调用次数."""
+        results: list[list[float] | None] = [None] * len(texts)
+        batch_size = 32  # 智谱API每批最多支持较多条目，32条平衡速度和可靠性
+
+        # 先查缓存
+        uncached_indices: list[int] = []
+        uncached_texts: list[str] = []
+        for i, text in enumerate(texts):
+            cache_key = text[:500]
+            if cache_key in self._paper_cache:
+                results[i] = self._paper_cache[cache_key]
+            else:
+                uncached_indices.append(i)
+                uncached_texts.append(cache_key)
+
+        if not uncached_texts:
+            return results
+
+        # 批量获取未缓存的
+        for start in range(0, len(uncached_texts), batch_size):
+            batch_texts = uncached_texts[start:start + batch_size]
+            batch_indices = uncached_indices[start:start + batch_size]
+            try:
+                import litellm
+                litellm.model_cost_default_url = ""
+                response = await litellm.aembedding(
+                    model=f"openai/{self.model}",
+                    input=[t[:2000] for t in batch_texts],
+                    api_key=self.api_key,
+                    api_base=self.api_base,
+                )
+                sorted_data = sorted(response.data, key=lambda x: x["index"])
+                for idx, data in zip(batch_indices, sorted_data):
+                    vec = data["embedding"]
+                    results[idx] = vec
+                    self._paper_cache[uncached_texts[
+                        uncached_indices.index(idx)
+                    ]] = vec
+                self._api_available = True
+            except Exception as e:
+                logger.warning(f"批量嵌入失败(batch {start}): {e}")
+                self._api_available = False
+
+        return results
+
+    @staticmethod
+    def _cosine_similarity(a: list[float], b: list[float]) -> float:
+        """计算余弦相似度."""
+        import math
+        dot = sum(x * y for x, y in zip(a, b))
+        norm_a = math.sqrt(sum(x * x for x in a))
+        norm_b = math.sqrt(sum(y * y for y in b))
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return round(dot / (norm_a * norm_b), 4)
+
+    async def compute_relevance_score(
+        self,
+        paper_title: str,
+        paper_abstract: str,
+        topic: str,
+    ) -> float:
+        """计算单篇论文与研究主题的语义相关性评分（0.0-1.0）.
+
+        Args:
+            paper_title: 论文标题.
+            paper_abstract: 论文摘要.
+            topic: 研究主题.
+
+        Returns:
+            语义相似度评分 0.0-1.0，API不可用时返回-1.0表示降级.
+        """
+        if not topic or not paper_title:
+            return 0.0
+
+        # 获取主题向量
+        topic_vec = await self._get_embedding(topic)
+        if topic_vec is None:
+            return -1.0  # 降级标记
+
+        # 获取论文向量
+        paper_text = f"{paper_title} {paper_abstract}"[:2000]
+        paper_vec = await self._get_embedding(paper_text)
+        if paper_vec is None:
+            return -1.0
+
+        return self._cosine_similarity(topic_vec, paper_vec)
+
+    async def filter_papers(
+        self,
+        papers: list,
+        topic: str,
+        threshold: float | None = None,
+    ) -> tuple[list, list, str]:
+        """过滤不相关论文（语义嵌入版）.
+
+        使用嵌入语义相似度替代黑名单/关键词匹配，
+        从根本上解决文献相关性过滤问题。
+
+        降级策略：如果 embedding API 不可用，
+        自动回退到 TRSS 关键词匹配（_is_irrelevant_paper）。
+
+        Args:
+            papers: 论文列表（需有 title 和 abstract 属性）.
+            topic: 研究主题.
+            threshold: 相似度阈值，None 则使用 DEFAULT_THRESHOLD.
+
+        Returns:
+            (kept_papers, filtered_papers, method):
+            - kept_papers: 保留的论文
+            - filtered_papers: 被过滤的论文
+            - method: "semantic"（语义过滤）或 "trss_fallback"（降级）
+        """
+        if not papers or not topic:
+            return papers, [], "none"
+
+        if threshold is None:
+            threshold = self.DEFAULT_THRESHOLD
+
+        # 获取主题向量
+        topic_vec = await self._get_embedding(topic)
+        if topic_vec is None:
+            # API不可用，降级到TRSS
+            logger.info("Embedding API不可用，降级到TRSS关键词过滤")
+            kept, filtered = self._fallback_trss(papers, topic)
+            return kept, filtered, "trss_fallback"
+
+        # 准备论文文本
+        paper_texts = []
+        for p in papers:
+            title = getattr(p, "title", "") or ""
+            abstract = getattr(p, "abstract", "") or ""
+            paper_texts.append(f"{title} {abstract}"[:2000])
+
+        # 批量获取论文向量
+        paper_vecs = await self._get_embeddings_batch(paper_texts)
+
+        # 计算所有论文的相似度
+        scored: list[tuple[float, object]] = []
+        for paper, vec in zip(papers, paper_vecs):
+            if vec is None:
+                # 单篇获取失败，保留（保守策略），相似度记为1.0
+                scored.append((1.0, paper))
+                continue
+            sim = self._cosine_similarity(topic_vec, vec)
+            scored.append((sim, paper))
+
+        # 过滤 + 保护机制：过滤后数量过少时自动降低阈值重试
+        # 避免阈值过高导致过度过滤（很多Citation只有标题没有摘要，相似度偏低）
+        min_keep = max(5, len(papers) // 4)  # 至少保留25%或5篇
+        current_threshold = threshold
+        min_threshold = 0.15  # 最低阈值底线
+
+        while True:
+            kept = [p for sim, p in scored if sim >= current_threshold]
+            filtered = [p for sim, p in scored if sim < current_threshold]
+
+            if len(kept) >= min_keep or current_threshold <= min_threshold:
+                break
+
+            # 降低阈值重试
+            current_threshold = max(
+                min_threshold,
+                current_threshold - 0.05,
+            )
+
+        logger.info(
+            "语义过滤完成: 保留%d篇, 过滤%d篇 (阈值=%.2f→%.2f)",
+            len(kept), len(filtered), threshold, current_threshold,
+        )
+        return kept, filtered, "semantic"
+
+    def _fallback_trss(
+        self, papers: list, topic: str
+    ) -> tuple[list, list]:
+        """降级策略：使用TRSS关键词匹配."""
+        kept: list = []
+        filtered: list = []
+        for p in papers:
+            title = getattr(p, "title", "") or ""
+            abstract = getattr(p, "abstract", "") or ""
+            if _is_irrelevant_paper(title, abstract, topic):
+                filtered.append(p)
+            else:
+                kept.append(p)
+        return kept, filtered
+
+    @classmethod
+    def is_api_available(cls) -> bool:
+        """检查embedding API是否在之前的调用中成功过."""
+        return cls._api_available is True
+
+
+# 全局单例（延迟初始化，首次使用时读取配置）
+_semantic_filter: SemanticRelevanceFilter | None = None
+
+
+def get_semantic_filter() -> SemanticRelevanceFilter:
+    """获取全局 SemanticRelevanceFilter 单例.
+
+    从 ScholarPilot 配置中读取智谱 API Key 和 api_base。
+    如果未配置 API Key，返回一个不可用的实例（后续自动降级到TRSS）。
+    """
+    global _semantic_filter
+    if _semantic_filter is not None:
+        return _semantic_filter
+
+    try:
+        from scholarpilot.config import Settings
+        config = Settings()
+        _semantic_filter = SemanticRelevanceFilter(
+            api_key=config.zhipu_api_key,
+            api_base=config.zhipu_api_base,
+        )
+    except Exception:
+        # 配置不可用，创建空实例（会自动降级）
+        _semantic_filter = SemanticRelevanceFilter()
+
+    return _semantic_filter
+
+
+# ===== Cross-Encoder 精排器（第四代：两阶段架构）=====
+# 在 Bi-Encoder 初筛后，使用 LLM-as-a-Judge 或本地 BGE-Reranker 进行精排。
+# Bi-Encoder 快但粗（独立编码），Cross-Encoder 慢但精（联合编码）。
+# 业界标准 RAG 两阶段架构：召回(Bi-Encoder) → 精排(Cross-Encoder)。
+
+class CrossEncoderReranker:
+    """Cross-Encoder 精排器：对 Bi-Encoder 初筛后的论文进行精确重排序.
+
+    两阶段架构的第二阶段：
+    1. Bi-Encoder（embedding-3）快速初筛，移除明显不相关的论文
+    2. Cross-Encoder 精排，对保留的论文进行精确的相关性排序
+
+    实现策略（优先级递减）：
+    1. 本地 BGE-Reranker-v2-m3（sentence_transformers.CrossEncoder）
+       - 精度最高，全交互注意力机制
+       - 需要 sentence-transformers + torch（首次使用自动下载模型）
+    2. LLM-as-a-Judge（GLM-4 API）
+       - 无需额外依赖，使用已有 API
+       - 将主题+论文拼接后让 LLM 评分，本质等同于 Cross-Encoder
+    3. 跳过精排（降级到 Bi-Encoder 排序）
+
+    精排的作用：
+    - 重排序：将最相关的论文排到前面（影响引用优先级和文献池截取）
+    - 精筛：移除 Bi-Encoder 误保留的边界不相关论文
+    """
+
+    # LLM-as-a-Judge 的批量大小（每批送入 LLM 评分的论文数）
+    LLM_BATCH_SIZE: int = 10
+    # 精排后移除底部的比例（最低相关的 N% 被移除）
+    BOTTOM_DROP_RATIO: float = 0.10
+    # LLM 评分低于此值的论文被移除（只移除明确不相关的 1-2 分）
+    LLM_SCORE_THRESHOLD: float = 2.0  # LLM 评分范围 1-5
+
+    def __init__(self) -> None:
+        self._local_reranker = None  # sentence_transformers.CrossEncoder 实例
+        self._local_available: bool | None = None  # None=未检测
+        self._llm = None  # LLM 实例（延迟初始化）
+
+    def _try_init_local_reranker(self) -> bool:
+        """尝试初始化本地 BGE-Reranker-v2-m3 模型.
+
+        Returns:
+            True 如果本地模型可用.
+        """
+        if self._local_available is not None:
+            return self._local_available
+
+        try:
+            # 设置 HuggingFace 镜像（中国用户加速）
+            import os
+            if "HF_ENDPOINT" not in os.environ:
+                os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
+            from sentence_transformers import CrossEncoder
+            self._local_reranker = CrossEncoder(
+                "BAAI/bge-reranker-v2-m3",
+                max_length=512,
+            )
+            self._local_available = True
+            logger.info("本地 BGE-Reranker-v2-m3 加载成功")
+            return True
+        except ImportError:
+            logger.info(
+                "sentence-transformers 未安装，Cross-Encoder 降级到 LLM-as-a-Judge"
+            )
+            self._local_available = False
+            return False
+        except Exception as e:
+            logger.warning(f"本地 BGE-Reranker 加载失败: {e}")
+            self._local_available = False
+            return False
+
+    def _score_local(
+        self, topic: str, paper_texts: list[str],
+    ) -> list[float]:
+        """使用本地 BGE-Reranker 评分.
+
+        Args:
+            topic: 研究主题.
+            paper_texts: 论文文本列表（标题+摘要）.
+
+        Returns:
+            相关性评分列表（0-1，越高越相关）.
+        """
+        if not self._local_reranker:
+            return [0.5] * len(paper_texts)
+
+        # Cross-Encoder 需要 (query, document) 对
+        pairs = [(topic, text[:512]) for text in paper_texts]
+        raw_scores = self._local_reranker.predict(pairs)
+
+        # BGE-Reranker 输出 logits，通过 sigmoid 映射到 0-1
+        import math
+        return [1.0 / (1.0 + math.exp(-s)) for s in raw_scores]
+
+    async def _score_llm(
+        self, topic: str, papers: list, batch_size: int = 10,
+    ) -> list[float]:
+        """使用 LLM-as-a-Judge 评分（GLM-4）.
+
+        将研究主题和论文标题+摘要拼接后送入 LLM，
+        让 LLM 对每篇论文与研究主题的相关性打分（1-5分）。
+        这本质上等同于 Cross-Encoder 的联合编码机制。
+
+        Args:
+            topic: 研究主题.
+            papers: 论文列表.
+            batch_size: 每批送入 LLM 的论文数.
+
+        Returns:
+            相关性评分列表（1.0-5.0，越高越相关）.
+        """
+        if not self._llm:
+            try:
+                from scholarpilot.config import Settings
+                from scholarpilot.llm.gateway import LLMGateway
+                config = Settings()
+                self._llm = LLMGateway(config)
+            except Exception as e:
+                logger.warning(f"LLM 初始化失败，跳过精排: {e}")
+                return [5.0] * len(papers)  # 保守策略：全部保留
+
+        scores: list[float] = []
+        # 分批处理，每批 batch_size 篇
+        for start in range(0, len(papers), batch_size):
+            batch = papers[start:start + batch_size]
+            batch_scores = await self._score_llm_batch(topic, batch)
+            scores.extend(batch_scores)
+
+        return scores
+
+    async def _score_llm_batch(
+        self, topic: str, batch: list,
+    ) -> list[float]:
+        """单批 LLM 评分."""
+        # 构建论文列表文本
+        paper_lines: list[str] = []
+        for i, p in enumerate(batch, 1):
+            title = getattr(p, "title", "") or ""
+            abstract = getattr(p, "abstract", "") or ""
+            # 截断摘要，避免 prompt 过长
+            abstract_short = abstract[:200] + "..." if len(abstract) > 200 else abstract
+            paper_lines.append(f"[{i}] 标题: {title}\n摘要: {abstract_short}")
+
+        papers_text = "\n\n".join(paper_lines)
+
+        prompt = (
+            f"研究主题：{topic}\n\n"
+            f"请对以下{len(batch)}篇论文与研究主题的相关性进行评分（1-5分）。\n"
+            f"评分标准：\n"
+            f"5分 = 直接研究该主题\n"
+            f"4分 = 密切相关（相同变量/方法/对象）\n"
+            f"3分 = 间接相关（提供理论支撑或背景）\n"
+            f"2分 = 弱相关（仅个别关键词重叠）\n"
+            f"1分 = 不相关\n\n"
+            f"论文列表：\n{papers_text}\n\n"
+            f"请只输出评分，每行一个数字，格式如下：\n"
+            f"1: 5\n2: 4\n3: 1\n..."
+        )
+
+        try:
+            response = await self._llm.chat(
+                messages=[{"role": "user", "content": prompt}],
+                model="glm-4",
+                temperature=0.1,  # 低温度，确保评分稳定
+            )
+
+            # 解析评分
+            scores: list[float] = []
+            for i in range(len(batch)):
+                # 匹配 "N: score" 或 "N. score" 格式
+                import re
+                match = re.search(
+                    rf'{i + 1}\s*[:.]\s*([1-5])', response,
+                )
+                if match:
+                    scores.append(float(match.group(1)))
+                else:
+                    scores.append(5.0)  # 解析失败，保守保留
+
+            return scores
+        except Exception as e:
+            logger.warning(f"LLM 评分失败: {e}")
+            return [5.0] * len(batch)  # 失败时保守保留
+
+    async def rerank(
+        self,
+        papers: list,
+        topic: str,
+        drop_bottom: bool = True,
+    ) -> tuple[list, list, str]:
+        """对论文列表进行 Cross-Encoder 精排.
+
+        两阶段架构的第二阶段：在 Bi-Encoder 初筛后精排。
+
+        Args:
+            papers: Bi-Encoder 初筛后保留的论文列表.
+            topic: 研究主题.
+            drop_bottom: 是否移除最低相关的底部论文.
+
+        Returns:
+            (reranked_papers, dropped_papers, method):
+            - reranked_papers: 按相关性降序排列的论文
+            - dropped_papers: 被移除的底部论文
+            - method: "local_bge" / "llm_judge" / "skipped"
+        """
+        if not papers or not topic or len(papers) <= 3:
+            return papers, [], "skipped"
+
+        # 策略1：尝试本地 BGE-Reranker
+        if self._try_init_local_reranker():
+            paper_texts = []
+            for p in papers:
+                title = getattr(p, "title", "") or ""
+                abstract = getattr(p, "abstract", "") or ""
+                paper_texts.append(f"{title} {abstract}")
+
+            raw_scores = self._score_local(topic, paper_texts)
+            method = "local_bge"
+        else:
+            # 策略2：LLM-as-a-Judge
+            raw_scores = await self._score_llm(topic, papers)
+            method = "llm_judge"
+
+        # 按评分降序排列
+        scored = list(zip(raw_scores, papers))
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        # 移除底部最低相关的论文
+        dropped: list = []
+        if drop_bottom and len(scored) > 5:
+            # 本地模型用 0.3 阈值，LLM 用 3.0 阈值
+            if method == "local_bge":
+                threshold = 0.3  # sigmoid 后 0.3 以下移除
+            else:
+                threshold = self.LLM_SCORE_THRESHOLD
+
+            # 找到低于阈值的论文
+            kept_scored = []
+            for score, paper in scored:
+                if score < threshold and len(kept_scored) >= 5:
+                    dropped.append(paper)
+                else:
+                    kept_scored.append((score, paper))
+
+            scored = kept_scored
+
+        reranked = [p for _, p in scored]
+
+        logger.info(
+            "Cross-Encoder精排(%s): %d篇→%d篇 (移除%d篇)",
+            method, len(papers), len(reranked), len(dropped),
+        )
+        return reranked, dropped, method
+
+
+# 全局 Cross-Encoder 精排器单例
+_cross_encoder_reranker: CrossEncoderReranker | None = None
+
+
+def get_cross_encoder_reranker() -> CrossEncoderReranker:
+    """获取全局 CrossEncoderReranker 单例."""
+    global _cross_encoder_reranker
+    if _cross_encoder_reranker is None:
+        _cross_encoder_reranker = CrossEncoderReranker()
+    return _cross_encoder_reranker
+
+
 @dataclass
 class Citation:
     """单个引用条目."""
@@ -365,6 +946,37 @@ _COMMON_SURNAMES = set("张王李赵刘陈杨黄周吴徐孙朱马胡郭林何�
 _ORDINAL_CHARS = set("一二三四五六七八九十")
 
 
+# 非引用前缀词（出现在匹配前方的文本中时，说明不是引用而是正文叙述）
+_NON_CITATION_PREFIXES: set[str] = {
+    "根据", "参考", "按照", "遵循", "依据", "依照", "基于", "借鉴",
+    "来源于", "来自于", "引自", "转引", "参见", "详见", "参见",
+    "借鉴了", "参考了", "根据上述", "结合上述",
+    "分析上述", "观察上述", "从上述", "由上述",
+}
+
+# 常见非姓名双字组合（实际是正文短语被误提取为作者名）
+# 动态化改造：去重并新增更多非姓名组合（含3-4字结论性短语）
+_NON_NAME_TWO_CHAR: set[str] = {
+    "上述", "以下", "以上", "前述", "本研", "本节", "本章", "本文",
+    "由此", "据此", "综上", "如表", "如图", "见表", "见图", "如上",
+    "此外", "另外", "然而", "因此", "所以", "虽然", "尽管", "无论",
+    "反之", "否则", "而且", "并且", "以及", "或者", "还是",
+    "不仅", "不但", "而是", "即是", "便是", "正因", "故而", "从而",
+    "进而", "甚至", "尤其", "特别", "主要", "基本", "大致", "大约",
+    "截至", "迄今", "至今", "相较", "对比", "相对", "相比",
+    "各类", "各项", "各种", "各个", "各部", "各方", "各组", "各期",
+    "此期", "本期", "同期", "前期", "后期", "末期", "初期", "中期",
+    "同年", "次年", "近年", "往年", "常年",
+    "高企", "低迷", "走低", "走高", "攀升", "骤降", "暴涨", "暴跌",
+    "根据", "按照", "依据", "依照", "基于", "借鉴", "鉴于", "考虑",
+    "结合", "关于", "对于", "至于",
+    "由于", "沿着", "顺着", "随着", "伴着", "本着",
+    # 新增：常见正文结论性短语（3-4字，被误提取为作者名）
+    "由此可知", "综上所述", "由此可见", "总而言之",
+    "整体而言", "总体来看", "从而可知", "是以", "因而",
+}
+
+
 def _is_valid_zh_author(name: str, non_name_words: set[str]) -> bool:
     """检查中文字符串是否像真实作者名.
 
@@ -403,11 +1015,125 @@ def _is_valid_zh_author(name: str, non_name_words: set[str]) -> bool:
     if len(name) == 2 and name[0] in _COMMON_SURNAMES and name[1] in _ORDINAL_CHARS:
         return False
 
-    # 3. "姓+重复字"模式：如 张张、李李、王王（单字叠写，非真实姓名）
-    if len(name) == 2 and name[0] == name[1]:
+    # 3. "姓+重复字"模式：如 张张、李李、王王、张张张（叠写，非真实姓名）
+    # 动态化改造：扩展为3字叠字检测（如 张张张、李李李）
+    if len(name) in (2, 3) and len(set(name)) == 1:
+        return False
+
+    # 4. 常见非姓名双字组合（正文短语被误提取）
+    if name in _NON_NAME_TWO_CHAR:
+        return False
+
+    # 5. 以非姓名首字开头的检测
+    # 常见动词/介词/连词首字，不太可能作为姓氏
+    _unlikely_surname_starts = set("从由据凭鉴于考虑因所但而且并或则即若此其该某本被将把给向往朝为以按照遵循依据")
+    if len(name) >= 2 and name[0] in _unlikely_surname_starts:
+        # 但需要排除真实姓氏（如"从"姓、"方"姓等），只过滤明显非姓氏的
+        _definitely_not_surnames = set("从由据凭鉴虑因所但而且并或则即若此其该某本被将把给向往朝为以按遵循依据")
+        if name[0] in _definitely_not_surnames:
+            return False
+
+    # 6. 包含明显非姓名字符组合（如"分析"、"研究"、"结果"等嵌在名字中）
+    _embedded_non_name = {"分析", "研究", "结果", "表明", "说明", "发现",
+                          "数据", "样本", "模型", "回归", "系数", "变量",
+                          "假设", "效应", "机制", "理论", "方法", "水平",
+                          "显著", "相关", "影响", "因素", "指标", "衡量"}
+    for word in _embedded_non_name:
+        if word in name:
+            return False
+
+    # 7. "姓+数字"模式：如 张三1、李四2（姓氏 + 阿拉伯数字，LLM假名）
+    # 动态化改造：检测姓氏后跟数字的假名模式
+    if name[0] in _COMMON_SURNAMES and re.search(r'\d', name[1:]):
+        return False
+
+    # 8. "姓+英文"模式：如 王A、李test（姓氏 + 英文字母，LLM假名）
+    # 动态化改造：检测姓氏后跟英文字母的假名模式
+    if name[0] in _COMMON_SURNAMES and re.search(r'[A-Za-z]', name[1:]):
         return False
 
     return True
+
+
+def _detect_suspicious_authors_by_frequency(
+    text: str,
+    reference_authors: set[str],
+) -> set[str]:
+    """基于频率的假名检测：检测在正文中以"XX（年份）"格式出现但不在参考文献列表中的作者名.
+
+   如果一个作者名在正文中出现的上下文都是"XX（年份）"格式
+    但从未出现在参考文献列表中，标记为可疑。
+
+    Args:
+        text: 论文正文文本
+        reference_authors: 参考文献列表中的所有作者名集合
+
+    Returns:
+        可疑作者名集合（在正文中被引用但不在参考文献中的作者名）
+    """
+    if not text or not reference_authors:
+        return set()
+
+    suspicious: set[str] = set()
+    # 匹配正文中的"作者（年份）"格式引用
+    pattern = re.compile(
+        r'([\u4e00-\u9fff]{2,4}(?:[和与][\u4e00-\u9fff]{2,4})*(?:等)?)\s*[（(]\s*((?:19|20)\d{2})\s*[）)]'
+    )
+
+    # 收集正文中所有被引用的作者名
+    cited_authors: set[str] = set()
+    for m in pattern.finditer(text):
+        author_str = m.group(1)
+        # 拆分多个作者（如"张三和李四"）
+        parts = re.split(r'[和与]', author_str.replace('等', ''))
+        for part in parts:
+            part = part.strip()
+            if part and len(part) >= 2:
+                cited_authors.add(part)
+
+    # 检查每个被引用的作者名是否出现在参考文献列表中
+    for author in cited_authors:
+        # 如果作者名不在参考文献列表中，标记为可疑
+        if author not in reference_authors:
+            suspicious.add(author)
+
+    return suspicious
+
+
+def _has_non_citation_prefix(text: str, match_start: int) -> bool:
+    """检查匹配位置前方是否有非引用前缀词.
+
+    Args:
+        text: 原始文本
+        match_start: 匹配在文本中的起始位置
+
+    Returns:
+        True 如果前方有非引用前缀词（应跳过此匹配）
+    """
+    # 取匹配前方最多10个字符作为上下文
+    context_start = max(0, match_start - 10)
+    preceding = text[context_start:match_start]
+
+    for prefix in _NON_CITATION_PREFIXES:
+        if preceding.endswith(prefix):
+            return True
+
+    return False
+
+
+def _clean_html_tags(text: str) -> str:
+    """清理文本中的HTML标签（如搜索结果高亮标签）.
+
+    Args:
+        text: 可能包含HTML标签的文本
+
+    Returns:
+        清理后的纯文本
+    """
+    if not text:
+        return text
+    # 移除所有HTML标签
+    return re.sub(r'<[^>]+>', '', text)
 
 
 def extract_citations_from_text(text: str) -> list[Citation]:
@@ -502,6 +1228,9 @@ def extract_citations_from_text(text: str) -> list[Citation]:
         # 黑名单过滤
         if authors_str.strip() in ZH_BLACKLIST:
             continue
+        # 前缀上下文过滤：检查匹配前方是否有非引用前缀词
+        if _has_non_citation_prefix(text, m.start()):
+            continue
         key = f"{authors_str}_{year}"
         if key not in seen:
             seen.add(key)
@@ -530,6 +1259,9 @@ def extract_citations_from_text(text: str) -> list[Citation]:
         authors_str = m.group(1)
         year = m.group(2)
         if authors_str.strip() in ZH_BLACKLIST:
+            continue
+        # 前缀上下文过滤
+        if _has_non_citation_prefix(text, m.start()):
             continue
         key = f"{authors_str}_{year}"
         if key not in seen:
@@ -565,14 +1297,249 @@ def extract_citations_from_text(text: str) -> list[Citation]:
                             for a in authors_clean if a.strip() and a.strip() != "et al."]
             if has_et_al and authors_clean:
                 authors_clean[-1] = authors_clean[-1] + " et al."
+            # 标准化 raw 引用文本：将 和/与 替换为 &
+            normalized_raw = raw
+            if "和" in raw or "与" in raw:
+                # 替换中英文连接词为标准 &
+                normalized_raw = re.sub(
+                    r'([A-Za-z]+)\s*(?:和|与)\s*([A-Za-z])',
+                    r'\1 & \2',
+                    raw,
+                )
+                # 将中文括号替换为英文括号
+                normalized_raw = normalized_raw.replace("（", " (").replace("）", ")")
             citations.append(Citation(
-                raw=raw,
+                raw=normalized_raw,
                 authors=authors_clean,
                 year=year,
                 language="en",
             ))
 
     return citations
+
+
+# ===== 经典方法论文献检测与自动补充 =====
+
+# 常见经典方法论引用缓存（LLM 在论文中常引用但文献池中可能没有的方法论文献）
+# 格式: (作者姓氏, 年份, 完整作者名, 标题, 期刊, DOI)
+#
+# 注意：此列表为加速缓存，不是主要检测机制。主要机制是 supplement_unverified_english_citations()
+# 函数，它通过 OpenAlex/Semantic Scholar API 动态检索任何未验证的英文引用。
+# 此缓存仅覆盖最常被引用的15篇经典方法论文献，避免对这些高频文献重复发起API请求。
+# 对于不在此列表的经典方法论引用（如 Hansen 1982 GMM、Newey & West 1987、Hausman 1978 等），
+# 动态补充函数会自动处理。
+_CLASSIC_METHODOLOGY_PAPERS: list[dict] = [
+    {
+        "authors": ["Rogers", "E. M."],
+        "year": "2003",
+        "title": "Diffusion of Innovations (5th Edition)",
+        "journal": "Free Press",
+        "doi": "",
+        "first_author_surname": "Rogers",
+    },
+    {
+        "authors": ["Kaplan", "S. N.", "Zingales", "L."],
+        "year": "1997",
+        "title": "Do Investment-Cash Flow Sensitivities Provide Useful Measures of Financing Constraints?",
+        "journal": "The Quarterly Journal of Economics",
+        "doi": "10.1162/003355397555163",
+        "first_author_surname": "Kaplan",
+    },
+    {
+        "authors": ["Baron", "R. M.", "Kenny", "D. A."],
+        "year": "1986",
+        "title": "The Moderator-Mediator Variable Distinction in Social Psychological Research",
+        "journal": "Journal of Personality and Social Psychology",
+        "doi": "10.1037/0022-3514.51.6.1173",
+        "first_author_surname": "Baron",
+    },
+    {
+        "authors": ["Heckman", "J. J."],
+        "year": "1979",
+        "title": "Sample Selection Bias as a Specification Error",
+        "journal": "Econometrica",
+        "doi": "10.2307/1912352",
+        "first_author_surname": "Heckman",
+    },
+    {
+        "authors": ["Wooldridge", "J. M."],
+        "year": "2010",
+        "title": "Econometric Analysis of Cross Section and Panel Data (2nd Edition)",
+        "journal": "MIT Press",
+        "doi": "",
+        "first_author_surname": "Wooldridge",
+    },
+    {
+        "authors": ["Cohen", "J."],
+        "year": "1988",
+        "title": "Statistical Power Analysis for the Behavioral Sciences (2nd Edition)",
+        "journal": "Lawrence Erlbaum Associates",
+        "doi": "",
+        "first_author_surname": "Cohen",
+    },
+    {
+        "authors": ["Sobel", "M. E."],
+        "year": "1982",
+        "title": "Asymptotic Confidence Intervals for Indirect Effects in Structural Equation Models",
+        "journal": "Sociological Methodology",
+        "doi": "10.2307/270723",
+        "first_author_surname": "Sobel",
+    },
+    {
+        "authors": ["Arellano", "M.", "Bond", "S."],
+        "year": "1991",
+        "title": "Some Tests of Specification for Panel Data: Monte Carlo Evidence and an Application to Employment Equations",
+        "journal": "The Review of Economic Studies",
+        "doi": "10.2307/2297968",
+        "first_author_surname": "Arellano",
+    },
+    {
+        "authors": ["Blundell", "R.", "Bond", "S."],
+        "year": "1998",
+        "title": "Initial Conditions and Moment Restrictions in Dynamic Panel Data Models",
+        "journal": "Journal of Econometrics",
+        "doi": "10.1016/S0304-4076(98)00009-8",
+        "first_author_surname": "Blundell",
+    },
+    {
+        "authors": ["White", "H."],
+        "year": "1980",
+        "title": "A Heteroskedasticity-Consistent Covariance Matrix Estimator and a Direct Test for Heteroskedasticity",
+        "journal": "Econometrica",
+        "doi": "10.2307/1912934",
+        "first_author_surname": "White",
+    },
+    {
+        "authors": ["MacKinnon", "J. G.", "White", "H."],
+        "year": "1985",
+        "title": "Some Heteroskedasticity-Consistent Covariance Matrix Estimators with Improved Finite Sample Properties",
+        "journal": "Journal of Econometrics",
+        "doi": "10.1016/0304-4076(85)90158-7",
+        "first_author_surname": "MacKinnon",
+    },
+    {
+        "authors": ["Tobin", "J."],
+        "year": "1958",
+        "title": "Estimation of Relationships for Limited Dependent Variables",
+        "journal": "Econometrica",
+        "doi": "10.2307/1907382",
+        "first_author_surname": "Tobin",
+    },
+    {
+        "authors": ["Heckman", "J. J.", "Ichimura", "H.", "Todd", "P."],
+        "year": "1998",
+        "title": "Matching as an Econometric Evaluation Estimator",
+        "journal": "The Review of Economic Studies",
+        "doi": "10.1111/1467-947X.00041",
+        "first_author_surname": "Heckman",
+    },
+    {
+        "authors": ["Rosenbaum", "P. R.", "Rubin", "D. B."],
+        "year": "1983",
+        "title": "The Central Role of the Propensity Score in Observational Studies for Causal Effects",
+        "journal": "Biometrika",
+        "doi": "10.1093/biomet/70.1.41",
+        "first_author_surname": "Rosenbaum",
+    },
+    {
+        "authors": ["Angrist", "J. D.", "Imbens", "G. W.", "Rubin", "D. B."],
+        "year": "1996",
+        "title": "Identification of Causal Effects Using Instrumental Variables",
+        "journal": "Journal of the American Statistical Association",
+        "doi": "10.1080/01621459.1996.10476902",
+        "first_author_surname": "Angrist",
+    },
+]
+
+
+def detect_classic_methodology_citations(
+    full_text: str,
+    existing_citations: list[Citation] | None = None,
+) -> list[Citation]:
+    """检测正文中引用的经典方法论文献，并构建已验证的 Citation 对象.
+
+    LLM 在写论文时常引用经典方法论（如 Rogers 2003 创新扩散理论、
+    Kaplan & Zingales 1997 融资约束 KZ 指数、Baron & Kenny 1986 中介效应），
+    这些文献通常不在 Phase 2 文献池中。此函数自动检测这些引用并补充。
+
+    Args:
+        full_text: 论文正文文本.
+        existing_citations: 已提取的引用列表（用于去重）.
+
+    Returns:
+        检测到的经典方法论文献 Citation 列表（已标记 verified=True）.
+    """
+    # 收集已有引用键
+    seen_keys: set[str] = set()
+    if existing_citations:
+        for c in existing_citations:
+            if c.authors:
+                # 用第一作者姓氏+年份作为去重键
+                surname = c.authors[0].split()[-1] if " " in c.authors[0] else c.authors[0]
+                seen_keys.add(f"{surname.lower()}_{c.year}")
+
+    detected: list[Citation] = []
+
+    for paper in _CLASSIC_METHODOLOGY_PAPERS:
+        surname = paper["first_author_surname"]
+        year = paper["year"]
+
+        # 去重检查
+        dedup_key = f"{surname.lower()}_{year}"
+        if dedup_key in seen_keys:
+            continue
+
+        # 在正文中搜索 姓氏+年份 模式
+        # 支持: Rogers（2003）, Rogers (2003), Rogers, 2003, Rogers 2003
+        # 支持: Kaplan和Zingales（1997）, Baron & Kenny (1986) 等
+        patterns = [
+            rf'{surname}\s*[（(]\s*{year}\s*[）)]',
+            rf'{surname}\s*[，,]\s*{year}',
+            rf'{surname}\s+{year}',
+            # 姓氏后可能跟其他作者名再跟年份（如 Kaplan和Zingales（1997））
+            rf'{surname}\s*(?:和|与|&|and)\s*[A-Z][a-z]+.*?[（(]\s*{year}\s*[）)]',
+            rf'{surname}\s+[A-Z]\.\s*[A-Z][a-z]+.*?[（(]\s*{year}\s*[）)]',
+        ]
+
+        is_cited = False
+        for pat in patterns:
+            if re.search(pat, full_text, re.IGNORECASE):
+                is_cited = True
+                break
+
+        if not is_cited:
+            continue
+
+        # 构建 Citation
+        authors = paper["authors"]
+        # 构建原始引用文本
+        if len(authors) == 1:
+            raw = f"{authors[0]} ({year})"
+        elif len(authors) == 2:
+            raw = f"{authors[0]} & {authors[1]} ({year})"
+        else:
+            raw = f"{authors[0]} et al. ({year})"
+
+        citation = Citation(
+            raw=raw,
+            authors=authors,
+            year=year,
+            language="en",
+            title=paper["title"],
+            journal=paper["journal"],
+            doi=paper.get("doi", ""),
+            verified=True,
+            source="classic_methodology",
+        )
+
+        detected.append(citation)
+        seen_keys.add(dedup_key)
+        logger.info("检测到经典方法论文献: %s (%s)", surname, year)
+
+    if detected:
+        logger.info("经典方法论文献检测: 补充 %d 篇", len(detected))
+
+    return detected
 
 
 def build_citations_from_pool(
@@ -787,6 +1754,7 @@ def replace_fake_authors_in_text(
     扫描正文中所有"作者（年份）"格式的中文引用，检测作者名是否为假名
     （张三/李四/王五等），若为假名则从文献池中选取年份匹配且主题相关的
     真实论文替换。同时清除"（未知，2026）""（参考文献）"等异常引用。
+    同时修正中英文混排引用格式（如 "Li和Gao et al.(2023)" → "Li & Gao et al. (2023)"）。
 
     Args:
         text: 论文正文文本.
@@ -798,6 +1766,28 @@ def replace_fake_authors_in_text(
     """
     if not text:
         return text
+
+    # 0. 修正中英文混排引用格式
+    # "Author和Author（Year）" → "Author & Author (Year)"
+    # "Author与Author（Year）" → "Author & Author (Year)"
+    # "Author和Author et al.(Year)" → "Author & Author et al. (Year)"
+    text = re.sub(
+        r'([A-Z][a-z]+)\s*(?:和|与)\s*([A-Z][a-z]+(?:\s+et\s+al\.)?)\s*[（(]\s*((?:19|20)\d{2})\s*[）)]',
+        r'\1 & \2 (\3)',
+        text,
+    )
+    # "Author和Author，Year" → "Author & Author, Year"
+    text = re.sub(
+        r'([A-Z][a-z]+)\s*(?:和|与)\s*([A-Z][a-z]+(?:\s+et\s+al\.)?)\s*[，,]\s*((?:19|20)\d{2})',
+        r'\1 & \2, \3',
+        text,
+    )
+    # "Li和Gao et al." → "Li & Gao et al."（无年份的引用片段）
+    text = re.sub(
+        r'([A-Z][a-z]+)\s*(?:和|与)\s*([A-Z][a-z]+\s+et\s+al\.?)',
+        r'\1 & \2',
+        text,
+    )
 
     non_name_words: set[str] = set()
     topic_kw_set = set(topic_keywords.split()) if topic_keywords else set()
@@ -833,6 +1823,17 @@ def replace_fake_authors_in_text(
         if year:
             pool_by_year.setdefault(year, []).append(paper)
 
+    # 动态化改造：基于频率的假名检测
+    # 收集参考文献池中所有作者名，用于检测正文中的可疑引用
+    _reference_authors: set[str] = set()
+    for paper in literature_pool:
+        if not isinstance(paper, dict):
+            continue
+        for author in paper.get("authors", []):
+            if author:
+                _reference_authors.add(author.strip())
+    _suspicious_authors = _detect_suspicious_authors_by_frequency(text, _reference_authors)
+
     # 从后往前替换避免偏移问题
     replacements: list[tuple[int, int, str]] = []
     for match in matches:
@@ -850,6 +1851,11 @@ def replace_fake_authors_in_text(
                 is_fake = True
                 break
             if part in _FAKE_NAME_PATTERNS:
+                is_fake = True
+                break
+            # 动态化改造：基于频率的假名检测
+            # 作者名在正文中被引用但从未出现在参考文献列表中
+            if part in _suspicious_authors:
                 is_fake = True
                 break
 
@@ -1190,6 +2196,110 @@ async def verify_citation(
     return citation
 
 
+async def supplement_unverified_english_citations(
+    citations: list[Citation],
+    openalex_engine=None,
+    ss_engine=None,
+) -> list[Citation]:
+    """对未验证的英文引用进行动态补充检索.
+
+    当 verify_citation 无法在文献池或API中找到引用时，此函数作为最后兜底：
+    仅用作者姓名+年份搜索 OpenAlex/Semantic Scholar，不加主题关键词。
+    适用于经典方法论文献（如 Hansen 1982、Newey & West 1987 等），
+    这些文献可能不在文献池中但确实被正文引用。
+
+    这是动态智能检测，替代硬编码列表，适用于任何研究主题。
+
+    Args:
+        citations: 引用列表（原地修改未验证的引用）.
+        openalex_engine: OpenAlex 引擎实例.
+        ss_engine: Semantic Scholar 引擎实例.
+
+    Returns:
+        更新后的引用列表.
+    """
+    unverified_en = [
+        c for c in citations
+        if not c.verified and c.language == "en" and c.authors
+    ]
+    if not unverified_en:
+        return citations
+
+    supplemented = 0
+    for citation in unverified_en:
+        first_author = citation.authors[0]
+        first_author_clean = first_author.replace(" et al.", "").replace(" et al", "").strip()
+        surname = first_author_clean.split()[-1] if " " in first_author_clean else first_author_clean
+
+        if not surname or len(surname) < 2:
+            continue
+
+        # OpenAlex 搜索：仅用作者名+年份，不加主题词
+        if openalex_engine:
+            try:
+                result = await openalex_engine.search(
+                    query=first_author_clean,
+                    limit=5,
+                    year_start=citation.year,
+                    year_end=citation.year,
+                )
+                if result.papers:
+                    for paper in result.papers:
+                        if _year_match(paper.year, citation.year):
+                            author_match = _match_any_author(first_author_clean, paper.authors)
+                            if author_match or not paper.authors:
+                                citation.verified = True
+                                citation.source = "openalex_supplement"
+                                citation.title = paper.title
+                                citation.journal = paper.primary_venue or ""
+                                citation.doi = paper.doi
+                                citation.abstract = paper.abstract
+                                citation.volume = paper.biblio_volume
+                                citation.issue = paper.biblio_issue
+                                citation.pages = f"{paper.biblio_first_page}-{paper.biblio_last_page}".strip("-")
+                                if paper.authors:
+                                    citation.authors = paper.authors[:5]
+                                supplemented += 1
+                                logger.info("动态补充验证成功: %s (%s) -> %s",
+                                           surname, citation.year, paper.title[:60])
+                                break
+            except Exception as e:
+                logger.debug(f"OpenAlex动态补充失败 [{surname} {citation.year}]: {e}")
+
+        # Semantic Scholar 兜底
+        if not citation.verified and ss_engine:
+            try:
+                ss_result = await ss_engine.search(
+                    query=first_author_clean,
+                    limit=5,
+                    year=citation.year,
+                )
+                if ss_result and ss_result.papers:
+                    for paper in ss_result.papers:
+                        if _year_match(paper.year, citation.year):
+                            author_match = _match_any_author(first_author_clean, paper.authors)
+                            if author_match or not paper.authors:
+                                citation.verified = True
+                                citation.source = "ss_supplement"
+                                citation.title = paper.title
+                                citation.journal = paper.primary_venue or ""
+                                citation.doi = paper.doi
+                                citation.abstract = paper.abstract
+                                if paper.authors:
+                                    citation.authors = paper.authors[:5]
+                                supplemented += 1
+                                logger.info("SS动态补充验证成功: %s (%s) -> %s",
+                                           surname, citation.year, paper.title[:60])
+                                break
+            except Exception as e:
+                logger.debug(f"SS动态补充失败 [{surname} {citation.year}]: {e}")
+
+    if supplemented > 0:
+        logger.info("动态补充验证: %d/%d 篇未验证英文引用补充成功", supplemented, len(unverified_en))
+
+    return citations
+
+
 def _year_match(paper_year, citation_year: str, tolerance: int = 1) -> bool:
     """检查论文年份是否匹配引用年份（允许 ±N 年误差）.
 
@@ -1437,16 +2547,21 @@ def format_cssci(citation: Citation) -> str:
         # 未验证且无标题：返回空字符串以便在列表中被过滤掉
         return ""
 
+    # 清理HTML标签（防止搜索结果高亮标签泄漏到参考文献中）
+    title = _clean_html_tags(citation.title) if citation.title else citation.title
+    journal = _clean_html_tags(citation.journal) if citation.journal else citation.journal
+    authors = [_clean_html_tags(a) for a in citation.authors] if citation.authors else citation.authors
+
     # 根据作者实际语言选择格式（而非 citation.language）
     # 修复：验证后作者名可能从中文变为英文（CNKI 返回英文论文）
-    authors_are_chinese = any(_is_chinese_author(a) for a in citation.authors[:1]) if citation.authors else False
+    authors_are_chinese = any(_is_chinese_author(a) for a in authors[:1]) if authors else False
 
     if citation.language == "zh" and authors_are_chinese:
         # 中文格式
-        author_str = _format_authors(citation.authors, "zh")
-        result = f"{author_str}：{citation.title}"
-        if citation.journal:
-            result += f"，《{citation.journal}》"
+        author_str = _format_authors(authors, "zh")
+        result = f"{author_str}：{title}"
+        if journal:
+            result += f"，《{journal}》"
         else:
             result += "，"
         if citation.year:
@@ -1457,12 +2572,12 @@ def format_cssci(citation: Citation) -> str:
         return result
     else:
         # 英文格式（包括验证后变为英文的情况）
-        author_str = _format_authors(citation.authors, "en")
+        author_str = _format_authors(authors, "en")
         result = f"{author_str}, {citation.year}"
-        if citation.title:
-            result += f', "{citation.title}"'
-        if citation.journal:
-            result += f", *{citation.journal}*"
+        if title:
+            result += f', "{title}"'
+        if journal:
+            result += f", *{journal}*"
         if citation.volume:
             result += f", Vol. {citation.volume}"
         if citation.issue:
@@ -1483,26 +2598,31 @@ def format_apa7(citation: Citation) -> str:
         # 未验证且无标题：返回空字符串以便在列表中被过滤掉
         return ""
 
+    # 清理HTML标签
+    title = _clean_html_tags(citation.title) if citation.title else citation.title
+    journal = _clean_html_tags(citation.journal) if citation.journal else citation.journal
+    clean_authors = [_clean_html_tags(a) for a in citation.authors] if citation.authors else citation.authors
+
     # 作者格式化
     if citation.language == "zh":
-        author_str = "、".join(citation.authors[:3])
-        if len(citation.authors) > 3:
+        author_str = "、".join(clean_authors[:3])
+        if len(clean_authors) > 3:
             author_str += "等"
     else:
         authors = []
-        for i, a in enumerate(citation.authors[:3]):
+        for i, a in enumerate(clean_authors[:3]):
             authors.append(a)
         author_str = ", ".join(authors)
-        if len(citation.authors) > 2:
+        if len(clean_authors) > 2:
             author_str += ", et al."
-        elif len(citation.authors) == 2:
-            author_str = f"{citation.authors[0]} & {citation.authors[1]}"
+        elif len(clean_authors) == 2:
+            author_str = f"{clean_authors[0]} & {clean_authors[1]}"
 
     result = f"{author_str} ({citation.year})"
-    if citation.title:
-        result += f". {citation.title}"
-    if citation.journal:
-        result += f". *{citation.journal}*"
+    if title:
+        result += f". {title}"
+    if journal:
+        result += f". *{journal}*"
     if citation.volume:
         result += f", {citation.volume}"
     if citation.issue:

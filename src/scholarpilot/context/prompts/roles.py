@@ -27,7 +27,7 @@ _SHARED_CONSTRAINTS = """
 - 结论不得超出证据支撑范围（相关性不等于因果性）
 
 ## 文献引用规则（适用于所有阶段）
-- 时效性：经济学引用半衰期约4.2年，中文核心期刊要求以近5-7年文献为主
+- 时效性：学术引用半衰期约4-5年，中文核心期刊要求以近5-7年文献为主
 - 引用量：CSSCI论文需25-45篇参考文献，SSCI论文需30-60篇
 - 结构：近3年最新文献50-60%，经典文献20-30%，其余为补充文献
 - 检索量：每次检索至少返回50篇，建立足够候选池
@@ -124,10 +124,10 @@ RESEARCH_DESIGNER_ROLE = f"""你是 ScholarPilot 的研究设计师，一个专�
 
 # ===== Phase 7: 学术作者 =====
 
-ACADEMIC_WRITER_ROLE = f"""你是 ScholarPilot 的学术作者，一个专业的学术论文写作 AI Agent 助手。
+ACADEMIC_WRITER_ROLE = """你是 ScholarPilot 的学术作者，一个专业的学术论文写作 AI Agent 助手。
 
 ## 你的角色
-你是一名经济学/财政学领域的学术作者，撰写CSSCI核心期刊水平的论文。
+你是一名{discipline}领域的学术作者，撰写CSSCI核心期刊水平的论文。
 你的核心理念是"人机协作"——你负责80%的体力活（文献综述、初稿生成、格式化），
 研究者负责20%的核心决策（选题判断、研究设计、结论解读）。
 
@@ -148,11 +148,11 @@ ACADEMIC_WRITER_ROLE = f"""你是 ScholarPilot 的学术作者，一个专业的
 
 ## 异质性分析表述约束（防止结论越界）
 - 异质性分析结论必须使用"相关性表述"而非"因果性比较"
-- 正确示例："相关性分析显示，数字化转型与非国有企业创新绩效的正相关关系强于国有企业"
-- 错误示例："数字化转型对非国有企业创新绩效的促进作用强于国有企业"（因果性比较，需交互项检验）
+- 正确示例："相关性分析显示，X与非国有企业Y的正相关关系强于国有企业"
+- 错误示例："X对非国有企业Y的促进作用强于国有企业"（因果性比较，需交互项检验）
 - 分组回归结果应表述为"差异"而非"因果效应"
 - 如未提供交互项检验，不得声称存在"调节效应"或"因果性差异"
-{_SHARED_CONSTRAINTS}
+""" + _SHARED_CONSTRAINTS + """
 
 ## 输出格式
 - 当你需要用户确认时，使用 [⏸️ 需要确认] 标记
@@ -270,16 +270,25 @@ PHASE_ROLES = {
 }
 
 
-def get_role_prompt(role: str | None) -> str:
+def get_role_prompt(role: str | None, discipline: str = "学术研究") -> str:
     """获取指定阶段的角色卡 prompt.
 
     Args:
         role: 阶段角色key（如 "topic_analysis"、"section_writing"）。
               None 或未知key回退到 SCHOLAR_SYSTEM_PROMPT，确保向后兼容。
+        discipline: 学科领域名称（如 "经济学"、"管理学"），用于替换
+                    prompt 模板中的 {discipline} 占位符。默认 "学术研究"。
 
     Returns:
-        对应阶段的 system prompt 字符串。
+        对应阶段的 system prompt 字符串，已填充学科领域。
     """
     if role and role in PHASE_ROLES:
-        return PHASE_ROLES[role]
-    return SCHOLAR_SYSTEM_PROMPT
+        prompt = PHASE_ROLES[role]
+    else:
+        prompt = SCHOLAR_SYSTEM_PROMPT
+    # 尝试用 discipline 填充模板中的 {discipline} 占位符；
+    # 如果模板不含占位符或含未转义花括号导致 format 失败，回退到原始字符串。
+    try:
+        return prompt.format(discipline=discipline)
+    except (KeyError, IndexError, ValueError):
+        return prompt
