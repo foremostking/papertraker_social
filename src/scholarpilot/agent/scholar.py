@@ -2143,6 +2143,20 @@ class ScholarAgent:
 
         full_text = draft_path.read_text(encoding="utf-8")
 
+        # 0a. 移除 LLM 自行生成的"参考文献"章节（含虚假引用列表）
+        # LLM 常在正文中编造一个"参考文献"章节，其中包含大量虚假引用
+        # （如同一作者十几篇论文），必须移除后由系统重新生成
+        from scholarpilot.tools.citation_manager import strip_llm_reference_section
+        original_len = len(full_text)
+        full_text = strip_llm_reference_section(full_text)
+        stripped_len = original_len - len(full_text)
+        if stripped_len > 0:
+            self.console.print(
+                f"  [yellow]🗑️ 移除 LLM 生成的参考文献章节（{stripped_len} 字符）[/yellow]"
+            )
+            # 保存移除参考文献后的文本
+            draft_path.write_text(full_text, encoding="utf-8")
+
         # 0. 先构建文献池（用于哈希ID清洗和正向引用构建）
         topic_info = self.topic_info or {}
         topic_keywords = " ".join(filter(None, [
@@ -2368,6 +2382,18 @@ class ScholarAgent:
                     verified_citations = reranked_cits
             except Exception as re:
                 logger.warning(f"Cross-Encoder精排异常(非致命): {re}")
+
+        # 2.5 作者频率限制：同一第一作者最多保留3篇论文
+        # 防止 LLM 编造同一作者的大量论文充斥参考文献列表
+        from scholarpilot.tools.citation_manager import cap_author_frequency
+        pre_cap_count = len(verified_citations)
+        verified_citations = cap_author_frequency(verified_citations, max_per_author=3)
+        capped_count = pre_cap_count - len(verified_citations)
+        if capped_count > 0:
+            self.console.print(
+                f"  [yellow]⚖️ 作者频率限制: 移除 {capped_count} 条超限引用"
+                f"（同一作者上限3篇）[/yellow]"
+            )
 
         # 3. 格式化参考文献列表
         self.console.print("[dim]📋 正在生成参考文献列表（CSSCI 格式）...[/dim]")

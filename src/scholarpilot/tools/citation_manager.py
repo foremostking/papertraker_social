@@ -304,18 +304,9 @@ def _is_irrelevant_paper(
 
     paper_text_lower = f"{title} {abstract}".lower()
 
-    # 安全网：遗留黑名单检查
-    _legacy_blocklist = (
-        "covid-19", "covid19", "coronavirus", "新冠", "疫情", "肺炎",
-        "结核", "tuberculosis", "mycobacterium", "antituberculosis",
-        "采摘机器人", "农业机器人", "harvest robot", "safflower",
-        "医疗旅游", "medical tourism",
-        "axis of allies", "us-japan alliance",
-        "data security and privacy protection", "ctrip",
-        "pharmaceutical innovation", "药物创新",
-        "endogenous knowledge spillover",
-    )
-    if any(block_word in paper_text_lower for block_word in _legacy_blocklist):
+    # 安全网：遗留黑名单检查（引用统一常量 _IRRELEVANT_DOMAIN_WORDS）
+    # TODO: 在语义过滤稳定运行后移除此安全网
+    if any(block_word in paper_text_lower for block_word in _IRRELEVANT_DOMAIN_WORDS):
         return True
 
     # TRSS评分检查
@@ -2739,6 +2730,202 @@ def generate_ai_disclosure(language: str = "zh") -> str:
         )
 
 
+def strip_llm_reference_section(text: str) -> str:
+    """移除正文中 LLM 自行生成的"参考文献"章节.
+
+    LLM 在撰写论文时常自行生成一个"参考文献"章节，其中包含大量编造的
+    虚假引用（如同一作者的十几篇论文）。这些虚假引用不应保留在正文中，
+    应由系统的引用管理流程（提取→验证→格式化）重新生成参考文献列表。
+
+    本函数检测并移除以下模式：
+    - "## 参考文献" / "### 参考文献" 标题及其后所有内容
+    - "## References" / "### References" 标题及其后所有内容
+    - "---\\n\\n## 参考文献" 分隔符及之后内容（系统之前追加的）
+    - 文末的编号引用列表（如 "[1] 作者（年份）.标题.期刊."）
+
+    Args:
+        text: 论文正文文本.
+
+    Returns:
+        移除 LLM 生成参考文献章节后的文本.
+    """
+    if not text:
+        return text
+
+    result = text
+
+    # 模式1: 系统之前追加的参考文献（--- 分隔符之后的内容）
+    for separator in [
+        "\n---\n\n## 参考文献",
+        "\n---\n## 参考文献",
+        "\n---\n\n## References",
+        "\n---\n## References",
+        "\n---\n\n## AI 使用声明",
+        "\n---\n## AI 使用声明",
+        "\n---\n\n## AI Disclosure",
+    ]:
+        idx = result.find(separator)
+        if idx != -1:
+            result = result[:idx].rstrip()
+            logger.info("移除已有参考文献/AI声明部分（分隔符匹配）")
+
+    # 模式2: LLM 在正文中生成的"参考文献"章节
+    # 匹配 ## 参考文献 / ### 参考文献 / ## References 等
+    ref_section_pattern = re.compile(
+        r'\n#{2,3}\s*(?:参考文献|References?|引用文献|Bibliography)\s*\n',
+        re.IGNORECASE,
+    )
+    m = ref_section_pattern.search(result)
+    if m:
+        result = result[:m.start()].rstrip()
+        logger.info("移除 LLM 生成的参考文献章节: 位置 %d-%d", m.start(), m.end())
+
+    # 模式3: 文末的编号引用列表块
+    # 检测连续多行以 "[数字]" 开头的引用列表（至少3条才算章节）
+    lines = result.split("\n")
+    cleaned_lines: list[str] = []
+    ref_block_start = -1
+    ref_block_count = 0
+
+    for i, line in enumerate(lines):
+        # 匹配 [1] 作者（年份）.标题.期刊. 格式
+        if re.match(r'^\s*\[\d+\]\s*[\u4e00-\u9fffA-Za-z]', line):
+            if ref_block_start == -1:
+                ref_block_start = i
+            ref_block_count += 1
+        else:
+            if ref_block_count >= 3 and ref_block_start != -1:
+                # 发现一个引用列表块（>=3条），移除它
+                logger.info(
+                    "移除编号引用列表块: 行 %d-%d（%d 条）",
+                    ref_block_start, i - 1, ref_block_count,
+                )
+                # 保留之前的行，跳过引用块
+                # 同时移除引用块前的空行和可能的标题行
+                while cleaned_lines and cleaned_lines[-1].strip() == "":
+                    cleaned_lines.pop()
+                # 检查是否移除了标题行（如"参考文献"）
+                if cleaned_lines and re.match(
+                    r'^#{1,3}\s*(?:参考文献|References?)',
+                    cleaned_lines[-1],
+                    re.IGNORECASE,
+                ):
+                    cleaned_lines.pop()
+                    while cleaned_lines and cleaned_lines[-1].strip() == "":
+                        cleaned_lines.pop()
+                ref_block_start = -1
+                ref_block_count = 0
+                continue
+            else:
+                if ref_block_start != -1:
+                    # 引用块不足3条，保留
+                    for j in range(ref_block_start, i):
+                        cleaned_lines.append(lines[j])
+                    ref_block_start = -1
+                    ref_block_count = 0
+                cleaned_lines.append(line)
+
+    # 处理末尾的引用块
+    if ref_block_count >= 3 and ref_block_start != -1:
+        logger.info(
+            "移除末尾编号引用列表块: 行 %d-%d（%d 条）",
+            ref_block_start, len(lines) - 1, ref_block_count,
+        )
+        while cleaned_lines and cleaned_lines[-1].strip() == "":
+            cleaned_lines.pop()
+        if cleaned_lines and re.match(
+            r'^#{1,3}\s*(?:参考文献|References?)',
+            cleaned_lines[-1],
+            re.IGNORECASE,
+        ):
+            cleaned_lines.pop()
+            while cleaned_lines and cleaned_lines[-1].strip() == "":
+                cleaned_lines.pop()
+    elif ref_block_start != -1:
+        for j in range(ref_block_start, len(lines)):
+            cleaned_lines.append(lines[j])
+
+    result = "\n".join(cleaned_lines).rstrip()
+
+    return result
+
+
+def cap_author_frequency(
+    citations: list[Citation],
+    max_per_author: int = 3,
+) -> list[Citation]:
+    """限制同一第一作者在参考文献列表中的最大论文数量.
+
+    LLM 在生成正文时可能反复引用同一作者的多篇论文（如17篇"许甜甜"），
+    这不符合学术规范。本函数对同一第一作者保留最多 max_per_author 篇论文，
+    优先保留已验证的、有标题的引用。
+
+    Args:
+        citations: 引用列表.
+        max_per_author: 同一第一作者最大论文数量（默认3）.
+
+    Returns:
+        限制后的引用列表.
+    """
+    if not citations or max_per_author <= 0:
+        return citations
+
+    # 按第一作者归一化名分组
+    author_groups: dict[str, list[Citation]] = {}
+    for c in citations:
+        if not c.authors:
+            key = "_no_author"
+        else:
+            first_author = c.authors[0].strip()
+            # 归一化：中文取全名，英文取姓氏（小写）
+            if re.search(r'[\u4e00-\u9fff]', first_author):
+                key = first_author.lower()
+            else:
+                # 英文取姓氏（最后一个单词）
+                parts = first_author.split()
+                key = parts[-1].lower() if parts else first_author.lower()
+        author_groups.setdefault(key, []).append(c)
+
+    result: list[Citation] = []
+    capped_count = 0
+
+    for key, group in author_groups.items():
+        if len(group) <= max_per_author:
+            result.extend(group)
+            continue
+
+        # 超过限制：按优先级排序保留
+        # 优先级：verified=True > 有title > 有journal > 其他
+        def sort_priority(c: Citation) -> tuple:
+            return (
+                0 if c.verified else 1,
+                0 if c.title else 1,
+                0 if c.journal else 1,
+            )
+
+        group.sort(key=sort_priority)
+        kept = group[:max_per_author]
+        removed = group[max_per_author:]
+
+        result.extend(kept)
+        capped_count += len(removed)
+
+        if removed:
+            author_display = group[0].authors[0] if group[0].authors else key
+            logger.warning(
+                "作者频率限制: %s 有 %d 篇引用，保留 %d 篇，移除 %d 篇",
+                author_display, len(group), max_per_author, len(removed),
+            )
+
+    if capped_count > 0:
+        logger.info(
+            "作者频率限制: 共移除 %d 条超限引用（上限 %d 篇/作者）",
+            capped_count, max_per_author,
+        )
+
+    return result
+
+
 __all__ = [
     "Citation",
     "extract_citations_from_text",
@@ -2746,6 +2933,8 @@ __all__ = [
     "verify_all_citations",
     "build_citations_from_pool",
     "replace_fake_authors_in_text",
+    "strip_llm_reference_section",
+    "cap_author_frequency",
     "format_cssci",
     "format_apa7",
     "format_references_list",

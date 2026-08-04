@@ -45,11 +45,13 @@ from scholarpilot.mcp.servers.arxiv import ArxivEngine, ArxivSearchResult, Arxiv
 from scholarpilot.mcp.servers.wos import WoSEngine, WoSSearchResult, WoSPaper
 from scholarpilot.mcp.servers.chinaxiv import ChinaXivEngine, ChinaXivSearchResult, ChinaXivPaper
 from scholarpilot.mcp.servers.pubscholar import PubScholarEngine, PubScholarSearchResult, PubScholarPaper
+from scholarpilot.mcp.servers.openalex import OpenAlexEngine, OpenAlexPaper, OpenAlexSearchResult
 from scholarpilot.tools.chinese_search import (
     ChineseLiteratureManager,
     ChineseSearchResult,
     UnifiedChinesePaper,
 )
+from scholarpilot.tools.citation_manager import _IRRELEVANT_DOMAIN_WORDS
 from scholarpilot.utils.vpn import VPNStatus
 
 logger = logging.getLogger(__name__)
@@ -104,6 +106,7 @@ class UnifiedSearchResult:
     wos_result: Optional[WoSSearchResult] = None  # Web of Science（VPN/Session）
     chinaxiv_result: Optional[ChinaXivSearchResult] = None  # ChinaXiv 预印本
     pubscholar_result: Optional[PubScholarSearchResult] = None  # PubScholar OA
+    openalex_papers: list[UnifiedPaper] = field(default_factory=list)  # OpenAlex 英文文献
     all_papers: list[UnifiedPaper] = field(default_factory=list)
     total_count: int = 0
 
@@ -116,6 +119,7 @@ class UnifiedSearchResult:
             "wos": self.wos_result.to_dict() if self.wos_result else None,
             "chinaxiv": self.chinaxiv_result.to_dict() if self.chinaxiv_result else None,
             "pubscholar": self.pubscholar_result.to_dict() if self.pubscholar_result else None,
+            "openalex": [p.to_dict() for p in self.openalex_papers],
             "total_count": self.total_count,
             "papers": [p.to_dict() for p in self.all_papers],
         }
@@ -208,22 +212,9 @@ class LiteratureSearchManager:
     # 注意：此黑名单为语义过滤（SemanticRelevanceFilter）的补充兜底，仅包含
     # 跨学科通用不相关主题（医学/农业/政治等），不含任何特定研究主题的过滤项。
     # 主题相关性判断主要依赖嵌入语义相似度，此列表仅处理明显跨域噪声。
-    _IRRELEVANT_TOPIC_BLOCKLIST: tuple[str, ...] = (
-        # 医学/疫情类
-        "covid-19", "covid19", "coronavirus",
-        "新冠", "疫情", "肺炎", "临床特征", "临床分析", "心理反应",
-        "结核", "tuberculosis", "耐药", "drug resistance",
-        # 农业/机器人类
-        "采摘机器人", "红花", "农业机器人",
-        "harvest robot", "safflower",
-        # 医疗旅游类
-        "医疗旅游", "文化旅游标准化", "medical tourism",
-        # 国际关系/政治类
-        "axis of allies", "us-japan alliance",
-        "antitrust interoperability",
-        # 结核病/抗菌类
-        "mycobacterium tuberculosis", "antituberculosis", "drug resistance in",
-    )
+    # 引用 citation_manager 中的统一常量 _IRRELEVANT_DOMAIN_WORDS，避免重复维护。
+    # TODO: 在语义过滤稳定运行后移除此安全网
+    _IRRELEVANT_TOPIC_BLOCKLIST: frozenset[str] = _IRRELEVANT_DOMAIN_WORDS
 
     def __init__(
         self,
@@ -268,6 +259,8 @@ class LiteratureSearchManager:
         self.chinaxiv_engine = ChinaXivEngine(timeout=timeout)
         # PubScholar OA 引擎（免费，SHA1 签名认证）
         self.pubscholar_engine = PubScholarEngine(timeout=timeout)
+        # OpenAlex 引擎（免费，无需 API Key，2.4亿论文全学科覆盖）
+        self.openalex_engine = OpenAlexEngine(timeout=timeout)
 
         # 保存 VPN 状态
         self.vpn_status = vpn_status
@@ -383,6 +376,7 @@ class LiteratureSearchManager:
         await self.wos_engine.close()
         await self.chinaxiv_engine.close()
         await self.pubscholar_engine.close()
+        await self.openalex_engine.close()
 
     async def search_all(
         self,
@@ -437,6 +431,10 @@ class LiteratureSearchManager:
             task_names.append("pubscholar")
             task_coros.append(self._search_pubscholar(topic, max_per_source))
 
+        # OpenAlex 英文文献源（免费，无需认证，全学科覆盖）
+        task_names.append("openalex")
+        task_coros.append(self._search_openalex(topic, region, content, year_start, year_end, max_per_source))
+
         # 并行执行所有任务
         task_results = await asyncio.gather(*task_coros, return_exceptions=True)
 
@@ -472,6 +470,11 @@ class LiteratureSearchManager:
                     result.pubscholar_result = PubScholarSearchResult(query=topic, error=str(res))
                 else:
                     result.pubscholar_result = res
+            elif name == "openalex":
+                if isinstance(res, Exception):
+                    logger.error(f"OpenAlex search error: {res}")
+                else:
+                    result.openalex_papers = res
 
         # 串行检索 arXiv（3秒间隔限制）
         if include_arxiv:
@@ -651,6 +654,62 @@ class LiteratureSearchManager:
             lang="zh",
         )
 
+    async def _search_openalex(
+        self,
+        topic: str,
+        region: str,
+        content: str,
+        year_start: str,
+        year_end: str,
+        max_per_source: int,
+    ) -> list[UnifiedPaper]:
+        """通过 OpenAlex 检索英文文献.
+
+        OpenAlex 是免费的全学科学术文献库（2.4亿论文），无需 API Key。
+        自动将中文主题翻译为英文进行检索。
+
+        Args:
+            topic: 核心主题（中文）.
+            region: 研究区域.
+            content: 研究内容.
+            year_start: 起始年份.
+            year_end: 结束年份.
+            max_per_source: 每源最大返回数.
+
+        Returns:
+            统一格式的论文列表.
+        """
+        en_query = await self._translate_to_english(
+            " ".join(filter(None, [topic, content]))
+        )
+        try:
+            result = await self.openalex_engine.search(
+                query=en_query,
+                limit=max_per_source,
+                year_start=year_start,
+                year_end=year_end,
+            )
+            papers: list[UnifiedPaper] = []
+            for paper in result.papers:
+                papers.append(UnifiedPaper(
+                    source="openalex",
+                    title=paper.title,
+                    authors=paper.authors[:3] if paper.authors else [],
+                    year=str(paper.year) if paper.year else "",
+                    venue=getattr(paper, "primary_venue", "") or "",
+                    abstract=getattr(paper, "abstract", "") or "",
+                    url=getattr(paper, "url", "") or "",
+                    doi=getattr(paper, "doi", "") or "",
+                    citation_count=getattr(paper, "cited_by_count", 0) or 0,
+                    keywords=getattr(paper, "concepts", []) or [],
+                    language="en",
+                    raw=paper.to_dict(),
+                ))
+            return papers
+        except Exception as e:
+            logger.warning(f"OpenAlex 检索失败: {e}")
+            return []
+
     async def _merge_papers(self, result: UnifiedSearchResult) -> list[UnifiedPaper]:
         """整合来自不同源的论文为统一列表."""
         papers: list[UnifiedPaper] = []
@@ -762,6 +821,10 @@ class LiteratureSearchManager:
                     language=p.language or "zh",
                     raw=p.to_dict(),
                 ))
+
+        # OpenAlex 论文（已在 _search_openalex 中转换为 UnifiedPaper）
+        if result.openalex_papers:
+            papers.extend(result.openalex_papers)
 
         # 跨源去重：按 DOI（大小写不敏感）和归一化标题去重
         seen_dois: set[str] = set()
@@ -926,6 +989,11 @@ class LiteratureSearchManager:
         标题+摘要关键词比对，计算重叠率作为相关性分数，
         过滤低相关性论文并按相关性降序排序。
 
+        注意：此关键词重合度过滤是 _merge_papers 阶段的预过滤步骤，
+        主题相关性判断的主机制是语义过滤器（SemanticRelevanceFilter，
+        基于 embedding 嵌入相似度），在 search_all 中于 _merge_papers
+        之后执行。此处的黑名单和关键词过滤仅作为语义过滤的补充安全网。
+
         在词重合度计算之前，先对论文的标题+摘要进行硬过滤：
         命中不相关主题黑名单（``_IRRELEVANT_TOPIC_BLOCKLIST``）的
         论文直接丢弃，不受"<5 篇放宽阈值"兜底保护。
@@ -997,6 +1065,7 @@ class LiteratureSearchManager:
         wos_papers = [p for p in papers if p.source == "wos"]
         chinaxiv_papers = [p for p in papers if p.source == "chinaxiv"]
         pubscholar_papers = [p for p in papers if p.source == "pubscholar"]
+        openalex_papers = [p for p in papers if p.source == "openalex"]
 
         if cnki_papers:
             lines.append(f"\n### CNKI 中文文献 ({len(cnki_papers)} 篇)")
@@ -1040,6 +1109,13 @@ class LiteratureSearchManager:
         if pubscholar_papers:
             lines.append(f"\n### PubScholar OA ({len(pubscholar_papers)} 篇)")
             for i, p in enumerate(pubscholar_papers[:max_display]):
+                authors = ", ".join(p.authors[:3])
+                cited = f" [cited: {p.citation_count}]" if p.citation_count else ""
+                lines.append(f"{i+1}. {p.title} - {authors} ({p.venue}, {p.year}){cited}")
+
+        if openalex_papers:
+            lines.append(f"\n### OpenAlex 英文文献 ({len(openalex_papers)} 篇)")
+            for i, p in enumerate(openalex_papers[:max_display]):
                 authors = ", ".join(p.authors[:3])
                 cited = f" [cited: {p.citation_count}]" if p.citation_count else ""
                 lines.append(f"{i+1}. {p.title} - {authors} ({p.venue}, {p.year}){cited}")
