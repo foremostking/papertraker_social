@@ -145,7 +145,7 @@ async def test_phase1_topic_analysis(api_key: str, model: str, topic: str, ark_m
 
 async def test_phase2_literature_search(topic_info: dict[str, Any]) -> dict[str, Any]:
     """测试 Phase 2: 多源文献检索."""
-    from scholarpilot.tools.chinese_search import ChineseLiteratureManager
+    from scholarpilot.tools.search import LiteratureSearchManager
     from scholarpilot.mcp.servers.semantic_scholar import SemanticScholarEngine
     from scholarpilot.mcp.servers.arxiv import ArxivEngine
 
@@ -161,10 +161,10 @@ async def test_phase2_literature_search(topic_info: dict[str, Any]) -> dict[str,
 
     # 2a: 中文文献检索（CNKI + NCPSSD）
     print(f"  2a. 中文文献检索（CNKI + NCPSSD）...")
-    cm = ChineseLiteratureManager()
+    cm = LiteratureSearchManager()
     try:
         start = time.time()
-        chinese_result = await cm.search(
+        chinese_result = await cm.search_chinese(
             topic=topic, region=region, content=content,
             year_start=year_start, year_end=year_end,
             max_per_source=50,

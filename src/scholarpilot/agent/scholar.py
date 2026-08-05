@@ -40,7 +40,7 @@ from scholarpilot.mcp.servers.cnki import (
 from scholarpilot.mcp.servers.semantic_scholar import SemanticScholarEngine
 from scholarpilot.mcp.servers.arxiv import ArxivEngine
 from scholarpilot.mcp.servers.openalex import OpenAlexEngine
-from scholarpilot.tools.chinese_search import ChineseLiteratureManager
+from scholarpilot.tools.search import LiteratureSearchManager
 from scholarpilot.utils.file_manager import FileManager
 from scholarpilot.utils.library import GlobalLibrary
 from scholarpilot.utils.vpn import EasyConnectDetector, VPNStatus
@@ -50,7 +50,21 @@ console = Console()
 
 
 class ScholarAgent:
-    """Scholar Agent - 学术论文写作 AI Agent.
+    """Scholar Agent - 学术论文写作 AI Agent [弃用中].
+
+    .. deprecated:: ADR-003
+        本过程式 Agent 正在弃用中，推荐使用 LangGraph 状态图路径
+        （``agent.graph.create_scholar_graph``）。
+
+        当前状态（P3 阶段）：
+        - **A 类方法**（文献检索/大纲/写作/引用/导出）已被
+          ``executor.py`` 完全覆盖，不再经由此类调用。
+        - **B 类方法**（证据矩阵、SPEC 生成、表格模板、质量报告、
+          去 AI 味、claim 校准等 14 个）保留在此类中，待抽取为
+          ``tools/`` 下独立模块后随类删除。
+        - ``scholar_finalize_node`` 已迁移至 ``agent/finalize.py``。
+
+        严禁在 B 类能力下沉前删除本类（ADR-003 约束）。
 
     核心工作流：
         用户输入 → 选题分析 → 多源文献检索（CNKI + Semantic Scholar + arXiv）
@@ -95,7 +109,7 @@ class ScholarAgent:
 
         # 文献检索引擎（多源）
         self._cnki_cookie = cnki_cookie
-        self.chinese_manager = ChineseLiteratureManager(
+        self.chinese_manager = LiteratureSearchManager(
             cnki_cookie=cnki_cookie,
             use_playwright=False,  # 可选启用 Playwright CNKI
         )
@@ -347,7 +361,7 @@ class ScholarAgent:
                 f"{', '.join(self.vpn_status.accessible_databases)}[/green]"
             )
             # 重新初始化中文管理器为 VPN 模式
-            self.chinese_manager = ChineseLiteratureManager(
+            self.chinese_manager = LiteratureSearchManager(
                 cnki_cookie=self._cnki_cookie,
                 use_playwright=False,
                 vpn_status=self.vpn_status,
@@ -380,7 +394,7 @@ class ScholarAgent:
                     )
                     if self.vpn_status.connected:
                         self.console.print("[green]VPN 连接成功![/green]")
-                        self.chinese_manager = ChineseLiteratureManager(
+                        self.chinese_manager = LiteratureSearchManager(
                             cnki_cookie=self._cnki_cookie,
                             use_playwright=False,
                             vpn_status=self.vpn_status,
@@ -646,7 +660,7 @@ class ScholarAgent:
         self.chinese_results = []
 
         try:
-            chinese_result = await self.chinese_manager.search(
+            chinese_result = await self.chinese_manager.search_chinese(
                 topic=topic,
                 region=region,
                 content=content,
@@ -4642,67 +4656,3 @@ class ScholarAgent:
                 border_style="green",
             )
         )
-
-
-# ===== LangGraph 节点函数 =====
-
-
-async def scholar_finalize_node(state: dict) -> dict:
-    """定稿节点：合并章节、导出最终文档.
-
-    从 ScholarState 中读取项目路径，合并所有草稿章节，
-    调用导出工具生成 Word 和 LaTeX 格式的最终文档。
-
-    Args:
-        state: 当前 Agent 状态（ScholarState）。
-
-    Returns:
-        包含 final_output 的状态更新字典。
-    """
-    from pathlib import Path
-
-    project_path = state.get("project_path", "")
-    if not project_path:
-        return {"final_output": ""}
-
-    project_dir = Path(project_path)
-    merged_path = project_dir / "draft" / "full_draft.md"
-
-    # 合并章节（如果尚未合并）
-    if not merged_path.exists():
-        draft_dir = project_dir / "draft"
-        if draft_dir.exists():
-            sections = sorted(
-                f for f in draft_dir.iterdir()
-                if f.is_file() and f.suffix == ".md" and f.name != "full_draft.md"
-            )
-            if sections:
-                merged = "# 论文草稿\n\n"
-                for section_file in sections:
-                    content = section_file.read_text(encoding="utf-8")
-                    merged += content + "\n\n---\n\n"
-                merged_path.parent.mkdir(parents=True, exist_ok=True)
-                merged_path.write_text(merged, encoding="utf-8")
-
-    if not merged_path.exists():
-        return {"final_output": ""}
-
-    # 导出为 Word 和 LaTeX
-    from scholarpilot.tools.exporter import export_project
-
-    final_outputs = []
-    try:
-        docx_path = export_project(project_dir, fmt="docx")
-        final_outputs.append(str(docx_path))
-    except Exception as e:
-        final_outputs.append(f"docx export failed: {e}")
-
-    try:
-        tex_path = export_project(project_dir, fmt="latex")
-        final_outputs.append(str(tex_path))
-    except Exception as e:
-        final_outputs.append(f"latex export failed: {e}")
-
-    final_output = "\n".join(final_outputs)
-
-    return {"final_output": final_output}

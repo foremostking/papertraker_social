@@ -208,7 +208,7 @@ scholarpilot/
 | OpenAlex | 英文学术 | ✅ 已验证 | 免费，覆盖全面 |
 | arXiv | 英文预印本 | ✅ 已验证 | 经济学分类 |
 
-中文文献使用 `ChineseLiteratureManager` 双源合并去重，CNKI 不可用时 NCPSSD 兜底。
+中文文献使用 `LiteratureSearchManager` 三源合并去重（CNKI + 万方 + NCPSSD），CNKI 不可用时 NCPSSD 兜底。
 
 ## 开发
 

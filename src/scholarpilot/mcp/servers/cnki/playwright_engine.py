@@ -1,8 +1,12 @@
-"""CNKI Playwright 检索引擎.
+"""CNKI Playwright 检索引擎（降级备选，默认不启用）.
 
 使用 Playwright 无头浏览器绕过 CNKI 反爬虫机制。
 核心原理：通过 page.evaluate() 在浏览器上下文内执行 fetch 请求，
 所有 Cookie 和安全头自动附带，无需手动管理。
+
+> **降级说明（ADR-002）**：本引擎不再作为默认路径导出，仅在 aiohttp
+> 通路被 CAPTCHA 频繁拦截时按需 `try: from .playwright_engine import ...`
+> 作为验证码兜底插件启用。默认不 import、不实例化。
 
 技术来源：
 - papertracker_social/cnki_cssci_fetcher_anti_detection.py 的 page.evaluate() 技术
@@ -204,16 +208,51 @@ class CNKIPlaywrightEngine:
         self._page = None
         self._initialized = False
 
-    def _build_query_json(self, query: str) -> dict[str, Any]:
+    def _build_query_json(
+        self,
+        query: str,
+        source_categories: list[str] | None = None,
+    ) -> dict[str, Any]:
         """构建 CNKI QueryJson 格式.
 
         基于 papertraker_20260124/cnki_retrieval.py 的格式。
+        支持来源类别筛选（通过 ControlGroup 的 .extend-tit-checklist 子项）。
         """
         # 如果是纯文本，转换为主题搜索
         if "SU%=" not in query and "TI%=" not in query:
             search_value = f"SU%='{query}'"
         else:
             search_value = query
+
+        # ControlGroup 子项
+        control_children: list[dict[str, Any]] = []
+
+        # 来源类别筛选
+        if source_categories:
+            from scholarpilot.mcp.servers.cnki.aiohttp_engine import (
+                SOURCE_CATEGORY_MAPPING,
+            )
+            source_items = []
+            for cat in source_categories:
+                mapping = SOURCE_CATEGORY_MAPPING.get(cat)
+                if mapping:
+                    source_items.append({
+                        "Key": 0,
+                        "Title": mapping["Title"],
+                        "Logic": 1,
+                        "Field": mapping["Field"],
+                        "Operator": "DEFAULT",
+                        "Value": mapping["Value"],
+                        "Value2": "",
+                    })
+            if source_items:
+                control_children.append({
+                    "Key": ".extend-tit-checklist",
+                    "Title": "",
+                    "Logic": 0,
+                    "Items": source_items,
+                    "ChildItems": [],
+                })
 
         return {
             "Platform": "",
@@ -245,7 +284,7 @@ class CNKIPlaywrightEngine:
                         "Title": "",
                         "Logic": 0,
                         "Items": [],
-                        "ChildItems": [],
+                        "ChildItems": control_children,
                     },
                 ]
             },
@@ -264,6 +303,7 @@ class CNKIPlaywrightEngine:
         limit: int = 20,
         page: int = 1,
         sort_field: str = "PT",
+        source_categories: list[str] | None = None,
     ) -> CNKIPlaywrightResult:
         """通过浏览器内 fetch 执行 CNKI 检索.
 
@@ -275,6 +315,7 @@ class CNKIPlaywrightEngine:
             limit: 返回数量。
             page: 页码。
             sort_field: 排序字段（PT=发表时间, RU=被引, TR=相关度）。
+            source_categories: 来源类别列表（如 ["SCI","北大核心","CSSCI"]）。
 
         Returns:
             CNKIPlaywrightResult: 检索结果。
@@ -284,8 +325,59 @@ class CNKIPlaywrightEngine:
             if not ok:
                 return CNKIPlaywrightResult(query=query, total_count=0)
 
-        query_json = self._build_query_json(query)
+        logger.info(
+            "[CNKI Playwright search] 检索参数: query='%s', page=%d, limit=%d, "
+            "sort=%s, source_categories=%s",
+            query, page, limit, sort_field, source_categories,
+        )
+
+        query_json = self._build_query_json(query, source_categories)
         query_json_str = json.dumps(query_json, ensure_ascii=False)
+        logger.debug("[CNKI Playwright search] 构建的 QueryJson: %s", query_json_str)
+
+        # 打印 QueryJson 关键结构（DEBUG 级别），便于排查来源类别筛选是否正确
+        try:
+            cg = next(
+                (g for g in query_json["QNode"]["QGroup"]
+                 if g.get("Key") == "ControlGroup"),
+                None,
+            )
+            logger.debug(
+                "[CNKI Playwright search] QGroup 数量: %d, 各组 Key: %s",
+                len(query_json["QNode"]["QGroup"]),
+                [g.get("Key") for g in query_json["QNode"]["QGroup"]],
+            )
+            if cg:
+                children = cg.get("ChildItems", [])
+                logger.debug(
+                    "[CNKI Playwright search] ControlGroup ChildItems 数量: %d",
+                    len(children),
+                )
+                for i, child in enumerate(children):
+                    items = child.get("Items", [])
+                    if child.get("Key") == ".extend-tit-checklist":
+                        logger.info(
+                            "[CNKI Playwright search] 来源类别筛选: %d 个类别, "
+                            "titles=%s, fields=%s",
+                            len(items),
+                            [it.get("Title", "") for it in items],
+                            [f"{it.get('Field','')}={it.get('Value','')}"
+                             for it in items],
+                        )
+                    else:
+                        logger.debug(
+                            "[CNKI Playwright search] ControlGroup child[%d] "
+                            "Key='%s', items=%d",
+                            i, child.get("Key"), len(items),
+                        )
+        except (KeyError, TypeError) as e:
+            logger.warning("[CNKI Playwright search] QueryJson 解析失败: %s", e)
+
+        logger.info(
+            "[CNKI Playwright search] 发送请求: gridUrl=%s, pageNum=%s, "
+            "pageSize=%s, sortField=%s",
+            self.GRID_URL, page, min(limit, 50), sort_field,
+        )
 
         # 检测是否被重定向到验证码页面
         current_url = self._page.url
@@ -384,13 +476,23 @@ class CNKIPlaywrightEngine:
 
         try:
             result_text = await self._page.evaluate(search_js, search_params)
+            logger.info(
+                "[CNKI Playwright search] 响应: HTML 长度=%d",
+                len(result_text or ""),
+            )
 
             if not result_text:
                 logger.warning("CNKI Playwright search returned empty response")
                 return CNKIPlaywrightResult(query=query, total_count=0)
 
             # CNKI grid 接口返回 HTML 格式的结果
-            return self._parse_grid_html(result_text, query)
+            result = self._parse_grid_html(result_text, query)
+            logger.info(
+                "[CNKI Playwright search] 检索完成: query='%s', "
+                "total_count=%d, returned=%d",
+                query, result.total_count, len(result.papers),
+            )
+            return result
 
         except Exception as e:
             logger.error(f"CNKI Playwright search failed: {e}")

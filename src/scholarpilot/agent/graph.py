@@ -25,7 +25,7 @@ from langgraph.graph import END, START, StateGraph
 from .executor import scholar_execute_node
 from .planner import scholar_plan_node
 from .review import human_review_node
-from .scholar import scholar_finalize_node
+from .finalize import scholar_finalize_node
 from .state import ScholarState
 
 

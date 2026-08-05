@@ -778,12 +778,68 @@ class CNKIAiohttpEngine:
         # 额外筛选条件通过 QGroup 传入（不拼进检索式字符串）
         # 这样每个字段是独立的 QGroup 条目，CNKI API 能正确解析
 
+        logger.info(
+            "[CNKI search] 检索参数: query='%s', page=%d, limit=%d, "
+            "year=%s-%s, sort=%s, author='%s', journal='%s', "
+            "affiliation='%s', min_citations=%d, source_categories=%s",
+            query, page, limit, year_start, year_end, sort_field,
+            author, journal, affiliation, min_citations, source_categories,
+        )
+        logger.debug("[CNKI search] 构建的检索式: %s", search_query)
+
         query_json = self.build_query_json(
             search_query, year_start, year_end,
             author=author, journal=journal,
             affiliation=affiliation, min_citations=min_citations,
             source_categories=source_categories,
         )
+
+        # 打印 QueryJson 关键结构（DEBUG 级别）
+        try:
+            qj_parsed = json.loads(query_json)
+            q_group = qj_parsed.get("QNode", {}).get("QGroup", [])
+            logger.debug(
+                "[CNKI search] QueryJson QGroup 数量: %d, "
+                "各组 Key: %s",
+                len(q_group),
+                [g.get("Key") for g in q_group],
+            )
+            # 详细打印 ControlGroup 的来源类别子项
+            for g in q_group:
+                if g.get("Key") == "ControlGroup":
+                    children = g.get("ChildItems", [])
+                    logger.debug(
+                        "[CNKI search] ControlGroup ChildItems 数量: %d",
+                        len(children),
+                    )
+                    for i, child in enumerate(children):
+                        items = child.get("Items", [])
+                        if child.get("Key") == ".extend-tit-checklist":
+                            cat_titles = [
+                                it.get("Title", "") for it in items
+                            ]
+                            cat_fields = [
+                                f"{it.get('Field','')}={it.get('Value','')}"
+                                for it in items
+                            ]
+                            logger.info(
+                                "[CNKI search] 来源类别筛选: %d 个类别, "
+                                "titles=%s, fields=%s",
+                                len(items), cat_titles, cat_fields,
+                            )
+                        else:
+                            logger.debug(
+                                "[CNKI search] ControlGroup child[%d] "
+                                "Key='%s', items=%d",
+                                i, child.get("Key"), len(items),
+                            )
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.warning("[CNKI search] QueryJson 解析失败: %s", e)
+
+        search_from = self._build_search_from(
+            year_start, year_end, source_categories,
+        )
+        logger.info("[CNKI search] searchFrom: %s", search_from)
 
         post_data = {
             "boolSearch": "true",
@@ -795,9 +851,7 @@ class CNKIAiohttpEngine:
             "dstyle": "listmode",
             "boolSortSearch": "false",
             "aside": f"({search_query})",
-            "searchFrom": self._build_search_from(
-                year_start, year_end, source_categories,
-            ),
+            "searchFrom": search_from,
             "subject": "",
             "turnpage": "",
             "language": "uniplatform",
@@ -818,11 +872,21 @@ class CNKIAiohttpEngine:
             "X-Requested-With": "XMLHttpRequest",
         }
 
+        logger.info(
+            "[CNKI search] 发送请求: URL=%s, pageNum=%s, pageSize=%s, "
+            "sortField=%s, vpn_mode=%s, cookie_keys=%s",
+            self.BRIEF_GRID_URL,
+            post_data["pageNum"], post_data["pageSize"],
+            post_data["sortField"], self.vpn_mode,
+            list(self._cookies.keys())[:5] if self._cookies else "none",
+        )
+
         try:
             configure_no_proxy()
             async with aiohttp.ClientSession(trust_env=False) as session:
                 # VPN 模式预热: 访问 AdvSearch 页面获取机构 Session Cookie
                 if self.vpn_mode:
+                    logger.debug("[CNKI search] VPN 模式: 预热 Session")
                     await self._warmup_session(session)
 
                 async with session.post(
@@ -833,6 +897,12 @@ class CNKIAiohttpEngine:
                     timeout=aiohttp.ClientTimeout(total=self.timeout),
                 ) as response:
                     html = await response.text()
+                    status_code = response.status
+
+                    logger.info(
+                        "[CNKI search] 响应: HTTP %d, HTML 长度=%d",
+                        status_code, len(html),
+                    )
 
                     # 检测验证码
                     if "captcha" in html.lower() or "verify" in html.lower():
@@ -857,8 +927,9 @@ class CNKIAiohttpEngine:
                     result.raw_response = html[:5000]
 
                     logger.info(
-                        f"CNKI search '{query}': {result.total_count} total, "
-                        f"{len(result.papers)} returned"
+                        "[CNKI search] 检索完成: query='%s', "
+                        "total_count=%d, returned=%d",
+                        query, result.total_count, len(result.papers),
                     )
                     return result
 

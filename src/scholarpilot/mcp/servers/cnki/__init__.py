@@ -12,12 +12,10 @@
 引擎选择:
     - CNKIAiohttpEngine: 推荐，基于 papertracker_social 已验证方案，
       aiohttp + 正确 QueryJson，2026-06-27 实测返回 1736 篇
-    - CNKIEngine: 旧 httpx 方案（可能被 CAPTCHA 拦截）
-    - CNKIPlaywrightEngine: 浏览器内 fetch（可选）
+    - CNKIPlaywrightEngine: 浏览器内 fetch（可选，默认不启用）
 """
 
 from scholarpilot.mcp.servers.cnki.server import (
-    CNKIEngine,
     CNKIPaper,
     CNKISearchResult,
     QueryLayer,
@@ -26,14 +24,17 @@ from scholarpilot.mcp.servers.cnki.server import (
 )
 from scholarpilot.mcp.servers.cnki.aiohttp_engine import (
     CNKIAiohttpEngine,
+    SOURCE_CATEGORY_MAPPING,
+    DEFAULT_SOURCE_CATEGORIES,
 )
 
 __all__ = [
-    "CNKIEngine",
     "CNKIAiohttpEngine",
     "CNKIPaper",
     "CNKISearchResult",
     "QueryLayer",
     "calculate_eight_dimensions",
     "assess_feasibility",
+    "SOURCE_CATEGORY_MAPPING",
+    "DEFAULT_SOURCE_CATEGORIES",
 ]

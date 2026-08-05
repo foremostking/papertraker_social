@@ -35,7 +35,22 @@ except ImportError:  # pragma: no cover - litellm 为可选依赖
     litellm = None  # type: ignore[assignment]
     _LITELLM_AVAILABLE = False
 
-from scholarpilot.mcp.servers.cnki import CNKISearchResult, CNKIPaper
+from scholarpilot.mcp.servers.cnki import (
+    CNKIAiohttpEngine,
+    CNKISearchResult,
+    CNKIPaper,
+    DEFAULT_SOURCE_CATEGORIES,
+)
+from scholarpilot.mcp.servers.ncpssd import (
+    NCPSSDEngine,
+    NCPSSDPaper,
+    NCPSSDSearchResult,
+)
+from scholarpilot.mcp.servers.wanfang import (
+    WanfangEngine,
+    WanfangPaper,
+    WanfangSearchResult,
+)
 from scholarpilot.mcp.servers.semantic_scholar import (
     SemanticScholarEngine,
     SSSearchResult,
@@ -47,7 +62,6 @@ from scholarpilot.mcp.servers.chinaxiv import ChinaXivEngine, ChinaXivSearchResu
 from scholarpilot.mcp.servers.pubscholar import PubScholarEngine, PubScholarSearchResult, PubScholarPaper
 from scholarpilot.mcp.servers.openalex import OpenAlexEngine, OpenAlexPaper, OpenAlexSearchResult
 from scholarpilot.tools.chinese_search import (
-    ChineseLiteratureManager,
     ChineseSearchResult,
     UnifiedChinesePaper,
 )
@@ -239,14 +253,44 @@ class LiteratureSearchManager:
                         CNKI 和万方将使用机构 IP 认证模式。
                         如不传入，需在调用 search_all 前手动设置。
         """
-        # 中文文献：ChineseLiteratureManager（NCPSSD + CNKI + 万方 多源降级）
-        # 传入 vpn_status 启用 CNKI/万方 机构 IP 认证
-        self.chinese_manager = ChineseLiteratureManager(
-            cnki_cookie=cnki_cookie,
-            use_playwright=use_playwright,
-            timeout=timeout,
-            vpn_status=vpn_status,
+        # 中文文献引擎：直接实例化（CNKI + 万方 + NCPSSD）
+        # 判断 CNKI 是否可通过 VPN 机构 IP 认证
+        cnki_vpn_mode = (
+            vpn_status is not None
+            and vpn_status.connected
+            and "cnki" in vpn_status.accessible_databases
         )
+        # 判断万方是否可通过 VPN 机构 IP 认证
+        wanfang_vpn_mode = (
+            vpn_status is not None
+            and vpn_status.connected
+            and "wanfang" in vpn_status.accessible_databases
+        )
+        self.cnki_engine = CNKIAiohttpEngine(
+            cookie_str=cnki_cookie,
+            timeout=timeout,
+            vpn_mode=cnki_vpn_mode,
+        )
+        self.wanfang_engine = WanfangEngine(
+            timeout=timeout,
+            vpn_mode=wanfang_vpn_mode,
+        )
+        self.ncpssd_engine = NCPSSDEngine(timeout=timeout)
+
+        if cnki_vpn_mode:
+            logger.info("CNKI engine in VPN mode (institutional IP auth)")
+        elif cnki_cookie:
+            self.cnki_engine.set_cookie(cnki_cookie)
+            logger.info("CNKI aiohttp engine initialized with custom cookie")
+        elif self.cnki_engine.has_cookie:
+            logger.info(
+                f"CNKI aiohttp engine initialized with cached cookie "
+                f"({list(self.cnki_engine._cookies.keys())[:3]})"
+            )
+        if wanfang_vpn_mode:
+            logger.info("Wanfang engine in VPN mode (institutional IP auth)")
+        else:
+            logger.info("Wanfang engine initialized (public access mode)")
         self.ss_engine = SemanticScholarEngine(api_key=ss_api_key, timeout=timeout)
         self.arxiv_engine = ArxivEngine(timeout=timeout)
         # WoS 引擎：双模式（API Key 优先，其次 SID）
@@ -370,7 +414,9 @@ class LiteratureSearchManager:
 
     async def close(self) -> None:
         """关闭所有引擎."""
-        await self.chinese_manager.close()
+        await self.cnki_engine.close()
+        await self.wanfang_engine.close()
+        await self.ncpssd_engine.close()
         await self.ss_engine.close()
         await self.arxiv_engine.close()
         await self.wos_engine.close()
@@ -415,7 +461,7 @@ class LiteratureSearchManager:
         # 构建并行检索任务（arXiv 串行，因为3秒间隔限制）
         task_names: list[str] = ["chinese", "ss"]
         task_coros: list = [
-            self._search_chinese(topic, region, content, year_start, year_end, max_per_source),
+            self.search_chinese(topic, region, content, year_start, year_end, max_per_source),
             self._search_semantic_scholar(topic, region, content, year_start, year_end, max_per_source),
         ]
 
@@ -529,23 +575,193 @@ class LiteratureSearchManager:
 
         return result
 
-    async def _search_chinese(
-        self, topic: str, region: str, content: str,
-        year_start: str, year_end: str, max_results: int,
+    async def search_chinese(
+        self, topic: str, region: str = "", content: str = "",
+        year_start: str = "", year_end: str = "",
+        max_per_source: int = 50,
+        source_categories: list[str] | None = None,
     ) -> ChineseSearchResult:
-        """执行中文文献检索（NCPSSD + CNKI 多源降级）.
+        """执行多源中文文献检索（CNKI + 万方 + NCPSSD 并行）.
 
-        使用 ChineseLiteratureManager 并行检索 NCPSSD（免费、稳定）
-        和 CNKI（可选 Playwright 增强），自动合并去重。
+        合并去重三源结果，优先级 CNKI > 万方 > NCPSSD。
+        默认使用 7 类核心期刊来源筛选（见 DEFAULT_SOURCE_CATEGORIES）。
         """
-        return await self.chinese_manager.search(
-            topic=topic,
-            region=region,
-            content=content,
-            year_start=year_start,
-            year_end=year_end,
-            max_per_source=max_results,
+        result = ChineseSearchResult(query=f"{topic} {region} {content}".strip())
+
+        # 构建检索词
+        cnki_query = CNKIAiohttpEngine.build_query(topic, region, content)
+        wanfang_query = WanfangEngine.build_query(topic, region, content)
+        ncpssd_query = NCPSSDEngine.build_query(topic, region, content)
+
+        logger.info(
+            f"Chinese search: CNKI='{cnki_query}', "
+            f"Wanfang='{wanfang_query}', NCPSSD='{ncpssd_query}'"
         )
+
+        ys = year_start or "2020"
+        ye = year_end or "2026"
+        categories = (
+            source_categories if source_categories is not None
+            else DEFAULT_SOURCE_CATEGORIES
+        )
+
+        # 并行检索 CNKI + 万方 + NCPSSD
+        tasks = [
+            self.cnki_engine.search(
+                cnki_query, limit=max_per_source,
+                year_start=ys, year_end=ye,
+                source_categories=categories,
+            ),
+            self.wanfang_engine.search(
+                wanfang_query, limit=min(max_per_source, 20),
+                year_start=ys, year_end=ye,
+            ),
+            self.ncpssd_engine.search(
+                ncpssd_query, limit=max_per_source,
+                year_start=year_start, year_end=year_end,
+            ),
+        ]
+        cnki_result_raw, wanfang_result_raw, ncpssd_result_raw = await asyncio.gather(
+            *tasks, return_exceptions=True,
+        )
+
+        # 处理 CNKI 结果
+        if isinstance(cnki_result_raw, Exception):
+            logger.warning(f"CNKI search failed: {cnki_result_raw}")
+            result.cnki_result = CNKISearchResult(query=cnki_query, total_count=0)
+        elif not isinstance(cnki_result_raw, CNKISearchResult):
+            result.cnki_result = CNKISearchResult(query=cnki_query, total_count=0)
+        else:
+            result.cnki_result = cnki_result_raw
+        result.cnki_count = result.cnki_result.total_count
+
+        # 处理万方结果
+        if isinstance(wanfang_result_raw, Exception):
+            logger.warning(f"Wanfang search failed: {wanfang_result_raw}")
+            result.wanfang_result = WanfangSearchResult(query=wanfang_query, total_count=0)
+        elif not isinstance(wanfang_result_raw, WanfangSearchResult):
+            result.wanfang_result = WanfangSearchResult(query=wanfang_query, total_count=0)
+        else:
+            result.wanfang_result = wanfang_result_raw
+        result.wanfang_count = result.wanfang_result.total_count
+
+        # 处理 NCPSSD 结果
+        if isinstance(ncpssd_result_raw, Exception):
+            logger.warning(f"NCPSSD search failed: {ncpssd_result_raw}")
+            result.ncpssd_result = NCPSSDSearchResult(query=ncpssd_query, total_count=0)
+        elif not isinstance(ncpssd_result_raw, NCPSSDSearchResult):
+            result.ncpssd_result = NCPSSDSearchResult(query=ncpssd_query, total_count=0)
+        else:
+            result.ncpssd_result = ncpssd_result_raw
+        result.ncpssd_count = result.ncpssd_result.total_count
+
+        # 合并去重
+        result.papers = self._merge_and_dedup_chinese(
+            cnki_papers=result.cnki_result.papers,
+            wanfang_papers=result.wanfang_result.papers,
+            ncpssd_papers=result.ncpssd_result.papers,
+        )
+
+        logger.info(
+            f"Chinese search complete: CNKI={result.cnki_count}, "
+            f"Wanfang={result.wanfang_count}, NCPSSD={result.ncpssd_count}, "
+            f"merged={len(result.papers)}"
+        )
+
+        return result
+
+    @staticmethod
+    def _normalize_title_chinese(title: str) -> str:
+        """标准化标题用于去重比较。"""
+        return re.sub(r"[\s\W_]+", "", title).lower()
+
+    def _merge_and_dedup_chinese(
+        self,
+        cnki_papers: list[CNKIPaper],
+        wanfang_papers: list[WanfangPaper],
+        ncpssd_papers: list[NCPSSDPaper],
+    ) -> list[UnifiedChinesePaper]:
+        """合并三个数据源的论文并去重.
+
+        去重策略：基于标题相似度（去除标点符号后完全匹配）。
+        优先级：CNKI > 万方 > NCPSSD（CNKI 数据最丰富，优先保留）。
+        """
+        unified: list[UnifiedChinesePaper] = []
+        seen_titles: set[str] = set()
+
+        # 1. 先添加 CNKI 论文（数据最丰富，优先级最高）
+        for paper in cnki_papers:
+            if not paper.title:
+                continue
+            normalized = self._normalize_title_chinese(paper.title)
+            if normalized in seen_titles:
+                continue
+            seen_titles.add(normalized)
+            unified.append(UnifiedChinesePaper(
+                title=paper.title,
+                authors=paper.authors,
+                journal=paper.journal,
+                year=paper.year,
+                abstract=paper.abstract,
+                keywords=paper.keywords,
+                url=paper.url,
+                source="cnki",
+                cited_count=paper.cited_count,
+                download_count=paper.download_count,
+                fund=paper.fund,
+            ))
+
+        # 2. 添加万方论文（跳过与 CNKI 重复的，携带扩展字段）
+        for paper in wanfang_papers:
+            if not paper.title:
+                continue
+            normalized = self._normalize_title_chinese(paper.title)
+            if normalized in seen_titles:
+                continue
+            seen_titles.add(normalized)
+            unified.append(UnifiedChinesePaper(
+                title=paper.title,
+                authors=paper.authors,
+                journal=paper.journal,
+                year=paper.year,
+                abstract=paper.abstract,
+                keywords=paper.keywords,
+                doi=paper.doi,
+                url=paper.url,
+                source="wanfang",
+                cited_count=paper.cited_count,
+                download_count=paper.download_count,
+                paper_type=paper.paper_type,
+                institution=paper.institution,
+                degree_level=paper.degree_level,
+                core_tags=paper.core_tags,
+                issue=paper.issue,
+                page_range=paper.page_range,
+                language=paper.language,
+                issn=paper.issn,
+            ))
+
+        # 3. 添加 NCPSSD 论文（跳过与前两源重复的，兜底补充）
+        for paper in ncpssd_papers:
+            if not paper.title:
+                continue
+            normalized = self._normalize_title_chinese(paper.title)
+            if normalized in seen_titles:
+                continue
+            seen_titles.add(normalized)
+            unified.append(UnifiedChinesePaper(
+                title=paper.title,
+                authors=paper.authors,
+                journal=paper.journal,
+                year=paper.year,
+                abstract=paper.abstract,
+                keywords=paper.keywords,
+                doi=paper.doi,
+                url=paper.url,
+                source="ncpssd",
+            ))
+
+        return unified
 
     async def _search_semantic_scholar(
         self, topic: str, region: str, content: str,

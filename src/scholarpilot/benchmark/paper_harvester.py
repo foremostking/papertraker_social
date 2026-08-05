@@ -46,7 +46,7 @@ import httpx
 from scholarpilot.utils.network import configure_no_proxy
 from scholarpilot.benchmark.journal_list import get_journal_names
 from scholarpilot.mcp.servers.ncpssd import NCPSSDEngine, NCPSSDPaper
-from scholarpilot.mcp.servers.cnki import CNKIAiohttpEngine, CNKIPaper
+from scholarpilot.mcp.servers.cnki import CNKIAiohttpEngine, CNKIPaper, DEFAULT_SOURCE_CATEGORIES
 
 logger = logging.getLogger(__name__)
 
@@ -326,6 +326,7 @@ class PaperHarvester:
                             year_end=year_end,
                             sort_field=sort_field,
                             journal=journal,
+                            source_categories=DEFAULT_SOURCE_CATEGORIES,
                         )
                     except Exception as e:
                         logger.error(
