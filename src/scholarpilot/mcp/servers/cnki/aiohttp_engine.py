@@ -41,6 +41,25 @@ from scholarpilot.mcp.servers.cnki.server import (
 logger = logging.getLogger(__name__)
 
 
+# ===== CNKI 来源类别映射 =====
+# 来源: papertracker_rich/literature_fetcher/engines/cnki.py 已验证的映射
+# CNKI 高级检索页面 "来源类别" 复选框对应的 QueryJson 字段
+SOURCE_CATEGORY_MAPPING: dict[str, dict[str, str]] = {
+    "SCI":    {"Field": "SI",   "Value": "Y",    "Title": "SCI来源期刊"},
+    "EI":     {"Field": "EI",   "Value": "Y",    "Title": "EI来源期刊"},
+    "北大核心": {"Field": "HX",  "Value": "Y",    "Title": "北大核心"},
+    "CSSCI":  {"Field": "CSI",  "Value": "Y",    "Title": "CSSCI"},
+    "CSCD":   {"Field": "CSD",  "Value": "Y",    "Title": "CSCD"},
+    "AMI":    {"Field": "AMI",  "Value": "P13",  "Title": "AMI"},
+    "WJCI":   {"Field": "LYBSM","Value": "P12",  "Title": "WJCI"},
+}
+
+# 默认核心期刊来源类别（用户指定的7类）
+DEFAULT_SOURCE_CATEGORIES: list[str] = [
+    "SCI", "北大核心", "CSSCI", "EI", "CSCD", "AMI", "WJCI",
+]
+
+
 # ===== CNKI aiohttp 引擎 =====
 
 class CNKIAiohttpEngine:
@@ -58,6 +77,11 @@ class CNKIAiohttpEngine:
     - sortField: "FFD"（不是 "PT"）
     - language: "uniplatform"
     - 需要有效的 Cookie（SID_kns_new + Ecp_ClientId）
+
+    来源类别筛选：
+    - 通过 ControlGroup 的 ".extend-tit-checklist" 子项实现
+    - 每个来源类别是一个独立 Item，Logic=1（OR 关系）
+    - 支持的类别: SCI/EI/北大核心/CSSCI/CSCD/AMI/WJCI
     """
 
     BRIEF_GRID_URL = "https://kns.cnki.net/kns8s/brief/grid"
@@ -390,6 +414,7 @@ class CNKIAiohttpEngine:
         journal: str = "",
         affiliation: str = "",
         min_citations: int = 0,
+        source_categories: list[str] | None = None,
     ) -> str:
         """构建 QueryJson 参数（复刻 papertracker_social 格式）.
 
@@ -399,7 +424,7 @@ class CNKIAiohttpEngine:
         - Journal (JN): 文献来源精确匹配
         - Affiliation (AF): 机构精确匹配
         - CitedFreq (CF): 被引频次筛选
-        - ControlGroup: 年份范围
+        - ControlGroup: 年份范围 + 来源类别筛选
 
         Args:
             search_query: CNKI 检索式（如 SU %= '地方政府债务'）。
@@ -409,6 +434,10 @@ class CNKIAiohttpEngine:
             journal: 文献来源/期刊名（JN= 精确匹配）。
             affiliation: 机构名（AF= 精确匹配）。
             min_citations: 最低被引频次（0=不筛选）。
+            source_categories: 来源类别列表（如 ["SCI","北大核心","CSSCI"]）。
+                支持的类别见 SOURCE_CATEGORY_MAPPING。
+                None 表示不筛选来源类别（返回全部期刊）。
+                空列表等同 None。
 
         Returns:
             JSON 字符串。
@@ -513,30 +542,58 @@ class CNKIAiohttpEngine:
                 "ChildItems": [],
             })
 
+        # ControlGroup 子项: 年份范围 + 来源类别筛选
+        control_children = [
+            {
+                "Key": ".tit-startend-yearbox",
+                "Title": "",
+                "Logic": 0,
+                "Items": [
+                    {
+                        "Key": ".tit-startend-yearbox",
+                        "Title": "出版年度",
+                        "Logic": 0,
+                        "Field": "YE",
+                        "Operator": 7,
+                        "Value": year_start,
+                        "Value2": year_end,
+                    }
+                ],
+                "ChildItems": [],
+            }
+        ]
+
+        # 来源类别筛选: 每个类别一个 Item, Logic=1 (OR 关系)
+        # 来源: papertracker_rich/literature_fetcher/engines/cnki.py 已验证
+        if source_categories:
+            source_items = []
+            for cat in source_categories:
+                mapping = SOURCE_CATEGORY_MAPPING.get(cat)
+                if mapping:
+                    source_items.append({
+                        "Key": 0,
+                        "Title": mapping["Title"],
+                        "Logic": 1,  # OR: 满足任一来源类别即可
+                        "Field": mapping["Field"],
+                        "Operator": "DEFAULT",
+                        "Value": mapping["Value"],
+                        "Value2": "",
+                    })
+            if source_items:
+                control_children.append({
+                    "Key": ".extend-tit-checklist",
+                    "Title": "",
+                    "Logic": 0,
+                    "Items": source_items,
+                    "ChildItems": [],
+                })
+
         q_group.append({
             "Key": "ControlGroup",
             "Title": "",
             "Logic": 0,
             "Items": [],
-            "ChildItems": [
-                {
-                    "Key": ".tit-startend-yearbox",
-                    "Title": "",
-                    "Logic": 0,
-                    "Items": [
-                        {
-                            "Key": ".tit-startend-yearbox",
-                            "Title": "出版年度",
-                            "Logic": 0,
-                            "Field": "YE",
-                            "Operator": 7,
-                            "Value": year_start,
-                            "Value2": year_end,
-                        }
-                    ],
-                    "ChildItems": [],
-                }
-            ],
+            "ChildItems": control_children,
         })
 
         query_json = {
@@ -556,6 +613,43 @@ class CNKIAiohttpEngine:
             "SearchFrom": 1,
         }
         return json.dumps(query_json, ensure_ascii=False)
+
+    @staticmethod
+    def _build_search_from(
+        year_start: str,
+        year_end: str,
+        source_categories: list[str] | None = None,
+    ) -> str:
+        """构建 searchFrom 字符串.
+
+        searchFrom 是 CNKI 表单提交时的描述性参数,记录当前筛选状态.
+        来源类别部分需要列出已选类别,未选时显示"全部期刊".
+
+        Args:
+            year_start: 起始年份.
+            year_end: 结束年份.
+            source_categories: 来源类别列表.
+
+        Returns:
+            searchFrom 字符串.
+        """
+        if source_categories:
+            # 列出已选来源类别名称
+            cat_names = []
+            for cat in source_categories:
+                mapping = SOURCE_CATEGORY_MAPPING.get(cat)
+                if mapping:
+                    cat_names.append(mapping["Title"])
+            source_str = ",".join(cat_names) if cat_names else "全部期刊"
+        else:
+            source_str = "全部期刊"
+
+        return (
+            f"资源范围：学术期刊;  中英文扩展;  "
+            f"时间范围：出版年度：{year_start} 到 {year_end},"
+            f"更新时间：不限;  "
+            f"来源类别：{source_str}; "
+        )
 
     # ===== 检索执行 =====
 
@@ -635,6 +729,7 @@ class CNKIAiohttpEngine:
         journal: str = "",
         affiliation: str = "",
         min_citations: int = 0,
+        source_categories: list[str] | None = None,
     ) -> CNKISearchResult:
         """执行 CNKI 检索.
 
@@ -645,6 +740,7 @@ class CNKIAiohttpEngine:
         - 文献来源检索（JN =）
         - 年份范围（YE BETWEEN）
         - 被引频次筛选（CF >=）
+        - 来源类别筛选（SCI/北大核心/CSSCI/EI/CSCD/AMI/WJCI）
         - 排序：FFD=发表时间, RU=被引, 空=相关度
 
         Args:
@@ -658,6 +754,8 @@ class CNKIAiohttpEngine:
             journal: 文献来源/期刊名（精确匹配 JN=）。
             affiliation: 机构名（精确匹配 AF=）。
             min_citations: 最低被引频次（0=不筛选）。
+            source_categories: 来源类别列表（如 ["SCI","北大核心","CSSCI"]）。
+                None 表示不筛选来源类别（返回全部期刊）。
 
         Returns:
             CNKISearchResult: 检索结果。
@@ -684,6 +782,7 @@ class CNKIAiohttpEngine:
             search_query, year_start, year_end,
             author=author, journal=journal,
             affiliation=affiliation, min_citations=min_citations,
+            source_categories=source_categories,
         )
 
         post_data = {
@@ -696,10 +795,8 @@ class CNKIAiohttpEngine:
             "dstyle": "listmode",
             "boolSortSearch": "false",
             "aside": f"({search_query})",
-            "searchFrom": (
-                f"资源范围：学术期刊;  中英文扩展;  "
-                f"时间范围：出版年度：{year_start} 到 {year_end},更新时间：不限;  "
-                f"来源类别：全部期刊; "
+            "searchFrom": self._build_search_from(
+                year_start, year_end, source_categories,
             ),
             "subject": "",
             "turnpage": "",
