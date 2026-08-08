@@ -366,7 +366,7 @@ class DatabaseRAG:
         # 2. 如果没有精确匹配,尝试分解关键词
         if not databases:
             # 提取关键词并搜索
-            keywords = self._extract_keywords(research_topic)
+            keywords = extract_keywords(research_topic)
             all_indicators: list[dict[str, Any]] = []
             seen_dbs: set[str] = set()
 
@@ -394,7 +394,7 @@ class DatabaseRAG:
         # 3. 搜索相关指标
         # 用关键词分解搜索（完整研究主题不会匹配到按关键词存储的指标）
         key_indicators: list[dict[str, Any]] = []
-        keywords = self._extract_keywords(research_topic)
+        keywords = extract_keywords(research_topic)
         seen_ind_keys: set[str] = set()
         for kw in keywords:
             indicators = self.search_indicators(kw, limit=10)
@@ -454,32 +454,6 @@ class DatabaseRAG:
         }
 
     # ===== 内部辅助方法 =====
-
-    def _extract_keywords(self, text: str) -> list[str]:
-        """从研究主题中提取关键词."""
-        # 停用词
-        stopwords = {
-            "的", "对", "影响", "与", "和", "及", "在", "了", "是", "为",
-            "研究", "分析", "基于", "从", "到", "中", "上", "下",
-            "the", "of", "on", "in", "a", "an", "and", "or", "to", "for",
-        }
-
-        # 简单分词 (按空格和标点)
-        import re
-        tokens = re.split(r"[\s,，。、；;：:（）()【】\[\]{}\"'《》]+", text)
-
-        keywords = []
-        for token in tokens:
-            token = token.strip()
-            if not token or token in stopwords or len(token) < 2:
-                continue
-            keywords.append(token)
-
-        # 如果没有分出关键词,使用原始文本
-        if not keywords and text.strip():
-            keywords = [text.strip()]
-
-        return keywords
 
     def _find_db_by_name(self, name: str) -> dict[str, Any] | None:
         """按名称查找数据库."""

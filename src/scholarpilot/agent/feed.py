@@ -43,7 +43,8 @@ from datetime import datetime
 from typing import Any, Optional
 
 from scholarpilot.config import Settings, get_settings
-from scholarpilot.utils.library import GlobalLibrary, _normalize_title
+from scholarpilot.utils.library import GlobalLibrary
+from scholarpilot.utils.text import normalize_title
 
 logger = logging.getLogger(__name__)
 
@@ -566,7 +567,7 @@ class FeedManager:
                 continue
 
             # 标题规范化去重
-            normalized = _normalize_title(title)
+            normalized = normalize_title(title)
             if normalized in seen_titles:
                 continue
 

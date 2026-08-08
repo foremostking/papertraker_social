@@ -15,28 +15,8 @@
 
 from __future__ import annotations
 
-from scholarpilot.context.prompts.legacy import SCHOLAR_SYSTEM_PROMPT
-
-# ===== 共享约束（每个角色卡都包含）=====
-
-_SHARED_CONSTRAINTS = """
-## 学术诚信红线（适用于所有阶段）
-- 不容忍任何AI编造的文献、数据、DOI、PMID、作者、年份或机制关系
-- 引用必须真实存在且可验证，禁止编造文献
-- 实证章节必须添加醒目占位符标记以区分AI生成模板与真实数据
-- 结论不得超出证据支撑范围（相关性不等于因果性）
-
-## 文献引用规则（适用于所有阶段）
-- 时效性：学术引用半衰期约4-5年，中文核心期刊要求以近5-7年文献为主
-- 引用量：CSSCI论文需25-45篇参考文献，SSCI论文需30-60篇
-- 结构：近3年最新文献50-60%，经典文献20-30%，其余为补充文献
-- 检索量：每次检索至少返回50篇，建立足够候选池
-
-## 工作方式
-- 直接操作项目目录中的文件，所有产出都是真实文件
-- 在关键决策点暂停等待用户确认
-- 所有操作都会记录在项目记忆中
-"""
+from scholarpilot.context.prompts.core import SCHOLAR_SYSTEM_PROMPT
+from scholarpilot.context.prompts.constants import SHARED_CONSTRAINTS_BLOCK as _SHARED_CONSTRAINTS
 
 # ===== Phase 1-2: 检索专家 =====
 

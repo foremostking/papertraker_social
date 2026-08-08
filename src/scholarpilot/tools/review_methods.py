@@ -43,6 +43,20 @@ from pydantic import BaseModel, Field, field_validator
 
 from scholarpilot.models.spec import PaperType
 
+# ADR-007 P4：导入集中式综述 Prompt（单次调用完整版）
+# 本模块的分步 prompt（ReviewStep.prompt）是编排版，用于多步 LLM 调用；
+# 以下集中式 prompt 是单次调用完整版，用于一次性生成综述。
+# 两者互补：编排版提供中间产物（矩阵/大纲），完整版提供完整输出。
+from scholarpilot.context.prompts.review import (
+    DEEPSEEK_FIVE_STEP_PROMPT,
+    NOTEBOOKLM_FIVE_STEP_PROMPT,
+    GEMINI_FIVE_STEP_PROMPT,
+    CHATGPT_REVIEW_PARAGRAPH_PROMPT,
+    REVIEW_QUALITY_CHECK_PROMPT,
+)
+# ADR-007 P4: 关键词提取收敛到 utils/text.py
+from scholarpilot.utils.text import extract_keywords
+
 logger = logging.getLogger(__name__)
 
 
@@ -69,6 +83,16 @@ class ReviewMethod(str, Enum):
     TEXTBOOK_GUIDE = "textbook_guide"
     CHATGPT_PARAGRAPH = "chatgpt_paragraph"
     HYBRID = "hybrid"
+
+
+# 集中式 Prompt 映射（ReviewMethod → 完整单次调用 prompt 模板）
+# ADR-007 P4：编排版 prompt（ReviewStep.prompt）与集中式 prompt 互补
+CENTRALIZED_PROMPTS: dict[ReviewMethod, str] = {
+    ReviewMethod.DEEPSEEK_FIVE_STEP: DEEPSEEK_FIVE_STEP_PROMPT,
+    ReviewMethod.NOTEBOOKLM_FIVE_STEP: NOTEBOOKLM_FIVE_STEP_PROMPT,
+    ReviewMethod.GEMINI_FIVE_STEP: GEMINI_FIVE_STEP_PROMPT,
+    ReviewMethod.CHATGPT_PARAGRAPH: CHATGPT_REVIEW_PARAGRAPH_PROMPT,
+}
 
 
 class ReviewType(str, Enum):
@@ -340,6 +364,22 @@ class ReviewMethodEngine:
     # 中文字符正则（用于判断文献来源是否为中文）
     _CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
 
+    @staticmethod
+    def get_centralized_prompt(method: ReviewMethod) -> str | None:
+        """获取集中式完整 prompt（单次调用版）.
+
+        ADR-007 P4：与 generate() 的分步编排 prompt 互补。
+        generate() 返回多步 ReviewStep（含中间产物矩阵/大纲），
+        本方法返回完整单次调用 prompt（来自 context/prompts/review.py）。
+
+        Args:
+            method: 综述方法论.
+
+        Returns:
+            完整 prompt 模板字符串，或 None（该方法无集中式 prompt）。
+        """
+        return CENTRALIZED_PROMPTS.get(method)
+
     def generate(
         self,
         method: ReviewMethod,
@@ -407,7 +447,7 @@ class ReviewMethodEngine:
         steps: list[ReviewStep] = []
 
         # Step 1: 边界锚定
-        keywords = self._extract_keywords(topic)
+        keywords = extract_keywords(topic)
         search_query = self._build_search_query(keywords)
         steps.append(ReviewStep(
             step_index=1,
@@ -538,7 +578,7 @@ class ReviewMethodEngine:
         steps: list[ReviewStep] = []
 
         # Step 1: 关键词拆解
-        keywords = self._extract_keywords(topic)[:5]
+        keywords = extract_keywords(topic)[:5]
         steps.append(ReviewStep(
             step_index=1,
             step_name="关键词拆解",
@@ -1006,31 +1046,6 @@ class ReviewMethodEngine:
     # 辅助方法
     # ------------------------------------------------------------------
 
-    def _extract_keywords(self, topic: str) -> list[str]:
-        """从研究主题提取核心关键词.
-
-        采用启发式规则：按常见分隔符拆分，过滤停用词，
-        保留有意义的短语。
-
-        Args:
-            topic: 研究主题.
-
-        Returns:
-            核心关键词列表.
-        """
-        stop_words = {"研究", "分析", "影响", "关系", "基于", "关于", "的", "与", "和"}
-        parts = re.split(r"[，,、；;：:（）()\s]+", topic)
-        keywords = []
-        for part in parts:
-            part = part.strip()
-            if not part or part in stop_words:
-                continue
-            if 2 <= len(part) <= 12:
-                keywords.append(part)
-        if not keywords:
-            keywords = [topic.strip()]
-        return keywords[:8]
-
     def _build_search_query(self, keywords: list[str]) -> str:
         """根据关键词构建布尔检索式.
 
@@ -1444,7 +1459,7 @@ def select_method(
 
 
 def check_review_quality(text: str) -> dict[str, Any]:
-    """检查综述文本的质量.
+    """检查综述文本的质量（规则版）.
 
     检查维度:
         1. 引用密度（每千字引用数）
@@ -1452,6 +1467,10 @@ def check_review_quality(text: str) -> dict[str, Any]:
         3. 逻辑过渡词使用
         4. 文献覆盖时间跨度
         5. 研究空白识别
+
+    ADR-007 P4：本函数为规则版质量检查（正则+计数）。
+    如需 LLM 深度评审，使用 REVIEW_QUALITY_CHECK_PROMPT（已导入）
+    发起 LLM 调用获取五维度量化评分。
 
     Args:
         text: 综述文本.

@@ -18,6 +18,11 @@
 
 from __future__ import annotations
 
+from scholarpilot.context.prompts.constants import (
+    SCREENING_REF_TARGETS,
+    SEARCH_VOLUME_RULES,
+)
+
 # ===== 检索策略生成 =====
 
 SEARCH_STRATEGY_PROMPT = """## 任务：生成多源文献检索策略
@@ -64,9 +69,7 @@ SEARCH_STRATEGY_PROMPT = """## 任务：生成多源文献检索策略
 
 ### 3. 检索量规划
 
-- 经济学引用半衰期约4.2年，近5年文献应占50-60%
-- CSSCI论文需25-45篇参考文献，SSCI论文需30-60篇
-- 每源检索至少50篇，建立足够候选池（检索量:引用量 ≈ 2:1）
+""" + SEARCH_VOLUME_RULES + """
 
 ---
 
@@ -124,10 +127,7 @@ arXiv：约 20 篇
 
 【筛选目标】
 从候选池筛选出最终引用文献：
-- CSSCI论文：25-45篇
-- SSCI论文：30-60篇
-- 近5年文献占比：50-60%
-- 经典文献占比：20-30%
+""" + SCREENING_REF_TARGETS + """
 ```
 
 ### 输出要求
@@ -401,3 +401,26 @@ LITERATURE_SCREENING_PROMPT = """## 任务：对文献列表进行两道筛选
 6. 如发现文献池存在明显缺口（如缺少某类重要文献），应主动提示
 7. 用中文撰写，文献标题保留原文（中文或英文）
 """
+
+# ===== 关键词翻译 Prompt（从 tools/search.py 提取）=====
+
+KEYWORD_TRANSLATION_PROMPT = """你是一位学术文献检索专家。请将下面的中文研究主题翻译为英文学术搜索词，用于在 Semantic Scholar / arXiv / Web of Science 等英文文献库中检索。
+要求：
+1. 输出纯英文短语，使用学术界通用术语；
+2. 不要添加任何解释、标点符号前缀或引号；
+3. 保持简洁，保留关键概念之间的逻辑关系（如 AND 连接）；
+4. 若输入已是英文，原样输出。
+
+中文输入：{text}
+英文输出："""
+
+# ===== 同义词扩展 Prompt（从 tools/search.py 提取）=====
+
+SYNONYM_EXPANSION_PROMPT = """你是一位学术文献检索专家。给定以下研究主题关键词，请生成 5-10 个相关的同义词或近义词（中英文均可），用于扩展文献检索的召回率。
+要求：
+1. 每行输出一个词，不要编号、不要解释；
+2. 涵盖该主题在学术界常用的不同表达方式；
+3. 同时包含中文和英文术语（如适用）。
+
+主题关键词：{words_str}
+同义词/近义词："""

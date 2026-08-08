@@ -46,6 +46,8 @@ from scholarpilot.mcp.servers.ncpssd import (
     NCPSSDPaper,
     NCPSSDSearchResult,
 )
+# ADR-007 P4: 标题归一化收敛到 utils/text.py
+from scholarpilot.utils.text import normalize_title
 from scholarpilot.mcp.servers.wanfang import (
     WanfangEngine,
     WanfangPaper,
@@ -64,6 +66,10 @@ from scholarpilot.mcp.servers.openalex import OpenAlexEngine, OpenAlexPaper, Ope
 from scholarpilot.tools.chinese_search import (
     ChineseSearchResult,
     UnifiedChinesePaper,
+)
+from scholarpilot.context.prompts.search import (
+    KEYWORD_TRANSLATION_PROMPT,
+    SYNONYM_EXPANSION_PROMPT,
 )
 from scholarpilot.tools.citation_manager import _IRRELEVANT_DOMAIN_WORDS
 from scholarpilot.utils.vpn import VPNStatus
@@ -357,17 +363,7 @@ class LiteratureSearchManager:
         if not _LITELLM_AVAILABLE or not self._zhipu_api_key:
             return None
 
-        prompt = (
-            "你是一位学术文献检索专家。请将下面的中文研究主题翻译为英文学术搜索词，"
-            "用于在 Semantic Scholar / arXiv / Web of Science 等英文文献库中检索。\n"
-            "要求：\n"
-            "1. 输出纯英文短语，使用学术界通用术语；\n"
-            "2. 不要添加任何解释、标点符号前缀或引号；\n"
-            "3. 保持简洁，保留关键概念之间的逻辑关系（如 AND 连接）；\n"
-            "4. 若输入已是英文，原样输出。\n\n"
-            f"中文输入：{text}\n"
-            "英文输出："
-        )
+        prompt = KEYWORD_TRANSLATION_PROMPT.format(text=text)
 
         try:
             response = await litellm.acompletion(  # type: ignore[union-attr]
@@ -670,11 +666,6 @@ class LiteratureSearchManager:
 
         return result
 
-    @staticmethod
-    def _normalize_title_chinese(title: str) -> str:
-        """标准化标题用于去重比较。"""
-        return re.sub(r"[\s\W_]+", "", title).lower()
-
     def _merge_and_dedup_chinese(
         self,
         cnki_papers: list[CNKIPaper],
@@ -693,7 +684,7 @@ class LiteratureSearchManager:
         for paper in cnki_papers:
             if not paper.title:
                 continue
-            normalized = self._normalize_title_chinese(paper.title)
+            normalized = normalize_title(paper.title)
             if normalized in seen_titles:
                 continue
             seen_titles.add(normalized)
@@ -715,7 +706,7 @@ class LiteratureSearchManager:
         for paper in wanfang_papers:
             if not paper.title:
                 continue
-            normalized = self._normalize_title_chinese(paper.title)
+            normalized = normalize_title(paper.title)
             if normalized in seen_titles:
                 continue
             seen_titles.add(normalized)
@@ -745,7 +736,7 @@ class LiteratureSearchManager:
         for paper in ncpssd_papers:
             if not paper.title:
                 continue
-            normalized = self._normalize_title_chinese(paper.title)
+            normalized = normalize_title(paper.title)
             if normalized in seen_titles:
                 continue
             seen_titles.add(normalized)
@@ -1134,17 +1125,7 @@ class LiteratureSearchManager:
             return None
 
         words_str = "、".join(sorted(topic_words))
-        prompt = (
-            "你是一位学术文献检索专家。给定以下研究主题关键词，"
-            "请生成 5-10 个相关的同义词或近义词（中英文均可），"
-            "用于扩展文献检索的召回率。\n"
-            "要求：\n"
-            "1. 每行输出一个词，不要编号、不要解释；\n"
-            "2. 涵盖该主题在学术界常用的不同表达方式；\n"
-            "3. 同时包含中文和英文术语（如适用）。\n\n"
-            f"主题关键词：{words_str}\n"
-            "同义词/近义词："
-        )
+        prompt = SYNONYM_EXPANSION_PROMPT.format(words_str=words_str)
 
         try:
             response = await litellm.acompletion(  # type: ignore[union-attr]

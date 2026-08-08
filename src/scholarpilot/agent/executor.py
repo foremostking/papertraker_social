@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from scholarpilot.config import get_settings
+from scholarpilot.context.engine import ContextEngine
+from scholarpilot.context.prompts import get_role_prompt
 from scholarpilot.llm.gateway import LLMGateway
 from scholarpilot.models.plan import ExecutionPlan, ExecutionStep, StepStatus, StepType
 
@@ -201,23 +203,17 @@ async def _execute_outline_generation(
             lit_summary = json.dumps(sr.get("result", {}), ensure_ascii=False)
             break
 
-    # 构建 prompt
-    prompt = (
-        f"请根据以下论文规格和文献检索结果，生成一篇学术论文的详细大纲。\n\n"
-        f"## 论文规格\n{spec_content}\n\n"
-        f"## 文献检索结果\n文献总数：{lit_summary}\n\n"
-        f"请生成包含以下要素的 JSON 格式大纲：\n"
-        f"- title: 论文标题\n"
-        f"- sections: 章节列表，每个章节含 title（标题）、word_count（字数）、subsections（子节）、key_points（关键点）\n"
-        f"- abstract: 摘要\n"
-        f"- keywords: 关键词列表\n"
+    # 通过 ContextEngine 构建标准化上下文（ADR-007 P4：消除内联 prompt）
+    engine = ContextEngine()
+    context = engine.build_outline_context(
+        spec_content=spec_content,
+        research_type=paper_spec.get("research_type", "empirical"),
+        literature_summary=lit_summary,
+        target_journal=paper_spec.get("target_journal", "CSSCI核心期刊"),
     )
 
     response = await llm.chat(
-        messages=[
-            {"role": "system", "content": "你是一位资深学术导师，擅长论文结构设计。"},
-            {"role": "user", "content": prompt},
-        ],
+        messages=context.to_messages(),
         model=config.default_writing_model,
         temperature=0.4,
     )
@@ -264,6 +260,7 @@ async def _execute_section_writing(
     """执行章节撰写步骤."""
     config = get_settings()
     llm = LLMGateway(config)
+    engine = ContextEngine()
 
     project_dir = Path(project_path) if project_path else None
 
@@ -296,22 +293,22 @@ async def _execute_section_writing(
 
         logger.info(f"Writing section: {section_title}")
 
-        prompt = (
-            f"请撰写学术论文《{paper_title}》的以下章节。\n\n"
-            f"## 章节：{section_title}\n"
-            f"## 字数要求：约{word_count}字\n"
-            f"## 子节：{', '.join(subsections) if subsections else '无'}\n"
-            f"## 关键点：{', '.join(key_points) if key_points else '无'}\n\n"
-            f"## 前面章节摘要：\n{chr(10).join(previous_summaries[-3:] if previous_summaries else ['无（这是第一章）'])}\n\n"
-            f"## 文献参考：{lit_summary[:500] if lit_summary else '需自行引用'}\n\n"
-            f"请撰写完整的学术内容，使用规范的学术语言，包含必要的引用标注。"
+        context = engine.build_section_writing_context(
+            paper_title=paper_title,
+            target_journal=paper_spec.get("target_journal", "CSSCI核心期刊"),
+            language=paper_spec.get("language", "中文"),
+            outline=json.dumps(outline_data, ensure_ascii=False),
+            section_title=section_title,
+            word_count=word_count,
+            subsections=subsections,
+            key_points=key_points,
+            research_type=paper_spec.get("research_type", "empirical"),
+            relevant_papers=lit_summary[:500] if lit_summary else "",
+            previous_sections="\n".join(previous_summaries[-3:]) if previous_summaries else "",
         )
 
         response = await llm.chat(
-            messages=[
-                {"role": "system", "content": "你是一位资深学术研究者，擅长撰写经济学/金融学论文。"},
-                {"role": "user", "content": prompt},
-            ],
+            messages=context.to_messages(),
             model=config.default_writing_model,
             temperature=0.6,
         )
@@ -608,7 +605,7 @@ async def _execute_custom_step(
         llm = LLMGateway(config)
         response = await llm.chat(
             messages=[
-                {"role": "system", "content": "你是一位学术论文写作助手。"},
+                {"role": "system", "content": get_role_prompt(None)},
                 {"role": "user", "content": step.input_prompt},
             ],
             model=step.model or config.default_writing_model,

@@ -55,6 +55,8 @@ from scholarpilot.context.prompts.evidence import (
 )
 from scholarpilot.llm.gateway import LLMGateway
 from scholarpilot.utils.library import GlobalLibrary
+# ADR-007 P4: 证据强度枚举收敛到 models/enums.py
+from scholarpilot.models.enums import EvidenceStrength
 
 logger = logging.getLogger(__name__)
 
@@ -92,22 +94,8 @@ class EvidenceType(str, Enum):
     DESCRIPTIVE = "descriptive"
 
 
-class EvidenceStrength(str, Enum):
-    """证据强度枚举.
-
-    遵循保守策略：宁可标 WEAK 不标 STRONG.
-
-    Attributes:
-        STRONG: 强证据——有 DOI + 权威期刊 + 大样本 + 因果识别.
-        MODERATE: 中等证据——同行评议 + 样本有限.
-        WEAK: 弱证据——预印本/小样本/仅相关性.
-        UNVERIFIED: 未验证——信息不足.
-    """
-
-    STRONG = "strong"
-    MODERATE = "moderate"
-    WEAK = "weak"
-    UNVERIFIED = "unverified"
+# ADR-007 P4: EvidenceStrength 已收敛到 models/enums.py
+# 以下直接使用导入的 EvidenceStrength，不再重复定义
 
 
 # =============================================================================

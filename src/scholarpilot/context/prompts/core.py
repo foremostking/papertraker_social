@@ -1,10 +1,19 @@
-"""Scholar Agent 的 Prompt 模板.
+"""核心 Prompt 模板 —— 13 个基础 Prompt 常量.
 
 采用 Context Engineering 方法论：
 - 不同任务使用不同的 Prompt，避免上下文污染
 - 精准注入相关上下文，不堆砌所有信息
 - 支持中文和英文论文
+
+ADR-007 P4：原 legacy.py 重命名为 core.py，消除"legacy"命名误导。
+共享约束常量提取至 constants.py。
 """
+
+from scholarpilot.context.prompts.constants import (
+    CITATION_RULES_BLOCK,
+    REVIEW_CITATION_RULES,
+    SPEC_REF_STRATEGY,
+)
 
 # ===== Scholar Agent 系统提示词 =====
 
@@ -23,11 +32,7 @@ SCHOLAR_SYSTEM_PROMPT = """你是 ScholarPilot，一个专业的学术论文写�
 5. **论文撰写**：基于大纲逐章生成论文初稿
 6. **格式导出**：输出 Word/Markdown/LaTeX 格式
 
-## 文献引用规则（重要）
-- **时效性**：学术引用半衰期约4-5年，中文核心期刊要求以近 5-7 年文献为主
-- **引用量**：CSSCI 论文需 25-45 篇参考文献，SSCI 论文需 30-60 篇
-- **结构**：近 3 年最新文献 50-60%，经典文献 20-30%，其余为补充文献
-- **检索量**：每次检索至少返回 50 篇，建立足够候选池
+""" + CITATION_RULES_BLOCK + """
 
 ## 工作方式
 - 你直接操作项目目录中的文件，所有产出都是真实文件
@@ -116,9 +121,7 @@ SPEC_GENERATION_PROMPT = """## 任务：生成论文规格文档（SPEC.md）
 3. **目标期刊**：推荐3-5个适合的目标期刊
 4. **创新点**：本研究可能的创新点
 5. **参考文献策略**：
-   - 目标引用量：CSSCI 论文 25-45 篇，SSCI 论文 30-60 篇
-   - 时效性要求：学术引用半衰期4-5年，70% 以上引用应为近 5-7 年文献
-   - 需检索至少 50-100 篇文献作为候选池
+""" + SPEC_REF_STRATEGY + """
 6. **时间安排**：建议的研究进度
 
 **根据论文类型差异化内容**：
@@ -302,10 +305,7 @@ REVIEW_WRITING_PROMPT = """## 任务：撰写文献综述
 7. 中文撰写，学术规范语言
 8. 引用格式：作者（年份）或（作者，年份）；同一处多引用用分号分隔：作者A（年份）；作者B（年份）
 
-文献引用规则：
-- 学术引用半衰期约4-5年，近5年文献应占50-60%
-- 引用列表中的每篇文献至少被提及一次
-- 优先引用CSSCI/SSCI核心期刊和被引频次高的文献
+""" + REVIEW_CITATION_RULES + """
 """
 
 # ===== 摘要 + 关键词 + 分类号生成 Prompt =====

@@ -24,6 +24,8 @@ import aiohttp
 from pydantic import BaseModel, Field
 
 from scholarpilot.utils.network import configure_no_proxy, get_aiohttp_session_kwargs
+# ADR-007 P4: 证据等级枚举收敛到 models/enums.py
+from scholarpilot.models.enums import EvidenceStrength
 
 logger = logging.getLogger(__name__)
 
@@ -33,20 +35,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-class EvidenceLevel(str, Enum):
-    """证据等级枚举.
-
-    Attributes:
-        STRONG: 强证据 — 有 DOI 且来自权威期刊.
-        MODERATE: 中等证据 — 有明确来源但无 DOI.
-        WEAK: 弱证据 — 推断性表达，无直接来源支撑.
-        UNVERIFIED: 未验证 — AI 生成的可能虚构引用.
-    """
-
-    STRONG = "strong"
-    MODERATE = "moderate"
-    WEAK = "weak"
-    UNVERIFIED = "unverified"
+# ADR-007 P4: EvidenceLevel 已收敛到 models/enums.py 的 EvidenceStrength
+# 保留别名以兼容本模块内 30+ 处 EvidenceLevel.XXX 引用
+EvidenceLevel = EvidenceStrength
 
 
 class CitationVerification(BaseModel):

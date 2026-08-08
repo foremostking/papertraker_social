@@ -43,6 +43,7 @@ from pydantic import BaseModel, Field
 from scholarpilot.context.prompts.claim import (
     CLAIM_CALIBRATION_PROMPT,
     CLAIM_EXTRACTION_PROMPT,
+    CLAIM_OVERREACH_CONFIRM_PROMPT,
 )
 from scholarpilot.llm.gateway import LLMGateway
 
@@ -418,29 +419,12 @@ class ClaimCalibrator:
         Returns:
             True 表示确认为 overreach，False 表示降级.
         """
-        check_prompt = f"""## 任务：二次确认结论越界判断
-
-### 结论句
-{claim_text}
-
-### 结论类型
-{claim_type}
-
-### 章节上下文（截断）
-{section_text[:2000]}
-
-### 参考文献详情
-{references_detail[:1500]}
-
-### 请确认该结论是否确实越界
-
-判断标准：
-- overreach：证据仅支撑相关性（如OLS回归），但结论使用因果性表述（"导致""促进""抑制"）
-- 如果结论使用了因果性词汇，但研究中使用了因果识别策略（IV/DID/RD），则不算越界
-- 如果结论表述谨慎（如"与...相关""存在关联"），则不算越界
-
-请只回答 "true"（确认为overreach）或 "false"（不确认，需降级）。
-"""
+        check_prompt = CLAIM_OVERREACH_CONFIRM_PROMPT.format(
+            claim_text=claim_text,
+            claim_type=claim_type,
+            section_context=section_text[:2000],
+            references_detail=references_detail[:1500],
+        )
 
         try:
             response = await self.llm.chat(

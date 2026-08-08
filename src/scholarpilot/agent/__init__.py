@@ -7,6 +7,11 @@
 
 from .state import ScholarState
 from .scholar import ScholarAgent
-from .graph import create_scholar_graph
+
+# LangGraph 路径可能因依赖缺失而不可用，降级处理
+try:
+    from .graph import create_scholar_graph
+except ImportError:
+    create_scholar_graph = None
 
 __all__ = ["ScholarState", "ScholarAgent", "create_scholar_graph"]

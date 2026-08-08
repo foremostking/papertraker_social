@@ -33,6 +33,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+# ADR-007 P4: 统一统计辅助函数到 utils/text.py
+from scholarpilot.utils.text import safe_mean, safe_median, safe_stdev
+
 logger = logging.getLogger(__name__)
 
 
@@ -1273,26 +1276,11 @@ class PaperAnalyzer:
         """
         return len(re.findall(r"[\u4e00-\u9fff]", text))
 
-    @staticmethod
-    def _safe_mean(values: list[float] | list[int]) -> float:
-        """安全计算均值, 空列表返回 0.0."""
-        if not values:
-            return 0.0
-        return float(statistics.mean(values))
-
-    @staticmethod
-    def _safe_median(values: list[float] | list[int]) -> float:
-        """安全计算中位数, 空列表返回 0.0."""
-        if not values:
-            return 0.0
-        return float(statistics.median(values))
-
-    @staticmethod
-    def _safe_stdev(values: list[float] | list[int]) -> float:
-        """安全计算样本标准差, 少于 2 个值返回 0.0."""
-        if len(values) < 2:
-            return 0.0
-        return float(statistics.stdev(values))
+    # ADR-007 P4: _safe_mean/median/stdev 已收敛到 utils/text.py
+    # 保留类级别名，避免 30+ 处 self._safe_xxx 调用逐个修改
+    _safe_mean = staticmethod(safe_mean)
+    _safe_median = staticmethod(safe_median)
+    _safe_stdev = staticmethod(safe_stdev)
 
     # ==================================================================
     # 空结果工厂方法

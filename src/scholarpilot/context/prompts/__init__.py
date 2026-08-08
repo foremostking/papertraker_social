@@ -1,8 +1,9 @@
 """Prompt 模板库 — 按 10 阶段分类的模块化 Prompt 管理.
 
-从原 prompts.py 重构而来，保持完全向后兼容。
-原有 13 个 Prompt 常量仍可通过 `from scholarpilot.context.prompts import XXX` 访问。
+原有 13 个核心 Prompt 常量定义在 core.py，可通过 `from scholarpilot.context.prompts import XXX` 访问。
 新增 150+ 条 Prompt 模板按阶段分类存放。
+
+ADR-007 P4：原 prompts.py（兼容性 shim）已删除，legacy.py 已重命名为 core.py。
 
 阶段划分：
   1. system    — 系统提示词
@@ -22,7 +23,7 @@
 from __future__ import annotations
 
 # ===== 向后兼容：重新导出原有 13 个 Prompt =====
-from scholarpilot.context.prompts.legacy import (
+from scholarpilot.context.prompts.core import (
     SCHOLAR_SYSTEM_PROMPT,
     TOPIC_ANALYSIS_PROMPT,
     SPEC_GENERATION_PROMPT,
@@ -52,6 +53,8 @@ from scholarpilot.context.prompts.search import (
     SEARCH_STRATEGY_PROMPT,
     KEYWORD_DECOMPOSITION_PROMPT,
     LITERATURE_SCREENING_PROMPT,
+    KEYWORD_TRANSLATION_PROMPT,
+    SYNONYM_EXPANSION_PROMPT,
 )
 
 # 文献综述阶段
@@ -129,6 +132,8 @@ from scholarpilot.context.prompts.evidence import (
 from scholarpilot.context.prompts.claim import (
     CLAIM_EXTRACTION_PROMPT,
     CLAIM_CALIBRATION_PROMPT,
+    RELEVANCE_SCORING_PROMPT,
+    CLAIM_OVERREACH_CONFIRM_PROMPT,
 )
 
 __all__ = [
@@ -154,6 +159,8 @@ __all__ = [
     "SEARCH_STRATEGY_PROMPT",
     "KEYWORD_DECOMPOSITION_PROMPT",
     "LITERATURE_SCREENING_PROMPT",
+    "KEYWORD_TRANSLATION_PROMPT",
+    "SYNONYM_EXPANSION_PROMPT",
     # 文献综述阶段新增
     "DEEPSEEK_FIVE_STEP_PROMPT",
     "NOTEBOOKLM_FIVE_STEP_PROMPT",
@@ -204,4 +211,6 @@ __all__ = [
     # Claim校准 Prompt
     "CLAIM_EXTRACTION_PROMPT",
     "CLAIM_CALIBRATION_PROMPT",
+    "RELEVANCE_SCORING_PROMPT",
+    "CLAIM_OVERREACH_CONFIRM_PROMPT",
 ]

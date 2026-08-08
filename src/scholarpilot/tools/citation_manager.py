@@ -15,6 +15,9 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from scholarpilot.utils.network import configure_no_proxy
+from scholarpilot.context.prompts.claim import RELEVANCE_SCORING_PROMPT
+# ADR-007 P4: 标题归一化收敛到 utils/text.py
+from scholarpilot.utils.text import normalize_title
 
 logger = logging.getLogger(__name__)
 
@@ -762,18 +765,10 @@ class CrossEncoderReranker:
 
         papers_text = "\n\n".join(paper_lines)
 
-        prompt = (
-            f"研究主题：{topic}\n\n"
-            f"请对以下{len(batch)}篇论文与研究主题的相关性进行评分（1-5分）。\n"
-            f"评分标准：\n"
-            f"5分 = 直接研究该主题\n"
-            f"4分 = 密切相关（相同变量/方法/对象）\n"
-            f"3分 = 间接相关（提供理论支撑或背景）\n"
-            f"2分 = 弱相关（仅个别关键词重叠）\n"
-            f"1分 = 不相关\n\n"
-            f"论文列表：\n{papers_text}\n\n"
-            f"请只输出评分，每行一个数字，格式如下：\n"
-            f"1: 5\n2: 4\n3: 1\n..."
+        prompt = RELEVANCE_SCORING_PROMPT.format(
+            topic=topic,
+            batch_count=len(batch),
+            papers_text=papers_text,
         )
 
         try:
@@ -1932,7 +1927,7 @@ def _deduplicate_citations(citations: list[Citation]) -> list[Citation]:
 
     for c in citations:
         # 构建去重键
-        title_norm = _normalize_title(c.title or "")
+        title_norm = normalize_title(c.title or "")
         first_author = (c.authors[0] if c.authors else "").lower().strip()
         # 取姓氏（英文取最后一个单词，中文取第一个字）
         if re.search(r'[a-zA-Z]', first_author):

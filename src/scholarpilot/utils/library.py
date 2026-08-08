@@ -26,15 +26,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+# ADR-007 P4: 标题归一化收敛到 utils/text.py
+from scholarpilot.utils.text import normalize_title
 
-def _normalize_title(title: str) -> str:
-    """规范化标题用于去重比较.
-
-    去除空格、标点、大小写差异，使"地方政府债务研究"和"地方政府 债务 研究"能匹配。
-    """
-    # 去除所有空格和常见标点
-    cleaned = re.sub(r"[\s\u3000，。、；：！？\u201c\u201d\u2018\u2019（）()\[\]【】]", "", title)
-    return cleaned.lower()
+# 向后兼容别名（feed.py 等模块通过 library 导入 _normalize_title）
+_normalize_title = normalize_title
 
 
 def _generate_paper_id(title: str, year: str | int | None = "") -> str:

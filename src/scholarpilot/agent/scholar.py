@@ -31,6 +31,8 @@ from scholarpilot.config import get_settings
 from scholarpilot.context.engine import ContextEngine
 from scholarpilot.context.memory import ProjectMemory
 from scholarpilot.context.profile import ResearcherProfile
+from scholarpilot.context.prompts.constants import CSSCI_REF_RANGE
+from scholarpilot.events.types import ProgressEvent, StepOutput, WorkflowCallback
 from scholarpilot.llm.gateway import LLMGateway
 from scholarpilot.mcp.servers.cnki import (
     CNKISearchResult,
@@ -81,6 +83,7 @@ class ScholarAgent:
         project_dir: Path | str,
         config=None,
         cnki_cookie: str = "",
+        callback: WorkflowCallback | None = None,
     ) -> None:
         """初始化 Scholar Agent.
 
@@ -88,10 +91,12 @@ class ScholarAgent:
             project_dir: 项目目录路径。
             config: 配置对象，如不提供则自动获取。
             cnki_cookie: CNKI 登录 Cookie（可选）。
+            callback: 工作流回调接口，用于桌面 UI 实时进度推送（可选）。
         """
         self.project_dir = Path(project_dir)
         self.config = config or get_settings()
         self.console = console
+        self._callback = callback
 
         # 核心组件
         self.llm = LLMGateway(self.config)
@@ -142,6 +147,130 @@ class ScholarAgent:
         # 非交互模式（用于自动化测试或脚本调用）
         self.non_interactive: bool = False
         self.default_choices: dict[str, int] = {}  # 各交互步骤的默认选择
+
+    # ===== 回调辅助方法（桌面 UI 实时进度推送）=====
+
+    def _emit(
+        self,
+        phase: str,
+        status: str,
+        message: str = "",
+        progress_pct: float | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """发出进度事件到回调接口（如有）.
+
+        Args:
+            phase: 阶段标识
+            status: "start" | "progress" | "complete" | "error"
+            message: 人类可读描述
+            progress_pct: 子步骤进度 0.0-1.0
+            **kwargs: 附加数据，合并到 event.data
+        """
+        if not self._callback:
+            return
+        event = ProgressEvent(
+            phase=phase,
+            status=status,
+            message=message,
+            progress_pct=progress_pct,
+            data=kwargs if kwargs else None,
+        )
+        try:
+            self._callback.on_progress(event)
+        except Exception as e:
+            logger.debug(f"回调 on_progress 失败: {e}")
+
+    def _emit_step_complete(self, phase: str, content: str, content_type: str = "markdown", **metadata: Any) -> None:
+        """发出步骤完成事件，携带可预览的输出内容.
+
+        Args:
+            phase: 阶段标识
+            content: Markdown/JSON/Text 内容
+            content_type: "markdown" | "json" | "text"
+            **metadata: 元数据（char_count, ref_count 等）
+        """
+        if not self._callback:
+            return
+        output = StepOutput(
+            phase=phase,
+            content=content,
+            content_type=content_type,
+            metadata=metadata,
+        )
+        try:
+            self._callback.on_step_complete(phase, output)
+        except Exception as e:
+            logger.debug(f"回调 on_step_complete 失败: {e}")
+
+    def _emit_error(self, phase: str, error: str) -> None:
+        """发出错误事件."""
+        if not self._callback:
+            return
+        try:
+            self._callback.on_error(phase, error)
+        except Exception as e:
+            logger.debug(f"回调 on_error 失败: {e}")
+
+    def _save_step_output(self, phase: str) -> None:
+        """保存步骤输出到 .scholar/steps/ 目录，供前端预览加载.
+
+        Args:
+            phase: 阶段标识
+        """
+        steps_dir = self.project_dir / ".scholar" / "steps"
+        steps_dir.mkdir(parents=True, exist_ok=True)
+
+        content = ""
+        content_type = "markdown"
+        metadata: dict[str, Any] = {}
+
+        # 根据阶段读取对应的输出文件
+        file_map = {
+            "topic_analysis": (".scholar" / "memory.json", "json"),
+            "literature_search": ("literature" / "review.md", "markdown"),
+            "evidence_matrix": ("evidence_matrix.md", "markdown"),
+            "spec_generation": ("SPEC.md", "markdown"),
+            "outline": ("outline.md", "markdown"),
+        }
+
+        if phase in file_map:
+            rel_path, content_type = file_map[phase]
+            file_path = self.project_dir / rel_path
+            if file_path.exists():
+                content = file_path.read_text(encoding="utf-8")
+                metadata["char_count"] = len(content)
+
+        # 章节撰写阶段：读取所有已完成的章节
+        if phase == "section_writing":
+            draft_dir = self.project_dir / "draft"
+            if draft_dir.exists():
+                parts = []
+                for md_file in sorted(draft_dir.glob("chapter*.md")):
+                    parts.append(md_file.read_text(encoding="utf-8"))
+                content = "\n\n---\n\n".join(parts)
+                content_type = "markdown"
+                metadata["char_count"] = len(content)
+                metadata["chapter_count"] = len(parts)
+
+        # 完成阶段：读取完整草稿
+        if phase == "completed":
+            full_draft = self.project_dir / "draft" / "full_draft.md"
+            if not full_draft.exists():
+                full_draft = self.project_dir / "draft" / "full_draft_polished.md"
+            if full_draft.exists():
+                content = full_draft.read_text(encoding="utf-8")
+                metadata["char_count"] = len(content)
+
+        output = StepOutput(
+            phase=phase,
+            content=content,
+            content_type=content_type,
+            metadata=metadata,
+        )
+
+        output_file = steps_dir / f"{phase}.json"
+        output_file.write_text(output.to_json(), encoding="utf-8")
 
     async def run(self, user_input: str) -> None:
         """启动 Scholar Agent 工作流（支持断点续写）.
@@ -215,28 +344,40 @@ class ScholarAgent:
         try:
             # Phase 1: 选题分析
             if "topic_analysis" not in completed_phases:
+                self._emit("topic_analysis", "start", "开始选题分析...")
                 await self._phase1_topic_analysis(user_input)
+                self._emit("topic_analysis", "complete", "选题分析完成")
+                self._save_step_output("topic_analysis")
             self.file_manager.save_progress(
                 self.project_dir, "literature_search"
             )
 
             # Phase 2: 多源文献检索 + 8维统计
             if "literature_search" not in completed_phases:
+                self._emit("literature_search", "start", "开始多源文献检索...")
                 await self._phase2_literature_search()
+                self._emit("literature_search", "complete", "文献检索完成")
+                self._save_step_output("literature_search")
             self.file_manager.save_progress(
                 self.project_dir, "evidence_matrix"
             )
 
             # Phase 2.5: 证据矩阵构建（新增）
             if "evidence_matrix" not in completed_phases:
+                self._emit("evidence_matrix", "start", "构建证据矩阵...")
                 await self._phase2_5_build_evidence_matrix()
+                self._emit("evidence_matrix", "complete", "证据矩阵构建完成")
+                self._save_step_output("evidence_matrix")
             self.file_manager.save_progress(
                 self.project_dir, "spec_generation"
             )
 
             # Phase 3 + 4: 生成论文规格 + 用户审核
             if "spec_generation" not in completed_phases:
+                self._emit("spec_generation", "start", "生成论文规格文档...")
                 await self._phase3_generate_spec()
+                self._emit("spec_generation", "complete", "论文规格生成完成")
+                self._save_step_output("spec_generation")
                 approved = await self._human_review("选题验证", "SPEC.md")
                 if not approved:
                     self.console.print("[yellow]用户未确认选题，Agent 暂停。[/yellow]")
@@ -251,7 +392,10 @@ class ScholarAgent:
 
             # Phase 5 + 6: 生成大纲 + 用户审核
             if "outline" not in completed_phases:
+                self._emit("outline", "start", "生成论文大纲...")
                 await self._phase5_generate_outline()
+                self._emit("outline", "complete", "大纲生成完成")
+                self._save_step_output("outline")
                 approved = await self._human_review("论文大纲", "outline.md")
                 if not approved:
                     self.console.print("[yellow]用户未确认大纲，Agent 暂停。[/yellow]")
@@ -268,7 +412,9 @@ class ScholarAgent:
             if "data_collection" not in completed_phases:
                 research_type = self.topic_info.get("research_type", "empirical")
                 if research_type == "empirical":
+                    self._emit("data_collection", "start", "数据采集协作...")
                     data_ready = await self._phase6_5_data_collection()
+                    self._emit("data_collection", "complete", "数据采集阶段结束")
                     if not data_ready:
                         self.console.print(
                             "[yellow]用户跳过数据采集，实证章节将使用占位符模式[/yellow]\n"
@@ -281,9 +427,12 @@ class ScholarAgent:
 
             # Phase 7: 逐章撰写（支持章节级断点恢复）
             if "section_writing" not in completed_phases:
+                self._emit("section_writing", "start", "开始逐章撰写...")
                 await self._phase7_write_sections(
                     skip_sections=completed_sections if resume else None
                 )
+                self._emit("section_writing", "complete", "逐章撰写完成")
+                self._save_step_output("section_writing")
             self.file_manager.save_progress(
                 self.project_dir, "post_processing"
             )
@@ -302,6 +451,7 @@ class ScholarAgent:
             # 更新项目状态和进度
             self.file_manager.update_project_status(self.project_dir, "draft_completed")
             self.file_manager.save_progress(self.project_dir, "completed")
+            self._emit("completed", "start", "后处理：去AI味 + 润色 + Claim校准...")
 
             # 将本篇论文记录写入研究者画像（跨论文长期记忆）
             meta = self.file_manager.get_project_meta(self.project_dir) or {}
@@ -324,10 +474,13 @@ class ScholarAgent:
 
             # Phase 8 增强：显示质量报告 + 导出建议 + 实证工具提示
             self._phase8_post_completion()
+            self._emit("completed", "complete", "论文生成全部完成！")
+            self._save_step_output("completed")
 
         except Exception as e:
             logger.error(f"Scholar Agent error: {e}", exc_info=True)
             self.console.print(f"[red]错误: {e}[/red]")
+            self._emit_error("error", str(e))
             # 保存当前进度以便恢复
             self.file_manager.save_progress(
                 self.project_dir, "section_writing",
@@ -1556,6 +1709,14 @@ class ScholarAgent:
                 continue
 
             self.console.print(f"\n[dim]✍️ 正在撰写: {section_title} (约{word_count}字)...[/dim]")
+            self._emit(
+                "section_writing", "progress",
+                f"正在撰写: {section_title}（第{i+1}章/共{len(sections)}章）",
+                progress_pct=(i / len(sections)) if sections else 0,
+                current_chapter=i + 1,
+                total_chapters=len(sections),
+                section_title=section_title,
+            )
 
             # 为文献综述章节注入更详细的文献列表（含摘要），其他章节使用精简列表
             # 优先使用证据矩阵的结构化证据（如有）
@@ -1654,6 +1815,16 @@ class ScholarAgent:
                     total_sections=len(sections),
                     phase_detail=f"正在撰写: {section_title}（{len(completed_sections)}/{len(sections)}）",
                 )
+                self._emit(
+                    "section_writing", "progress",
+                    f"已完成: {section_title}（{len(completed_sections)}/{len(sections)}）",
+                    progress_pct=len(completed_sections) / len(sections) if sections else 0,
+                    completed_chapters=len(completed_sections),
+                    total_chapters=len(sections),
+                    section_title=section_title,
+                    char_count=len(section_content),
+                )
+                self._save_step_output("section_writing")
 
             except Exception as e:
                 self.console.print(f"  [red]章节撰写失败: {e}[/red]")
@@ -3309,11 +3480,11 @@ class ScholarAgent:
         # 参考文献评估
         ref_count = report.get("reference_count", 0)
         if ref_count >= 25:
-            assessment["references"] = f"充足（{ref_count}篇，CSSCI标准25-45篇）"
+            assessment["references"] = f"充足（{ref_count}篇，CSSCI标准{CSSCI_REF_RANGE}篇）"
         elif ref_count >= 15:
             assessment["references"] = f"偏少（{ref_count}篇，建议补充至25篇以上）"
         elif ref_count > 0:
-            assessment["references"] = f"不足（{ref_count}篇，核心期刊通常需要25-45篇）"
+            assessment["references"] = f"不足（{ref_count}篇，核心期刊通常需要{CSSCI_REF_RANGE}篇）"
         else:
             assessment["references"] = "缺失（无参考文献，请运行引用管理）"
 

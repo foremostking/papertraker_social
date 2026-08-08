@@ -144,3 +144,50 @@ CLAIM_CALIBRATION_PROMPT = """## 任务：校准结论与证据的匹配关系
   - 结论与政策建议章节：政策建议不需要引用支撑，标记为 supported
 - **partial 的使用标准**：只有当结论句的表述明显超出了引用文献的支撑范围时，才标记为 partial。例如结论说"A导致B"，但引用的文献只研究了"A与B的相关性"。如果引用文献的结论与结论句表述一致，应标记为 supported
 """
+
+# ===== 文献相关性评分 Prompt（从 tools/citation_manager.py 提取）=====
+
+RELEVANCE_SCORING_PROMPT = """研究主题：{topic}
+
+请对以下{batch_count}篇论文与研究主题的相关性进行评分（1-5分）。
+评分标准：
+5分 = 直接研究该主题
+4分 = 密切相关（相同变量/方法/对象）
+3分 = 间接相关（提供理论支撑或背景）
+2分 = 弱相关（仅个别关键词重叠）
+1分 = 不相关
+
+论文列表：
+{papers_text}
+
+请只输出评分，每行一个数字，格式如下：
+1: 5
+2: 4
+3: 1
+..."""
+
+# ===== Overreach 二次确认 Prompt（从 tools/claim_calibrator.py 提取）=====
+
+CLAIM_OVERREACH_CONFIRM_PROMPT = """## 任务：二次确认结论越界判断
+
+### 结论句
+{claim_text}
+
+### 结论类型
+{claim_type}
+
+### 章节上下文（截断）
+{section_context}
+
+### 参考文献详情
+{references_detail}
+
+### 请确认该结论是否确实越界
+
+判断标准：
+- overreach：证据仅支撑相关性（如OLS回归），但结论使用因果性表述（"导致""促进""抑制"）
+- 如果结论使用了因果性词汇，但研究中使用了因果识别策略（IV/DID/RD），则不算越界
+- 如果结论表述谨慎（如"与...相关""存在关联"），则不算越界
+
+请只回答 "true"（确认为overreach）或 "false"（不确认，需降级）。
+"""

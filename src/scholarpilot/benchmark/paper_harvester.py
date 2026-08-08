@@ -44,6 +44,7 @@ from typing import Any
 import httpx
 
 from scholarpilot.utils.network import configure_no_proxy
+from scholarpilot.utils.text import normalize_title
 from scholarpilot.benchmark.journal_list import get_journal_names
 from scholarpilot.mcp.servers.ncpssd import NCPSSDEngine, NCPSSDPaper
 from scholarpilot.mcp.servers.cnki import CNKIAiohttpEngine, CNKIPaper, DEFAULT_SOURCE_CATEGORIES
@@ -590,29 +591,6 @@ class PaperHarvester:
     # 内部方法: 去重
     # ==================================================================
 
-    def _normalize_title(self, title: str) -> str:
-        """标准化论文标题用于去重.
-
-        处理步骤:
-            1. 去除首尾空白.
-            2. 移除所有空白字符.
-            3. 移除所有标点符号 (中文和英文).
-            4. 转为小写.
-
-        Args:
-            title: 原始标题.
-
-        Returns:
-            标准化后的标题.
-        """
-        if not title:
-            return ""
-        # 去除首尾空白并移除所有内部空白
-        normalized = re.sub(r"\s+", "", title.strip())
-        # 仅保留字母、数字、下划线和 CJK 字符
-        normalized = re.sub(r"[^\w\u4e00-\u9fff]", "", normalized, flags=re.UNICODE)
-        return normalized.lower()
-
     def _dedup_key(self, paper: dict[str, Any]) -> str:
         """生成去重键 (标准化标题 + 年份).
 
@@ -622,7 +600,7 @@ class PaperHarvester:
         Returns:
             去重键字符串.
         """
-        title = self._normalize_title(paper.get("title", ""))
+        title = normalize_title(paper.get("title", ""))
         year = str(paper.get("year", "")).strip()
         return f"{title}_{year}"
 
