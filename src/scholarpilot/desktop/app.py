@@ -59,19 +59,21 @@ class DesktopApp:
                 completed_sections = progress.get("completed_sections", [])
                 total_sections = progress.get("total_sections", 0)
 
-                # 判断项目状态
-                status = "not_started"
-                if "completed" in completed_phases:
-                    status = "completed"
-                elif completed_phases or completed_sections:
-                    status = "in_progress"
-
-                # 计算进度百分比
+                # 所有可能的阶段（与 ScholarAgent 实际 emit 的阶段名一致）
                 all_phases = [
                     "topic_analysis", "literature_search", "evidence_matrix",
                     "spec_generation", "outline", "data_collection",
-                    "section_writing", "post_processing", "completed",
+                    "section_writing", "post_processing", "claim_calibration",
                 ]
+
+                # 判断项目状态：所有阶段完成 = 已完成
+                status = "not_started"
+                if completed_phases:
+                    status = "in_progress"
+                if len(completed_phases) >= len(all_phases):
+                    status = "completed"
+
+                # 计算进度百分比
                 phase_pct = len([p for p in all_phases if p in completed_phases]) / len(all_phases)
 
                 projects.append({
@@ -244,12 +246,22 @@ class DesktopApp:
             if not project_dir:
                 return json.dumps({"error": "项目不存在"}, ensure_ascii=False)
 
-            # 优先从 steps 目录读取缓存的输出
+            # 优先从 steps 目录读取缓存的输出（桌面版运行时创建）
             step_file = Path(project_dir) / ".scholar" / "steps" / f"{phase}.json"
             if step_file.exists():
                 return step_file.read_text(encoding="utf-8")
 
-            # 没有缓存，尝试实时读取
+            # 降级：从实际项目文件读取（兼容 CLI 版本生成的项目）
+            content = self._read_phase_output(Path(project_dir), phase)
+            if content:
+                return json.dumps({
+                    "phase": phase,
+                    "content": content,
+                    "content_type": "markdown",
+                    "metadata": {"char_count": len(content)},
+                    "saved_at": "",
+                }, ensure_ascii=False)
+
             return json.dumps({
                 "phase": phase,
                 "content": "（步骤尚未完成，暂无输出）",
@@ -542,6 +554,38 @@ class DesktopApp:
             except Exception:
                 pass
         return total
+
+    def _read_phase_output(self, project_dir: Path, phase: str) -> str:
+        """从项目实际文件读取阶段输出（CLI 兼容降级方案）.
+
+        当 .scholar/steps/ 缓存不存在时，直接读取对应文件。
+        """
+        file_map = {
+            "topic_analysis": "SPEC.md",
+            "literature_search": "literature/review.md",
+            "evidence_matrix": "literature/evidence_matrix.md",
+            "spec_generation": "SPEC.md",
+            "outline": "outline.md",
+            "data_collection": "data_collection_guide.md",
+            "section_writing": "draft/full_draft.md",
+            "post_processing": "draft/deai_report.md",
+            "claim_calibration": "draft/claim_calibration_report.md",
+            "completed": "draft/full_draft_polished.md",
+        }
+        # 降级映射：主文件不存在时尝试的替代文件
+        fallback_map = {
+            "literature_search": "literature/evidence_matrix.md",
+        }
+        if phase in file_map:
+            file_path = project_dir / file_map[phase]
+            if not file_path.exists() and phase in fallback_map:
+                file_path = project_dir / fallback_map[phase]
+            if file_path.exists():
+                try:
+                    return file_path.read_text(encoding="utf-8")
+                except Exception:
+                    return ""
+        return ""
 
 
 def main() -> None:

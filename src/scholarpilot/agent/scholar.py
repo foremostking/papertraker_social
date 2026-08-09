@@ -227,8 +227,8 @@ class ScholarAgent:
 
         # 根据阶段读取对应的输出文件
         file_map = {
-            "topic_analysis": (".scholar" / "memory.json", "json"),
-            "literature_search": ("literature" / "review.md", "markdown"),
+            "topic_analysis": (".scholar/memory.json", "json"),
+            "literature_search": ("literature/review.md", "markdown"),
             "evidence_matrix": ("evidence_matrix.md", "markdown"),
             "spec_generation": ("SPEC.md", "markdown"),
             "outline": ("outline.md", "markdown"),
