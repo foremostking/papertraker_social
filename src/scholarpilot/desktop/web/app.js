@@ -80,6 +80,7 @@
     progressData: null,
     bottomPanelCollapsed: false,
     commentSidebarOpen: false,
+    _timelineRenderTimer: null,  // debounce 时间线渲染
   };
 
   /* ════════════════════════════════════════════════════════════════
@@ -103,6 +104,7 @@
     getProjectList()        { return this._call('get_project_list'); },
     createProject(name, topic) { return this._call('create_project', name, topic); },
     deleteProject(name)     { return this._call('delete_project', name); },
+    renameProject(oldName, newName) { return this._call('rename_project', oldName, newName); },
     startGeneration(name, topic) { return this._call('start_generation', name, topic); },
     cancelGeneration()      { return this._call('cancel_generation'); },
     getGenerationStatus()   { return this._call('get_generation_status'); },
@@ -121,6 +123,9 @@
     },
     resolveComment(name, id) { return this._call('resolve_comment', name, id); },
     getConfig()             { return this._call('get_config'); },
+    setApiKey(provider, key) { return this._call('set_api_key', provider, key); },
+    setModelConfig(writingModel) { return this._call('set_model_config', writingModel); },
+    exportProject(name, fmt) { return this._call('export_project', name, fmt); },
   };
 
   /* ════════════════════════════════════════════════════════════════
@@ -325,6 +330,8 @@
 
     if (parts[0] === 'projects' || parts.length === 0 || !parts[0]) {
       renderProjectsPage();
+    } else if (parts[0] === 'settings') {
+      renderSettingsPage();
     } else if (parts[0] === 'progress' && parts[1]) {
       State.currentProject = decodeURIComponent(parts[1]);
       renderProgressPage(State.currentProject);
@@ -589,6 +596,8 @@
 
     var deleteBtn = '<button class="btn btn-ghost btn-sm project-card-action" data-action="delete" title="删除">' +
       ICONS.trash + '</button>';
+    var renameBtn = '<button class="btn btn-ghost btn-sm project-card-action" data-action="rename" title="重命名">' +
+      ICONS.edit + '</button>';
 
     return '<div class="project-card" data-project="' + escapeHtml(p.name) + '">' +
       '<div class="project-card-header">' +
@@ -607,7 +616,7 @@
       '</div>' +
       '<div class="project-card-footer">' +
         '<span style="font-size:12px;color:var(--text-tertiary);">进度 ' + (p.progress_pct || 0) + '%</span>' +
-        '<div class="project-card-actions">' + deleteBtn + actionBtn + '</div>' +
+        '<div class="project-card-actions">' + renameBtn + deleteBtn + actionBtn + '</div>' +
       '</div>' +
     '</div>';
   }
@@ -630,6 +639,9 @@
         confirmDialog('删除项目', '确定要删除项目 "' + (project ? project.title || name : name) + '" 吗？此操作不可撤销。', function () {
           deleteProject(name);
         });
+        break;
+      case 'rename':
+        showRenameDialog(name, project);
         break;
     }
   }
@@ -681,6 +693,54 @@
       navigate('#/progress/' + encodeURIComponent(name));
     } catch (e) {
       showToast('error', '创建失败: ' + e.message);
+    }
+  }
+
+  function showRenameDialog(oldName, project) {
+    var body =
+      '<div class="form-field">' +
+        '<label class="form-label">当前名称：' + escapeHtml(oldName) + '</label>' +
+      '</div>' +
+      '<div class="form-field">' +
+        '<label class="form-label">新名称</label>' +
+        '<input type="text" class="form-input" id="rename-project-name" value="' + escapeHtml(oldName) + '" />' +
+      '</div>';
+
+    showModal({
+      title: '重命名项目',
+      body: body,
+      buttons: [
+        { text: '取消', type: 'btn-secondary' },
+        {
+          text: '确认', type: 'btn-primary',
+          closeOnClick: false,
+          onClick: function (modal, overlay) {
+            var newName = modal.querySelector('#rename-project-name').value.trim();
+            if (!newName) {
+              showToast('warning', '请输入新名称');
+              return;
+            }
+            if (newName === oldName) {
+              showToast('info', '名称未改变');
+              document.getElementById('modal-root').removeChild(overlay);
+              return;
+            }
+            renameProject(oldName, newName, overlay);
+          },
+        },
+      ],
+    });
+  }
+
+  async function renameProject(oldName, newName, overlay) {
+    try {
+      var result = await API.renameProject(oldName, newName);
+      if (result.error) throw new Error(result.error);
+      showToast('success', '重命名成功: ' + newName);
+      if (overlay) document.getElementById('modal-root').removeChild(overlay);
+      await loadProjects();
+    } catch (e) {
+      showToast('error', '重命名失败: ' + e.message);
     }
   }
 
@@ -743,6 +803,221 @@
       showToast('error', '删除失败: ' + e.message);
     }
   }
+
+  function showExportDialog(projectName) {
+    var formats = [
+      { id: 'docx', label: 'Word (.docx)', icon: ICONS.doc, desc: '适合进一步编辑和排版' },
+      { id: 'pdf', label: 'PDF', icon: ICONS.file, desc: '适合提交和打印，需要 Word 或 LibreOffice' },
+      { id: 'latex', label: 'LaTeX (.tex)', icon: ICONS.edit, desc: '适合学术投稿和公式排版' },
+      { id: 'md', label: 'Markdown', icon: ICONS.doc, desc: '纯文本格式，方便版本管理' },
+    ];
+
+    var bodyHtml =
+      '<div class="export-dialog">' +
+        '<p style="color:var(--text-secondary);font-size:13px;margin-bottom:var(--space-lg);">选择导出格式：</p>' +
+        formats.map(function (f) {
+          return '<div class="export-option" data-fmt="' + f.id + '">' +
+            '<div class="export-option-icon">' + f.icon + '</div>' +
+            '<div class="export-option-info">' +
+              '<div class="export-option-label">' + escapeHtml(f.label) + '</div>' +
+              '<div class="export-option-desc">' + escapeHtml(f.desc) + '</div>' +
+            '</div>' +
+          '</div>';
+        }).join('') +
+        '<div class="export-status" id="export-status" style="display:none;"></div>' +
+      '</div>';
+
+    var modalResult = showModal({
+      title: '导出论文 — ' + escapeHtml(projectName),
+      body: bodyHtml,
+      footer: false,
+    });
+
+    // 绑定导出选项点击
+    modalResult.bodyEl.querySelectorAll('.export-option').forEach(function (opt) {
+      opt.addEventListener('click', function () {
+        var fmt = opt.getAttribute('data-fmt');
+        doExport(projectName, fmt, modalResult);
+      });
+    });
+  }
+
+  async function doExport(projectName, fmt, modalResult) {
+    var statusEl = modalResult.bodyEl.querySelector('#export-status');
+    statusEl.style.display = 'block';
+    statusEl.className = 'export-status loading';
+    statusEl.textContent = '正在导出 ' + fmt.toUpperCase() + ' 格式...';
+
+    // 禁用所有选项
+    modalResult.bodyEl.querySelectorAll('.export-option').forEach(function (opt) {
+      opt.style.pointerEvents = 'none';
+      opt.style.opacity = '0.5';
+    });
+
+    try {
+      var result = await API.exportProject(projectName, fmt);
+      if (result.error) throw new Error(result.error);
+      statusEl.className = 'export-status success';
+      statusEl.innerHTML =
+        '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>' +
+        '导出成功！文件路径：<br/><code>' + escapeHtml(result.output_path) + '</code>';
+      showToast('success', '导出成功: ' + result.output_path);
+    } catch (e) {
+      statusEl.className = 'export-status error';
+      statusEl.textContent = '导出失败: ' + e.message;
+      // 恢复选项
+      modalResult.bodyEl.querySelectorAll('.export-option').forEach(function (opt) {
+        opt.style.pointerEvents = '';
+        opt.style.opacity = '';
+      });
+    }
+  }
+
+  /* ════════════════════════════════════════════════════════════════
+     页面 1.5 — 设置页面
+     ════════════════════════════════════════════════════════════════ */
+  function renderSettingsPage() {
+    State.currentProject = '';
+    updateNavActive('#/settings');
+    updateBreadcrumb([{ label: '首页', route: '#/projects' }, { label: '设置' }]);
+    updateHeaderActions([]);
+
+    var main = document.getElementById('main-content');
+    main.innerHTML =
+      '<div class="settings-page">' +
+        '<h2 class="settings-title">API Key 配置</h2>' +
+        '<p class="settings-desc">配置大模型 API Key，用于论文生成和学术分析。密钥保存在本地 <code>.env</code> 文件中，不会上传到任何服务器。</p>' +
+        '<div class="settings-form" id="settings-form">' +
+          Object.keys(API_PROVIDERS).map(function (provider) {
+            return '<div class="form-field">' +
+              '<label class="form-label">' + escapeHtml(API_PROVIDERS[provider]) + '</label>' +
+              '<div class="form-input-row">' +
+                '<input type="password" class="form-input" id="api-key-' + provider + '" ' +
+                  'placeholder="输入 ' + escapeHtml(API_PROVIDERS[provider]) + ' 的 API Key" autocomplete="off">' +
+                '<button class="btn btn-secondary btn-sm" data-action="toggle" data-target="api-key-' + provider + '">' +
+                  ICONS.eye +
+                '</button>' +
+              '</div>' +
+            '</div>';
+          }).join('') +
+          '<div class="form-field">' +
+            '<label class="form-label">默认写作模型</label>' +
+            '<select class="form-input" id="default-writing-model">' +
+              MODEL_OPTIONS.map(function (m) {
+                return '<option value="' + escapeHtml(m.value) + '">' + escapeHtml(m.label) + '</option>';
+              }).join('') +
+            '</select>' +
+          '</div>' +
+          '<div class="form-actions">' +
+            '<button class="btn btn-primary" id="save-settings-btn">' +
+              '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>' +
+              '<span>保存配置</span>' +
+            '</button>' +
+            '<span class="form-status" id="form-status"></span>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+
+    // 加载当前配置
+    API.getConfig().then(function (config) {
+      if (config.error) return;
+      // 标记哪些提供商已配置
+      Object.keys(API_PROVIDERS).forEach(function (provider) {
+        var input = document.getElementById('api-key-' + provider);
+        if (input && config[provider + '_configured']) {
+          input.placeholder = '已配置（输入新 Key 覆盖，留空则保持不变）';
+          input.parentElement.parentElement.classList.add('configured');
+        }
+      });
+      // 设置默认写作模型
+      var modelSelect = document.getElementById('default-writing-model');
+      if (modelSelect && config.writing_model) {
+        modelSelect.value = config.writing_model;
+      }
+    }).catch(function () { /* 加载失败，静默处理 */ });
+
+    // 绑定事件
+    document.getElementById('save-settings-btn').addEventListener('click', saveSettings);
+
+    // 密码可见性切换
+    main.querySelectorAll('[data-action="toggle"]').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var targetId = btn.getAttribute('data-target');
+        var input = document.getElementById(targetId);
+        if (input) {
+          input.type = input.type === 'password' ? 'text' : 'password';
+        }
+      });
+    });
+  }
+
+  async function saveSettings() {
+    var statusEl = document.getElementById('form-status');
+    statusEl.className = 'form-status saving';
+    statusEl.textContent = '正在保存...';
+
+    var savedCount = 0;
+    var errors = [];
+
+    // 保存各个 API Key
+    for (var provider in API_PROVIDERS) {
+      var input = document.getElementById('api-key-' + provider);
+      if (input && input.value.trim()) {
+        try {
+          var result = await API.setApiKey(provider, input.value.trim());
+          if (result.error) throw new Error(result.error);
+          savedCount++;
+          input.value = '';
+          input.placeholder = '已配置（输入新 Key 覆盖，留空则保持不变）';
+          input.parentElement.parentElement.classList.add('configured');
+        } catch (e) {
+          errors.push(API_PROVIDERS[provider] + ': ' + e.message);
+        }
+      }
+    }
+
+    // 保存默认写作模型
+    var modelSelect = document.getElementById('default-writing-model');
+    if (modelSelect && modelSelect.value) {
+      try {
+        var modelResult = await API.setModelConfig(modelSelect.value);
+        if (modelResult.error) throw new Error(modelResult.error);
+      } catch (e) {
+        errors.push('模型配置: ' + e.message);
+      }
+    }
+
+    if (errors.length) {
+      statusEl.className = 'form-status error';
+      statusEl.textContent = '部分保存失败: ' + errors.join('; ');
+    } else if (savedCount > 0 || modelSelect.value) {
+      statusEl.className = 'form-status success';
+      statusEl.textContent = '配置已保存' + (savedCount > 0 ? '（' + savedCount + ' 个 API Key）' : '');
+      // 刷新配置状态
+      setTimeout(function () { updateConfigBadge(); }, 500);
+    } else {
+      statusEl.className = 'form-status';
+      statusEl.textContent = '未输入任何 API Key';
+    }
+  }
+
+  /* ════════════════════════════════════════════════════════════════
+     API 提供商映射
+     ════════════════════════════════════════════════════════════════ */
+  const API_PROVIDERS = {
+    zhipu:   '智谱 AI (GLM)',
+    ark:     '火山方舟 (豆包)',
+    claude:  'Claude (Anthropic)',
+    openai:  'OpenAI',
+    deepseek:'DeepSeek',
+  };
+
+  const MODEL_OPTIONS = [
+    { value: 'claude-sonnet-4-20250514', label: 'Claude Sonnet 4' },
+    { value: 'glm-4', label: '智谱 GLM-4' },
+    { value: 'gpt-4o', label: 'GPT-4o' },
+    { value: 'deepseek/deepseek-chat', label: 'DeepSeek Chat' },
+  ];
 
   /* ════════════════════════════════════════════════════════════════
      页面 2 — 进度面板
@@ -942,6 +1217,9 @@
     updateHeaderActions([
       { text: '生成进度', type: 'btn-secondary', icon: ICONS.clock, onClick: function () {
         navigate('#/progress/' + encodeURIComponent(projectName));
+      }},
+      { text: '导出', type: 'btn-secondary', icon: ICONS.file, onClick: function () {
+        showExportDialog(projectName);
       }},
       { text: '评论', type: 'btn-secondary', icon: ICONS.comment, onClick: function () {
         toggleCommentSidebar();
@@ -1200,6 +1478,7 @@
      ════════════════════════════════════════════════════════════════ */
   var selectionToolbar = null;
   var currentSelection = null;
+  var selectionTimer = null;  // 竞态保护：取消上一次待处理的选区
 
   function initSelectionToolbarForArea() {
     var area = document.getElementById('markdown-area');
@@ -1214,8 +1493,14 @@
   }
 
   function handleSelection(e) {
+    // 竞态保护：取消上一次待处理的选区判断
+    if (selectionTimer) {
+      clearTimeout(selectionTimer);
+      selectionTimer = null;
+    }
     // 延迟检查，确保 selection 已更新
-    setTimeout(function () {
+    selectionTimer = setTimeout(function () {
+      selectionTimer = null;
       var sel = window.getSelection();
       if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
         hideSelectionToolbar();
@@ -1614,10 +1899,16 @@
 
     addLog(logLevel, '[' + phaseName + '] ' + message);
 
-    // 如果当前在进度页面，更新 UI
+    // 如果当前在进度页面，更新 UI（debounce 时间线渲染，避免高频重绘）
     if (State.route && State.route.startsWith('#/progress')) {
       renderStatusBar(State.currentProject);
-      renderTimeline(State.currentProject);
+      if (State._timelineRenderTimer) {
+        clearTimeout(State._timelineRenderTimer);
+      }
+      State._timelineRenderTimer = setTimeout(function () {
+        State._timelineRenderTimer = null;
+        renderTimeline(State.currentProject);
+      }, 200);
     }
 
     // 步骤完成时刷新步骤列表

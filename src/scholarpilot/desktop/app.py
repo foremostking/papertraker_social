@@ -66,15 +66,21 @@ class DesktopApp:
                     "section_writing", "post_processing", "claim_calibration",
                 ]
 
-                # 判断项目状态：所有阶段完成 = 已完成
+                # 文件一致性校验：只有阶段标记为完成且对应文件存在才算真正完成
+                verified_phases = [
+                    p for p in completed_phases
+                    if self._verify_phase_file(project_dir, p)
+                ]
+
+                # 判断项目状态
                 status = "not_started"
-                if completed_phases:
+                if verified_phases:
                     status = "in_progress"
-                if len(completed_phases) >= len(all_phases):
+                if len(verified_phases) >= len(all_phases):
                     status = "completed"
 
-                # 计算进度百分比
-                phase_pct = len([p for p in all_phases if p in completed_phases]) / len(all_phases)
+                # 计算进度百分比（基于文件验证后的阶段数）
+                phase_pct = len(verified_phases) / len(all_phases)
 
                 projects.append({
                     "name": name,
@@ -136,6 +142,40 @@ class DesktopApp:
                 return json.dumps({"success": True}, ensure_ascii=False)
             return json.dumps({"error": "项目不存在"}, ensure_ascii=False)
         except Exception as e:
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+    def rename_project(self, old_name: str, new_name: str) -> str:
+        """重命名项目.
+
+        Args:
+            old_name: 原项目名称
+            new_name: 新项目名称
+
+        Returns:
+            JSON 格式的结果
+        """
+        try:
+            project_dir = self._file_manager.get_project_dir(old_name)
+            if not project_dir:
+                return json.dumps({"error": "项目不存在"}, ensure_ascii=False)
+
+            new_dir = project_dir.parent / new_name
+            if new_dir.exists():
+                return json.dumps({"error": "目标名称已存在"}, ensure_ascii=False)
+
+            project_dir.rename(new_dir)
+
+            # 更新 meta.json 中的名称
+            meta_path = new_dir / ".scholar" / "meta.json"
+            if meta_path.exists():
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                meta["name"] = new_name
+                meta["updated_at"] = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
+                meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            return json.dumps({"success": True, "new_name": new_name}, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"重命名失败: {e}", exc_info=True)
             return json.dumps({"error": str(e)}, ensure_ascii=False)
 
     # ── 工作流控制 API ──────────────────────────────────
@@ -225,7 +265,10 @@ class DesktopApp:
             ]
 
             for step in all_steps:
-                step["completed"] = step["id"] in completed_phases
+                step["completed"] = (
+                    step["id"] in completed_phases
+                    and self._verify_phase_file(Path(project_dir), step["id"])
+                )
 
             return json.dumps(all_steps, ensure_ascii=False)
         except Exception as e:
@@ -470,31 +513,70 @@ class DesktopApp:
         except Exception as e:
             return json.dumps({"error": str(e)}, ensure_ascii=False)
 
+    # ── 导出 API ──────────────────────────────────
+
+    def export_project(self, project_name: str, fmt: str = "docx") -> str:
+        """导出论文为指定格式.
+
+        Args:
+            project_name: 项目名称
+            fmt: 导出格式 (docx/pdf/latex/md)
+
+        Returns:
+            JSON 格式的导出结果
+        """
+        try:
+            project_dir = self._file_manager.get_project_dir(project_name)
+            if not project_dir:
+                return json.dumps({"error": "项目不存在"}, ensure_ascii=False)
+
+            from scholarpilot.tools.exporter import export_project as do_export
+
+            output_path = do_export(Path(project_dir), fmt=fmt)
+            return json.dumps({
+                "success": True,
+                "output_path": str(output_path),
+                "format": fmt,
+            }, ensure_ascii=False)
+        except FileNotFoundError as e:
+            return json.dumps({"error": f"论文草稿未找到: {e}"}, ensure_ascii=False)
+        except ValueError as e:
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"导出失败: {e}", exc_info=True)
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
+
     # ── 配置 API ──────────────────────────────────
 
     def get_config(self) -> str:
-        """获取当前配置信息（不包含敏感 API Key）.
+        """获取当前配置信息（不包含敏感 API Key 原文）.
 
         Returns:
             JSON 格式的配置信息
         """
         try:
-            has_api_key = bool(
-                getattr(self._config, "zhipu_api_key", "")
-                or getattr(self._config, "ark_api_key", "")
-                or getattr(self._config, "claude_api_key", "")
-                or getattr(self._config, "openai_api_key", "")
-            )
-            return json.dumps({
-                "has_api_key": has_api_key,
+            key_providers = {
+                "zhipu": "zhipu_api_key",
+                "ark": "ark_api_key",
+                "claude": "claude_api_key",
+                "openai": "openai_api_key",
+                "deepseek": "deepseek_api_key",
+            }
+            config_info = {
+                "has_api_key": False,
                 "writing_model": getattr(self._config, "default_writing_model", ""),
                 "projects_dir": str(self._config.projects_dir),
-            }, ensure_ascii=False)
+            }
+            for provider, attr in key_providers.items():
+                config_info[f"{provider}_configured"] = bool(getattr(self._config, attr, ""))
+                if bool(getattr(self._config, attr, "")):
+                    config_info["has_api_key"] = True
+            return json.dumps(config_info, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"error": str(e)}, ensure_ascii=False)
 
     def set_api_key(self, provider: str, api_key: str) -> str:
-        """设置 API Key.
+        """设置 API Key 并持久化到 .env 文件.
 
         Args:
             provider: 提供商 (zhipu/ark/claude/openai/deepseek)
@@ -505,6 +587,9 @@ class DesktopApp:
         """
         try:
             import os
+            import re
+            from scholarpilot.config import _find_env_file
+
             key_map = {
                 "zhipu": "ZHIPU_API_KEY",
                 "ark": "ARK_API_KEY",
@@ -513,7 +598,75 @@ class DesktopApp:
                 "deepseek": "DEEPSEEK_API_KEY",
             }
             env_key = key_map.get(provider, f"{provider.upper()}_API_KEY")
+
+            # 1. 更新当前进程环境变量
             os.environ[env_key] = api_key
+
+            # 2. 持久化到 .env 文件
+            env_path = _find_env_file()
+            if env_path.exists():
+                content = env_path.read_text(encoding="utf-8")
+                if re.search(fr"^{env_key}=.*$", content, re.MULTILINE):
+                    content = re.sub(
+                        fr"^{env_key}=.*$",
+                        f"{env_key}={api_key}",
+                        content,
+                        flags=re.MULTILINE,
+                    )
+                else:
+                    content = content.rstrip("\n") + f"\n{env_key}={api_key}\n"
+                env_path.write_text(content, encoding="utf-8")
+            else:
+                env_path.write_text(f"{env_key}={api_key}\n", encoding="utf-8")
+
+            # 3. 重置配置单例，下次 get_settings() 会重新读取 .env
+            from scholarpilot.config import reset_settings
+            reset_settings()
+            # 立即刷新当前实例的配置引用
+            self._config = get_settings()
+
+            return json.dumps({"success": True, "provider": provider}, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"设置 API Key 失败: {e}", exc_info=True)
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+    def set_model_config(self, writing_model: str) -> str:
+        """设置默认写作模型并持久化.
+
+        Args:
+            writing_model: 模型标识符（如 claude-sonnet-4-20250514）
+
+        Returns:
+            JSON 格式的设置结果
+        """
+        try:
+            import os
+            import re
+            from scholarpilot.config import _find_env_file
+
+            env_key = "SCHOLAR_DEFAULT_WRITING_MODEL"
+            os.environ[env_key] = writing_model
+
+            env_path = _find_env_file()
+            if env_path.exists():
+                content = env_path.read_text(encoding="utf-8")
+                if re.search(fr"^{env_key}=.*$", content, re.MULTILINE):
+                    content = re.sub(
+                        fr"^{env_key}=.*$",
+                        f"{env_key}={writing_model}",
+                        content,
+                        flags=re.MULTILINE,
+                    )
+                else:
+                    content = content.rstrip("\n") + f"\n{env_key}={writing_model}\n"
+                env_path.write_text(content, encoding="utf-8")
+            else:
+                env_path.write_text(f"{env_key}={writing_model}\n", encoding="utf-8")
+
+            from scholarpilot.config import reset_settings, get_settings
+            reset_settings()
+            self._config = get_settings()
+
             return json.dumps({"success": True}, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"error": str(e)}, ensure_ascii=False)
@@ -541,6 +694,51 @@ class DesktopApp:
             logger.debug(f"evaluate_js 失败: {e}")
 
     # ── 辅助方法 ──────────────────────────────────
+
+    def _verify_phase_file(self, project_dir: Path, phase: str) -> bool:
+        """验证阶段的输出文件是否真正完成.
+
+        用于进度一致性校验：即使 state.json 中标记为完成，
+        如果对应文件不存在或只是占位符，仍然认为该阶段未完成。
+
+        判定规则（必须同时满足）：
+        1. 文件存在
+        2. 文件大小 >= min_size 字节（排除 FileManager 创建的占位符）
+        3. 文件不含 "（待填写）" 占位标记
+        """
+        file_map = {
+            "topic_analysis": ("SPEC.md", 200),
+            "literature_search": ("literature/review.md", 500),
+            "evidence_matrix": ("literature/evidence_matrix.md", 300),
+            "spec_generation": ("SPEC.md", 500),
+            "outline": ("outline.md", 200),
+            "data_collection": ("data_collection_guide.md", 200),
+            "section_writing": ("draft/full_draft.md", 1000),
+            "post_processing": ("draft/deai_report.md", 200),
+            "claim_calibration": ("draft/claim_calibration_report.md", 200),
+            "completed": ("draft/full_draft_polished.md", 1000),
+        }
+        fallback_map = {
+            "literature_search": "literature/evidence_matrix.md",
+        }
+        if phase in file_map:
+            rel_path, min_size = file_map[phase]
+            file_path = project_dir / rel_path
+            if not file_path.exists() and phase in fallback_map:
+                file_path = project_dir / fallback_map[phase]
+            if not file_path.exists():
+                return False
+            try:
+                stat = file_path.stat()
+                if stat.st_size < min_size:
+                    return False
+                # 检查是否还是占位符（适用于覆盖了占位符文件的情况）
+                if "（待填写）" in file_path.read_text(encoding="utf-8")[:500]:
+                    return False
+            except OSError:
+                return False
+            return True
+        return False
 
     def _count_chars(self, project_dir: Path) -> int:
         """统计项目的总字符数."""
