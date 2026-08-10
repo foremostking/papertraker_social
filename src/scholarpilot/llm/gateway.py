@@ -138,6 +138,9 @@ class LLMGateway:
         思考过程标记（如 [💭 思考]、[🔧 执行]），以及用 ```markdown
         包裹正文。本方法去除这些多余内容，只保留正文。
 
+        同时处理「行内」混合场景：LLM 可能在正文中段或末尾混入交互式
+        提示（[⏸️ 需要确认]、[💭 思考] 等），需在清洗阶段一并剥离。
+
         Args:
             content: LLM 原始返回内容。
 
@@ -145,6 +148,24 @@ class LLMGateway:
             清洗后的内容。
         """
         import re
+
+        # 阶段1：剥离所有「行内」的交互式提示标记（从行首或行尾混入）
+        # 匹配 [emoji 提示词] 后到行尾的全部内容（含 emoji 类前缀）
+        # 例如：'[⏸️ 需要确认] 请确认以上...'
+        # 整行替换为空字符串；如果行中还有其他正文，则只截断提示部分
+        content = re.sub(
+            r"\s*\[(?:⏸️|💭|🔧|✅|❌|📝|📋|🔍|📊|💡|⚠️|🎯|✨|📚|🏗️)\s*[^\]]*\][^\n]*?(?:请确认|请告知|请提供|是否需要|如有需要|符合您的|不符合|告诉我|your (?:choice|decision|feedback))[^\n]*",
+            "",
+            content,
+            flags=re.MULTILINE,
+        )
+        # 单独匹配行尾的纯提示行（即使没带"请确认"等关键词的 ⏸️ 整行）
+        content = re.sub(
+            r"\n\s*\[⏸️[^\]]*\][^\n]*$",
+            "",
+            content,
+            flags=re.MULTILINE,
+        )
 
         lines = content.split("\n")
         cleaned_lines: list[str] = []
@@ -154,9 +175,16 @@ class LLMGateway:
         for line in lines:
             stripped = line.strip()
 
-            # 跳过思考过程标记行（如 [💭 思考] xxx、[🔧 执行] xxx）
-            if re.match(r"^\[(💭|🔧|✅|❌|📝|📋|🔍|📊|💡|⚠️|🎯|✨|📚|🏗️|🔧)\s*", stripped):
+            # 跳过整行的思考过程标记行（如 [💭 思考] xxx、[🔧 执行] xxx）
+            if re.match(r"^\[(💭|🔧|✅|❌|📝|📋|🔍|📊|💡|⚠️|🎯|✨|📚|🏗️|⏸️)\s*[^\]]*\]", stripped):
                 skip_until_content = True
+                continue
+
+            # 跳过整行的交互式提示（无方括号包裹，如"请确认以上..."开头）
+            if re.match(
+                r"^(请确认|请告知|请提供|是否需要|如有需要|符合您的|不符合|告诉我|need your)",
+                stripped,
+            ):
                 continue
 
             # 跳过 ```markdown 开头行
