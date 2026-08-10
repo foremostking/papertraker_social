@@ -577,6 +577,7 @@ class EvidenceMatrixBuilder:
         outline_sections: list[dict[str, Any]] | None = None,
         batch_size: int = 10,
         max_papers: int = 30,
+        progress_callback: Any = None,
     ) -> EvidenceMatrix:
         """批量构建证据矩阵.
 
@@ -589,18 +590,22 @@ class EvidenceMatrixBuilder:
             outline_sections: 大纲章节列表（可选，提供则同时构建章节映射）.
             batch_size: 每批处理的文献数量.
             max_papers: 最大处理文献数（避免过多 API 调用）.
-            batch_size: 每批文献数量.
-            max_papers: 最大文献数.
+            progress_callback: 进度回调，签名 (phase, event_type, msg) -> None.
 
         Returns:
             EvidenceMatrix 证据矩阵.
         """
         # 限制文献数量
         papers_to_process = project_papers[:max_papers]
+        total_batches = (len(papers_to_process) + batch_size - 1) // batch_size
         logger.info(
-            "开始构建证据矩阵: %d 篇文献（上限 %d），主题='%s'",
-            len(papers_to_process), max_papers, topic,
+            "开始构建证据矩阵: %d 篇文献（上限 %d），%d 批次，主题='%s'",
+            len(papers_to_process), max_papers, total_batches, topic,
         )
+
+        if progress_callback:
+            progress_callback("evidence_matrix", "progress",
+                f"证据矩阵: {len(papers_to_process)} 篇文献, {total_batches} 批次处理中...")
 
         # 分批处理
         batches = [
@@ -609,8 +614,9 @@ class EvidenceMatrixBuilder:
         ]
 
         semaphore = asyncio.Semaphore(3)  # 并发控制：最多 3 个批次同时处理
+        completed_batches = [0]  # 用列表包装以便在闭包中修改
 
-        async def _process_batch(batch: list[dict[str, Any]]) -> list[PaperEvidence]:
+        async def _process_batch(batch_idx: int, batch: list[dict[str, Any]]) -> list[PaperEvidence]:
             async with semaphore:
                 # 批内串行（单篇提取），批间并发
                 results = []
@@ -630,10 +636,17 @@ class EvidenceMatrixBuilder:
                             abstract=paper.get("abstract", ""),
                             evidence_strength=EvidenceStrength.UNVERIFIED,
                         ))
+                completed_batches[0] += 1
+                if progress_callback:
+                    progress_callback("evidence_matrix", "progress",
+                        f"证据矩阵: 批次 {completed_batches[0]}/{total_batches} 完成 "
+                        f"({len(results)} 篇文献证据已提取)")
                 return results
 
         # 并发处理所有批次
-        batch_results = await asyncio.gather(*[_process_batch(b) for b in batches])
+        batch_results = await asyncio.gather(*[
+            _process_batch(i, b) for i, b in enumerate(batches)
+        ])
         all_papers: list[PaperEvidence] = []
         for batch_result in batch_results:
             all_papers.extend(batch_result)

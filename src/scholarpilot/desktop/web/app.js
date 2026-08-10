@@ -20,6 +20,7 @@
      Phase 定义 — 9 个步骤的元数据
      ════════════════════════════════════════════════════════════════ */
   const PHASES = [
+    { id: 'policy_search',     name: '政策调研',   icon: 'landmark', desc: '搜索政策法规，梳理政策背景' },
     { id: 'topic_analysis',    name: '选题分析',   icon: 'target',   desc: '分析研究主题，确定论文方向' },
     { id: 'literature_search', name: '文献检索',   icon: 'book',     desc: '搜索和整理相关文献' },
     { id: 'evidence_matrix',   name: '证据矩阵',   icon: 'search',   desc: '构建文献证据矩阵' },
@@ -47,6 +48,7 @@
     pen:       '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 19l7-7 3 3-7 7-3-3z"/><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/><path d="M2 2l7.586 7.586"/><circle cx="11" cy="11" r="2"/></svg>',
     tool:      '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>',
     check:     '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>',
+    landmark:  '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="22" x2="21" y2="22"/><line x1="6" y1="18" x2="6" y2="11"/><line x1="10" y1="18" x2="10" y2="11"/><line x1="14" y1="18" x2="14" y2="11"/><line x1="18" y1="18" x2="18" y2="11"/><polygon points="12 2 20 10 4 10 12 2"/></svg>',
     clock:     '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
     trash:     '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>',
     play:      '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>',
@@ -126,6 +128,7 @@
     setApiKey(provider, key) { return this._call('set_api_key', provider, key); },
     setModelConfig(writingModel) { return this._call('set_model_config', writingModel); },
     exportProject(name, fmt) { return this._call('export_project', name, fmt); },
+    submitReview(reviewId, decision, feedback) { return this._call('submit_review', reviewId, decision, feedback); },
   };
 
   /* ════════════════════════════════════════════════════════════════
@@ -1112,7 +1115,12 @@
       (isRunning ?
         '<div style="margin-top:12px;display:flex;gap:8px;">' +
           '<button class="btn btn-danger btn-sm" id="cancel-gen-btn">' + ICONS.cancel + '<span>取消生成</span></button>' +
-        '</div>' : '');
+        '</div>' :
+        (progressPct < 100 ?
+          '<div style="margin-top:12px;display:flex;gap:8px;">' +
+            '<button class="btn btn-primary btn-sm" id="start-gen-from-progress-btn">' + ICONS.play + '<span>开始生成</span></button>' +
+            '<span style="color:var(--text-tertiary);font-size:12px;line-height:28px;">点击按钮启动 AI 论文生成流程</span>' +
+          '</div>' : ''));
 
     var cancelBtn = document.getElementById('cancel-gen-btn');
     if (cancelBtn) {
@@ -1120,6 +1128,13 @@
         confirmDialog('取消生成', '确定要取消当前的生成任务吗？已完成的步骤不会丢失。', function () {
           cancelGeneration();
         });
+      });
+    }
+
+    var startBtn = document.getElementById('start-gen-from-progress-btn');
+    if (startBtn) {
+      startBtn.addEventListener('click', function () {
+        showStartGenerationDialog(projectName);
       });
     }
   }
@@ -1854,11 +1869,16 @@
   function initBottomPanel() {
     var toggle = document.getElementById('bottom-panel-toggle');
     var panel = document.getElementById('bottom-panel');
+    var logResizer = document.getElementById('log-resizer');
     if (!toggle || !panel) return;
 
     toggle.addEventListener('click', function () {
       panel.classList.toggle('collapsed');
       State.bottomPanelCollapsed = panel.classList.contains('collapsed');
+      // 折叠时隐藏拖拽条
+      if (logResizer) {
+        logResizer.style.display = State.bottomPanelCollapsed ? 'none' : 'block';
+      }
     });
   }
 
@@ -1877,6 +1897,9 @@
         break;
       case 'error':
         handleErrorEvent(data);
+        break;
+      case 'review_request':
+        handleReviewRequest(data);
         break;
     }
   }
@@ -1961,6 +1984,141 @@
     }
   }
 
+  /* ════════════════════════════════════════════════════════════════
+     审核请求处理 — 工作流暂停等待用户确认
+     ════════════════════════════════════════════════════════════════ */
+
+  /** 当前活跃的审核模态框引用（防止重复弹出） */
+  var _activeReviewOverlay = null;
+
+  function handleReviewRequest(data) {
+    var reviewId = data.review_id || '';
+    var phase = data.phase || '';
+    var title = data.title || '请审核';
+    var content = data.content || '';
+    var phaseInfo = PHASE_MAP[phase];
+    var phaseName = phaseInfo ? phaseInfo.name : phase;
+
+    addLog('info', '[' + phaseName + '] 等待用户审核: ' + title);
+
+    // 如果已有审核模态框打开，先移除（理论上不应发生）
+    if (_activeReviewOverlay) {
+      var root = document.getElementById('modal-root');
+      if (_activeReviewOverlay.parentNode === root) {
+        root.removeChild(_activeReviewOverlay);
+      }
+      _activeReviewOverlay = null;
+    }
+
+    // 构建审核内容预览
+    var contentHtml = '';
+    if (content) {
+      // 使用 Markdown 渲染
+      contentHtml = '<div class="review-content" style="max-height:400px;overflow-y:auto;padding:12px;background:var(--bg-secondary);border-radius:8px;border:1px solid var(--border-color);">' +
+        (window.marked ? window.marked.parse(content) : escapeHtml(content)) +
+        '</div>';
+    } else {
+      contentHtml = '<p style="color:var(--text-tertiary);text-align:center;padding:24px;">（无内容预览）</p>';
+    }
+
+    // 修改意见输入框（默认隐藏，选择"修改"时显示）
+    var feedbackHtml =
+      '<div id="review-feedback-area" style="display:none;margin-top:12px;">' +
+        '<textarea id="review-feedback-input" class="form-input" rows="3" ' +
+        'style="width:100%;resize:vertical;font-size:13px;" ' +
+        'placeholder="请输入修改意见，例如：&#10;- 补充2024年最新政策&#10;- 调整文献综述的结构&#10;- 增加空间计量方法的说明"></textarea>' +
+      '</div>';
+
+    var bodyHtml =
+      '<div style="margin-bottom:12px;">' +
+        '<span style="display:inline-flex;align-items:center;gap:6px;padding:4px 10px;background:var(--bg-accent);border-radius:12px;font-size:12px;color:var(--text-secondary);">' +
+          (phaseInfo ? phaseInfo.icon : '') + ' ' + escapeHtml(phaseName) +
+        '</span>' +
+      '</div>' +
+      contentHtml +
+      feedbackHtml;
+
+    var overlay = null;
+    var modalRef = showModal({
+      title: title,
+      body: bodyHtml,
+      closeOnOverlay: false,  // 审核期间不允许点击遮罩关闭
+      buttons: [
+        {
+          text: '驳回', type: 'btn-danger',
+          onClick: function (modal, ov) {
+            overlay = ov;
+            submitReviewDecision(reviewId, 'reject', '', ov);
+          },
+        },
+        {
+          text: '修改', type: 'btn-secondary',
+          closeOnClick: false,
+          onClick: function (modal, ov) {
+            // 切换显示修改意见输入框
+            var feedbackArea = modal.querySelector('#review-feedback-area');
+            if (feedbackArea.style.display === 'none') {
+              feedbackArea.style.display = 'block';
+              modal.querySelector('#review-feedback-input').focus();
+            } else {
+              // 二次点击则提交修改
+              var feedback = modal.querySelector('#review-feedback-input').value.trim();
+              if (!feedback) {
+                showToast('warning', '请输入修改意见');
+                return;
+              }
+              overlay = ov;
+              submitReviewDecision(reviewId, 'modify', feedback, ov);
+            }
+          },
+        },
+        {
+          text: '确认通过', type: 'btn-primary',
+          onClick: function (modal, ov) {
+            overlay = ov;
+            submitReviewDecision(reviewId, 'confirm', '', ov);
+          },
+        },
+      ],
+    });
+
+    // 记录活跃的 overlay
+    _activeReviewOverlay = modalRef.overlay;
+
+    // 禁用关闭按钮（审核必须做出决策）
+    var closeBtn = modalRef.modal.querySelector('.modal-close');
+    if (closeBtn) {
+      closeBtn.style.display = 'none';
+    }
+  }
+
+  async function submitReviewDecision(reviewId, decision, feedback, overlay) {
+    try {
+      addLog('progress', '提交审核决策: ' + decision + (feedback ? ' (' + feedback.substring(0, 50) + '...)' : ''));
+
+      var result = await API.submitReview(reviewId, decision, feedback);
+      if (result && result.success) {
+        // 关闭模态框
+        var root = document.getElementById('modal-root');
+        if (overlay && overlay.parentNode === root) {
+          root.removeChild(overlay);
+        }
+        _activeReviewOverlay = null;
+
+        var msgMap = { confirm: '已确认，继续下一步', modify: '已提交修改意见', reject: '已驳回' };
+        showToast('success', msgMap[decision] || '审核已提交');
+        addLog('success', '审核决策已提交: ' + decision);
+      } else {
+        var errMsg = (result && result.error) ? result.error : '提交失败';
+        showToast('error', '审核提交失败: ' + errMsg);
+        addLog('error', '审核提交失败: ' + errMsg);
+      }
+    } catch (e) {
+      console.error('[ScholarPilot] submitReview error:', e);
+      showToast('error', '审核提交异常: ' + e.message);
+    }
+  }
+
   async function refreshSteps(projectName) {
     if (!projectName) return;
     try {
@@ -2016,6 +2174,79 @@
   }
 
   /* ════════════════════════════════════════════════════════════════
+     可拖拽分隔条 — 侧边栏宽度 / 日志面板高度
+     ════════════════════════════════════════════════════════════════ */
+  function initResizers() {
+    // ── 侧边栏垂直分隔条（左右拖拽改宽度）──
+    var sidebarResizer = document.getElementById('sidebar-resizer');
+    if (sidebarResizer) {
+      var sidebar = document.getElementById('sidebar');
+      var isDraggingCol = false;
+
+      sidebarResizer.addEventListener('mousedown', function (e) {
+        isDraggingCol = true;
+        sidebarResizer.classList.add('dragging');
+        document.body.classList.add('resizing-col');
+        e.preventDefault();
+      });
+
+      document.addEventListener('mousemove', function (e) {
+        if (!isDraggingCol) return;
+        var newWidth = e.clientX;
+        // 限制范围：180px ~ 400px
+        newWidth = Math.max(180, Math.min(400, newWidth));
+        document.documentElement.style.setProperty('--sidebar-width', newWidth + 'px');
+      });
+
+      document.addEventListener('mouseup', function () {
+        if (isDraggingCol) {
+          isDraggingCol = false;
+          sidebarResizer.classList.remove('dragging');
+          document.body.classList.remove('resizing-col');
+        }
+      });
+    }
+
+    // ── 日志面板水平分隔条（上下拖拽改高度）──
+    var logResizer = document.getElementById('log-resizer');
+    if (logResizer) {
+      var bottomPanel = document.getElementById('bottom-panel');
+      var isDraggingRow = false;
+      var startY = 0;
+      var startHeight = 0;
+
+      logResizer.addEventListener('mousedown', function (e) {
+        // 折叠状态下不启动拖拽
+        if (bottomPanel && bottomPanel.classList.contains('collapsed')) return;
+        isDraggingRow = true;
+        startY = e.clientY;
+        startHeight = parseInt(getComputedStyle(bottomPanel).height, 10) || 200;
+        logResizer.classList.add('dragging');
+        document.body.classList.add('resizing-row');
+        e.preventDefault();
+      });
+
+      document.addEventListener('mousemove', function (e) {
+        if (!isDraggingRow) return;
+        // 向上拖 = 增大面板高度
+        var delta = startY - e.clientY;
+        var newHeight = startHeight + delta;
+        // 限制范围：60px ~ 500px
+        newHeight = Math.max(60, Math.min(500, newHeight));
+        document.documentElement.style.setProperty('--bottom-panel-height', newHeight + 'px');
+      });
+
+      document.addEventListener('mouseup', function () {
+        if (isDraggingRow) {
+          isDraggingRow = false;
+          logResizer.classList.remove('dragging');
+          document.body.classList.remove('resizing-row');
+        }
+      });
+    }
+  }
+
+  /* ════════════════════════════════════════════════════════════════
      初始化
      ════════════════════════════════════════════════════════════════ */
   function init() {
@@ -2032,6 +2263,7 @@
     initSidebarNav();
     initBottomPanel();
     initToolbarButtons();
+    initResizers();
 
     // 路由
     window.addEventListener('hashchange', handleRoute);

@@ -1,0 +1,857 @@
+{
+  "timestamp": "2026-08-10 15:35:11",
+  "total": 121,
+  "passed": 121,
+  "failed": 0,
+  "errors": 0,
+  "all_pass": true,
+  "tests": [
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.workflow.auto_verifier",
+      "status": "PASS",
+      "detail": "模块加载成功 (AutoVerifier, VerificationResult, VerificationIssue)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.workflow.review_manager",
+      "status": "PASS",
+      "detail": "模块加载成功 (ReviewManager)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.workflow.controller",
+      "status": "PASS",
+      "detail": "模块加载成功 (WorkflowController)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.agent.scholar",
+      "status": "PASS",
+      "detail": "模块加载成功 (ScholarAgent)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.agent.state",
+      "status": "PASS",
+      "detail": "模块加载成功 (AgentState)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.agent.executor",
+      "status": "PASS",
+      "detail": "模块加载成功 (executor node)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.agent.planner",
+      "status": "PASS",
+      "detail": "模块加载成功 (planner node)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.agent.review",
+      "status": "PASS",
+      "detail": "模块加载成功 (review node)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.agent.feed",
+      "status": "PASS",
+      "detail": "模块加载成功 (feed node)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.desktop.app",
+      "status": "PASS",
+      "detail": "模块加载成功 (DesktopApp)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.events.types",
+      "status": "PASS",
+      "detail": "模块加载成功 (ProgressEvent, ReviewRequestEvent, ReviewResponse)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.context.prompts.verification",
+      "status": "PASS",
+      "detail": "模块加载成功 (VERIFICATION_PROMPTS, ACTOR_CRITIC_MAP)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.context.prompts.roles",
+      "status": "PASS",
+      "detail": "模块加载成功 (get_role_prompt, PHASE_ROLES)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.context.prompts",
+      "status": "PASS",
+      "detail": "模块加载成功 (Prompt 模板库)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.context.engine",
+      "status": "PASS",
+      "detail": "模块加载成功 (ContextEngine)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.context.memory",
+      "status": "PASS",
+      "detail": "模块加载成功 (ProjectMemory)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.llm.gateway",
+      "status": "PASS",
+      "detail": "模块加载成功 (LLMGateway)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.config",
+      "status": "PASS",
+      "detail": "模块加载成功 (get_settings)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.models.paper",
+      "status": "PASS",
+      "detail": "模块加载成功 (Paper)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.models.plan",
+      "status": "PASS",
+      "detail": "模块加载成功 (Plan)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.models.spec",
+      "status": "PASS",
+      "detail": "模块加载成功 (Spec)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.models.enums",
+      "status": "PASS",
+      "detail": "模块加载成功 (Enums)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.utils.file_manager",
+      "status": "PASS",
+      "detail": "模块加载成功 (FileManager)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.utils.logger",
+      "status": "PASS",
+      "detail": "模块加载成功 (日志模块)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.utils.library",
+      "status": "PASS",
+      "detail": "模块加载成功 (GlobalLibrary)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.tools.search",
+      "status": "PASS",
+      "detail": "模块加载成功 (LiteratureSearchManager)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.tools.exporter",
+      "status": "PASS",
+      "detail": "模块加载成功 (export_project)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.mcp.client",
+      "status": "PASS",
+      "detail": "模块加载成功 (MCPClient)",
+      "error": ""
+    },
+    {
+      "suite": "导入链完整性",
+      "name": "import scholarpilot.mcp.registry",
+      "status": "PASS",
+      "detail": "模块加载成功 (MCPRegistry)",
+      "error": ""
+    },
+    {
+      "suite": "VerificationResult数据类",
+      "name": "导入VerificationResult",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "VerificationResult数据类",
+      "name": "创建VerificationResult实例",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "VerificationResult数据类",
+      "name": "passed/needs_human属性",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "VerificationResult数据类",
+      "name": "critical_issues过滤",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "VerificationResult数据类",
+      "name": "to_dict方法",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "VerificationResult数据类",
+      "name": "VerificationIssue数据类",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "AutoVerifier决策逻辑",
+      "name": "导入AutoVerifier",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "AutoVerifier决策逻辑",
+      "name": "创建AutoVerifier实例",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "AutoVerifier决策逻辑",
+      "name": "阈值默认值(PASS=80, HUMAN=50)",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "AutoVerifier决策逻辑",
+      "name": "score>=80且无critical→pass",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "AutoVerifier决策逻辑",
+      "name": "score>=80但有critical→fix",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "AutoVerifier决策逻辑",
+      "name": "score 50-79→fix",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "AutoVerifier决策逻辑",
+      "name": "score<50→human",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "AutoVerifier决策逻辑",
+      "name": "边界值score=80无critical→pass",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "AutoVerifier决策逻辑",
+      "name": "边界值score=50且critical→fix",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "AutoVerifier决策逻辑",
+      "name": "边界值score=49→human",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "AutoVerifier决策逻辑",
+      "name": "未知阶段(无Prompt)默认通过",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "AutoVerifier决策逻辑",
+      "name": "自定义阈值(pass=90,human=60)",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ReviewManager跨线程协调",
+      "name": "导入ReviewManager",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ReviewManager跨线程协调",
+      "name": "创建ReviewManager实例",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ReviewManager跨线程协调",
+      "name": "create_review_id生成唯一ID",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ReviewManager跨线程协调",
+      "name": "create_review创建Event",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ReviewManager跨线程协调",
+      "name": "submit_review提交决策",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ReviewManager跨线程协调",
+      "name": "submit_review无效ID返回False",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ReviewManager跨线程协调",
+      "name": "get_pending_review_ids",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ReviewManager跨线程协调",
+      "name": "clear清理审核",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ReviewManager跨线程协调",
+      "name": "wait_for_review超时自动确认",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ReviewManager跨线程协调",
+      "name": "wait_for_review无效ID返回confirm",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ReviewManager跨线程协调",
+      "name": "完整流程(创建→提交→唤醒)",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ReviewManager跨线程协调",
+      "name": "set_event唤醒Event",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ScholarAgent初始化",
+      "name": "导入ScholarAgent",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ScholarAgent初始化",
+      "name": "创建ScholarAgent实例",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ScholarAgent初始化",
+      "name": "auto_verify默认启用",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ScholarAgent初始化",
+      "name": "_auto_verifier延迟初始化(None)",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ScholarAgent初始化",
+      "name": "_last_user_input初始为空字符串",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ScholarAgent初始化",
+      "name": "review_manager初始为None",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ScholarAgent初始化",
+      "name": "_loop初始为None",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ScholarAgent初始化",
+      "name": "non_interactive默认False",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ScholarAgent初始化",
+      "name": "LLMGateway初始化",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ScholarAgent初始化",
+      "name": "FileManager初始化",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ScholarAgent初始化",
+      "name": "ProjectMemory初始化",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ScholarAgent初始化",
+      "name": "ResearcherProfile初始化",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ScholarAgent初始化",
+      "name": "ContextEngine初始化",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ScholarAgent初始化",
+      "name": "GlobalLibrary初始化",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ScholarAgent初始化",
+      "name": "discipline默认值=经济学",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ScholarAgent初始化",
+      "name": "history列表初始化",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "ScholarAgent初始化",
+      "name": "多源检索引擎初始化",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "DesktopApp API",
+      "name": "导入DesktopApp",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "DesktopApp API",
+      "name": "无controller时返回错误",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "DesktopApp API",
+      "name": "submit_review传递参数给controller",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "DesktopApp API",
+      "name": "无效审核ID返回错误",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "DesktopApp API",
+      "name": "get_generation_status返回正确",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "验证Prompt",
+      "name": "导入验证Prompt模块",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "验证Prompt",
+      "name": "VERIFICATION_PROMPTS包含7个阶段",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "验证Prompt",
+      "name": "ACTOR_CRITIC_MAP角色映射完整",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "验证Prompt",
+      "name": "7个Prompt均包含必需元素(score/decision/issues/summary)",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "验证Prompt",
+      "name": "所有Prompt包含{content}占位符",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "验证Prompt",
+      "name": "policy_search Prompt包含{user_input}占位符",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "验证Prompt",
+      "name": "Prompt包含pass/fix/human决策分级",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "验证Prompt",
+      "name": "policy_search: 933字符",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "验证Prompt",
+      "name": "topic_analysis: 974字符",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "验证Prompt",
+      "name": "literature_search: 995字符",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "验证Prompt",
+      "name": "evidence_matrix: 931字符",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "验证Prompt",
+      "name": "spec_generation: 1015字符",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "验证Prompt",
+      "name": "outline: 1020字符",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "验证Prompt",
+      "name": "section_writing: 1097字符",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "前端JS审核模态框",
+      "name": "app.js文件存在",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "前端JS审核模态框",
+      "name": "app.js文件大小: 85230 字符",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "前端JS审核模态框",
+      "name": "submitReview API暴露",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "前端JS审核模态框",
+      "name": "handleReviewRequest函数存在",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "前端JS审核模态框",
+      "name": "submitReviewDecision函数存在",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "前端JS审核模态框",
+      "name": "review_request事件监听",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "前端JS审核模态框",
+      "name": "审核模态框包含三个按钮(驳回/修改/确认通过)",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "前端JS审核模态框",
+      "name": "_activeReviewOverlay防止重复弹出",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "前端JS审核模态框",
+      "name": "showModal函数存在",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "前端JS审核模态框",
+      "name": "修改意见输入框(review-feedback-input)",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "前端JS审核模态框",
+      "name": "API.submitReview调用",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "前端JS审核模态框",
+      "name": "Markdown渲染(marked.parse)",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "前端JS审核模态框",
+      "name": "审核内容最大高度400px",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "前端JS审核模态框",
+      "name": "onEvent事件路由函数",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "Events类型系统",
+      "name": "导入事件类型",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "Events类型系统",
+      "name": "ProgressEvent序列化",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "Events类型系统",
+      "name": "StepOutput序列化",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "Events类型系统",
+      "name": "ReviewRequestEvent序列化",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "Events类型系统",
+      "name": "ReviewResponse序列化",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "Events类型系统",
+      "name": "WorkflowCallbackAdapter回调转发",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "WorkflowController",
+      "name": "导入WorkflowController",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "WorkflowController",
+      "name": "创建WorkflowController实例",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "WorkflowController",
+      "name": "is_running初始False",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "WorkflowController",
+      "name": "_review_manager初始化",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "WorkflowController",
+      "name": "submit_review无效ID",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    },
+    {
+      "suite": "WorkflowController",
+      "name": "create_review_id",
+      "status": "PASS",
+      "detail": "",
+      "error": ""
+    }
+  ]
+}

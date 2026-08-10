@@ -107,15 +107,49 @@ img { max-width: 100%; }
   width: 100vw;
 }
 
+/* ── 可拖拽分隔条 ─────────────────────────────────────────────── */
+.resizer {
+  position: relative;
+  flex-shrink: 0;
+  z-index: 10;
+  background: transparent;
+  transition: background var(--transition-fast);
+}
+
+.resizer:hover,
+.resizer.dragging {
+  background: var(--accent);
+}
+
+/* 垂直分隔条（侧边栏 ↔ 内容区，左右拖拽） */
+.resizer-vertical {
+  width: 4px;
+  cursor: col-resize;
+  height: 100%;
+}
+
+/* 水平分隔条（内容区 ↔ 日志面板，上下拖拽） */
+.resizer-horizontal {
+  height: 4px;
+  cursor: row-resize;
+  width: 100%;
+}
+
+/* 拖拽时全局禁用文本选中和指针变化 */
+body.resizing-col * { cursor: col-resize !important; user-select: none !important; }
+body.resizing-row * { cursor: row-resize !important; user-select: none !important; }
+
 /* ── Sidebar ───────────────────────────────────────────────────── */
 .sidebar {
-  width: 240px;
-  min-width: 240px;
+  width: var(--sidebar-width, 240px);
+  min-width: 180px;
+  max-width: 400px;
   height: 100%;
   background: var(--bg-sidebar);
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
+  flex-shrink: 0;
   transition: width var(--transition);
 }
 
@@ -800,12 +834,14 @@ img { max-width: 100%; }
 
 /* Step Tree */
 .step-tree {
-  width: 240px;
-  min-width: 240px;
+  width: 220px;
+  min-width: 180px;
+  max-width: 300px;
   background: var(--bg-sidebar);
   border-right: 1px solid var(--border);
   overflow-y: auto;
   padding: var(--space-sm);
+  flex-shrink: 0;
 }
 
 .step-tree-title {
@@ -1163,11 +1199,12 @@ img { max-width: 100%; }
   display: flex;
   flex-direction: column;
   transition: all var(--transition);
-  max-height: 200px;
+  height: var(--bottom-panel-height, 200px);
+  flex-shrink: 0;
 }
 
 .bottom-panel.collapsed {
-  max-height: 40px;
+  height: 40px;
 }
 
 .bottom-panel-header {
@@ -1213,17 +1250,40 @@ img { max-width: 100%; }
 .bottom-panel-body {
   overflow: hidden;
   flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;  /* 允许 flex 子项收缩，触发滚动 */
 }
 
 .bottom-panel.collapsed .bottom-panel-body { display: none; }
 
 .log-stream {
-  height: 160px;
+  flex: 1;
   overflow-y: auto;
+  min-height: 0;  /* flex 子项收缩，确保滚动条出现 */
   padding: var(--space-sm) var(--space-lg);
   font-family: var(--font-code);
   font-size: 12px;
   line-height: 1.6;
+}
+
+/* 日志区域滚动条 — 加粗显示，确保可见 */
+.log-stream::-webkit-scrollbar {
+  width: 8px;
+}
+
+.log-stream::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: var(--radius-full);
+}
+
+.log-stream::-webkit-scrollbar-thumb {
+  background: var(--text-tertiary);
+  border-radius: var(--radius-full);
+}
+
+.log-stream::-webkit-scrollbar-thumb:hover {
+  background: var(--text-secondary);
 }
 
 .log-entry {

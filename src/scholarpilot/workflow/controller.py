@@ -17,9 +17,11 @@ from typing import Any
 from scholarpilot.agent.scholar import ScholarAgent
 from scholarpilot.events.types import (
     ProgressEvent,
+    ReviewRequestEvent,
     StepOutput,
     WorkflowCallbackAdapter,
 )
+from scholarpilot.workflow.review_manager import ReviewManager
 
 logger = logging.getLogger(__name__)
 
@@ -36,21 +38,29 @@ class _UICallback(WorkflowCallbackAdapter):
             try:
                 self._ui_update_fn("progress", event.to_dict())
             except Exception as e:
-                logger.debug(f"UI on_progress 转发失败: {e}")
+                logger.error(f"UI on_progress 转发失败: {e}")
 
     def on_step_complete(self, phase: str, output: StepOutput) -> None:
         if self._ui_update_fn:
             try:
                 self._ui_update_fn("step_complete", output.to_dict())
             except Exception as e:
-                logger.debug(f"UI on_step_complete 转发失败: {e}")
+                logger.error(f"UI on_step_complete 转发失败: {e}")
 
     def on_error(self, phase: str, error: str) -> None:
         if self._ui_update_fn:
             try:
                 self._ui_update_fn("error", {"phase": phase, "error": error})
             except Exception as e:
-                logger.debug(f"UI on_error 转发失败: {e}")
+                logger.error(f"UI on_error 转发失败: {e}")
+
+    def on_review_request(self, event: ReviewRequestEvent) -> None:
+        """转发审核请求事件到前端."""
+        if self._ui_update_fn:
+            try:
+                self._ui_update_fn("review_request", event.to_dict())
+            except Exception as e:
+                logger.error(f"UI on_review_request 转发失败: {e}")
 
 
 class WorkflowController:
@@ -92,6 +102,7 @@ class WorkflowController:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._cancel_event = threading.Event()
         self._is_running = False
+        self._review_manager = ReviewManager()
 
     def start(self, topic: str) -> None:
         """在后台线程中启动工作流.
@@ -127,8 +138,11 @@ class WorkflowController:
             cnki_cookie=self.cnki_cookie,
             callback=callback,
         )
-        # 桌面 UI 模式下自动跳过交互提示
+        # 桌面 UI 模式：禁用 CLI 交互（避免 EOFError），
+        # 审核机制通过 review_manager + _request_review Tier 2 独立工作
         agent.non_interactive = True
+        agent.review_manager = self._review_manager
+        agent._loop = self._loop
 
         try:
             self._loop.run_until_complete(agent.run(topic))
@@ -169,6 +183,25 @@ class WorkflowController:
     def is_running(self) -> bool:
         """工作流是否正在运行."""
         return self._is_running
+
+    def submit_review(self, review_id: str, decision: str, feedback: str = "") -> bool:
+        """提交用户审核决策，唤醒等待中的 ScholarAgent.
+
+        从主线程调用（pywebview API），通过 ReviewManager 将决策传递给
+        后台 asyncio 线程中等待的协程。
+
+        Args:
+            review_id: 审核唯一标识。
+            decision: 决策 "confirm" | "modify" | "reject"。
+            feedback: 修改意见（decision=modify 时填写）。
+
+        Returns:
+            是否成功提交。
+        """
+        success = self._review_manager.submit_review(review_id, decision, feedback)
+        if success and self._loop and self._loop.is_running():
+            self._review_manager.set_event(review_id, self._loop)
+        return success
 
     def wait(self, timeout: float | None = None) -> None:
         """等待工作流完成（阻塞）.

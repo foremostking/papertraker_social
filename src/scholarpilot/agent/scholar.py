@@ -32,7 +32,7 @@ from scholarpilot.context.engine import ContextEngine
 from scholarpilot.context.memory import ProjectMemory
 from scholarpilot.context.profile import ResearcherProfile
 from scholarpilot.context.prompts.constants import CSSCI_REF_RANGE
-from scholarpilot.events.types import ProgressEvent, StepOutput, WorkflowCallback
+from scholarpilot.events.types import ProgressEvent, ReviewRequestEvent, StepOutput, WorkflowCallback
 from scholarpilot.llm.gateway import LLMGateway
 from scholarpilot.mcp.servers.cnki import (
     CNKISearchResult,
@@ -148,6 +148,16 @@ class ScholarAgent:
         self.non_interactive: bool = False
         self.default_choices: dict[str, int] = {}  # 各交互步骤的默认选择
 
+        # 审核管理器（桌面 UI 模式下由 WorkflowController 注入）
+        self.review_manager = None  # ReviewManager | None
+        self._loop = None  # asyncio.AbstractEventLoop | None
+
+        # 自动校验（Actor-Critic 模式）：默认启用
+        # 启用后每个阶段产出先由 Critic 角色自动校验，不通过才升级人工审核
+        self.auto_verify: bool = True
+        self._auto_verifier: Any = None  # 延迟初始化（需要 self.llm）
+        self._last_user_input: str = ""  # 缓存用户输入供校验使用
+
     # ===== 回调辅助方法（桌面 UI 实时进度推送）=====
 
     def _emit(
@@ -167,7 +177,8 @@ class ScholarAgent:
             progress_pct: 子步骤进度 0.0-1.0
             **kwargs: 附加数据，合并到 event.data
         """
-        if not self._callback:
+        _cb = getattr(self, "_callback", None)
+        if not _cb:
             return
         event = ProgressEvent(
             phase=phase,
@@ -177,9 +188,9 @@ class ScholarAgent:
             data=kwargs if kwargs else None,
         )
         try:
-            self._callback.on_progress(event)
+            _cb.on_progress(event)
         except Exception as e:
-            logger.debug(f"回调 on_progress 失败: {e}")
+            logger.error(f"回调 on_progress 失败: {e}")
 
     def _emit_step_complete(self, phase: str, content: str, content_type: str = "markdown", **metadata: Any) -> None:
         """发出步骤完成事件，携带可预览的输出内容.
@@ -190,7 +201,8 @@ class ScholarAgent:
             content_type: "markdown" | "json" | "text"
             **metadata: 元数据（char_count, ref_count 等）
         """
-        if not self._callback:
+        _cb = getattr(self, "_callback", None)
+        if not _cb:
             return
         output = StepOutput(
             phase=phase,
@@ -199,18 +211,19 @@ class ScholarAgent:
             metadata=metadata,
         )
         try:
-            self._callback.on_step_complete(phase, output)
+            _cb.on_step_complete(phase, output)
         except Exception as e:
-            logger.debug(f"回调 on_step_complete 失败: {e}")
+            logger.error(f"回调 on_step_complete 失败: {e}")
 
     def _emit_error(self, phase: str, error: str) -> None:
         """发出错误事件."""
-        if not self._callback:
+        _cb = getattr(self, "_callback", None)
+        if not _cb:
             return
         try:
-            self._callback.on_error(phase, error)
+            _cb.on_error(phase, error)
         except Exception as e:
-            logger.debug(f"回调 on_error 失败: {e}")
+            logger.error(f"回调 on_error 失败: {e}")
 
     def _save_step_output(self, phase: str) -> None:
         """保存步骤输出到 .scholar/steps/ 目录，供前端预览加载.
@@ -227,6 +240,7 @@ class ScholarAgent:
 
         # 根据阶段读取对应的输出文件
         file_map = {
+            "policy_search": ("policy_research.md", "markdown"),
             "topic_analysis": (".scholar/memory.json", "json"),
             "literature_search": ("literature/review.md", "markdown"),
             "evidence_matrix": ("evidence_matrix.md", "markdown"),
@@ -281,6 +295,9 @@ class ScholarAgent:
         Args:
             user_input: 用户的自然语言输入（研究想法）。
         """
+        # 缓存用户输入，供 AutoVerifier 校验使用
+        self._last_user_input = user_input
+
         # Phase 0: VPN 检测（EasyConnect 机构访问）
         if getattr(self.config, "vpn_auto_detect", True):
             await self._detect_vpn_interactive()
@@ -342,12 +359,44 @@ class ScholarAgent:
             )
 
         try:
+            # Phase 0.5: 政策/制度背景调研（新增）
+            if "policy_search" not in completed_phases:
+                self._emit("policy_search", "start", "开始政策背景调研...")
+                await self._phase0_5_policy_search(user_input)
+                self._emit("policy_search", "complete", "政策背景调研完成")
+                self._save_step_output("policy_search")
+                approved = await self._request_review(
+                    phase="policy_search",
+                    title="政策背景调研审核",
+                    filename="policy_research.md",
+                )
+                if not approved:
+                    self.file_manager.save_progress(
+                        self.project_dir, "policy_search",
+                        phase_detail="等待用户确认政策调研结果",
+                    )
+                    return
+            self.file_manager.save_progress(
+                self.project_dir, "topic_analysis"
+            )
+
             # Phase 1: 选题分析
             if "topic_analysis" not in completed_phases:
                 self._emit("topic_analysis", "start", "开始选题分析...")
                 await self._phase1_topic_analysis(user_input)
                 self._emit("topic_analysis", "complete", "选题分析完成")
                 self._save_step_output("topic_analysis")
+                approved = await self._request_review(
+                    phase="topic_analysis",
+                    title="选题分析审核",
+                    content_override=self._format_topic_review(),
+                )
+                if not approved:
+                    self.file_manager.save_progress(
+                        self.project_dir, "topic_analysis",
+                        phase_detail="等待用户确认选题分析",
+                    )
+                    return
             self.file_manager.save_progress(
                 self.project_dir, "literature_search"
             )
@@ -358,6 +407,17 @@ class ScholarAgent:
                 await self._phase2_literature_search()
                 self._emit("literature_search", "complete", "文献检索完成")
                 self._save_step_output("literature_search")
+                approved = await self._request_review(
+                    phase="literature_search",
+                    title="文献检索结果审核",
+                    content_override=self._format_literature_review(),
+                )
+                if not approved:
+                    self.file_manager.save_progress(
+                        self.project_dir, "literature_search",
+                        phase_detail="等待用户确认文献检索结果",
+                    )
+                    return
             self.file_manager.save_progress(
                 self.project_dir, "evidence_matrix"
             )
@@ -378,7 +438,11 @@ class ScholarAgent:
                 await self._phase3_generate_spec()
                 self._emit("spec_generation", "complete", "论文规格生成完成")
                 self._save_step_output("spec_generation")
-                approved = await self._human_review("选题验证", "SPEC.md")
+                approved = await self._request_review(
+                    phase="spec_generation",
+                    title="选题验证（SPEC）",
+                    filename="SPEC.md",
+                )
                 if not approved:
                     self.console.print("[yellow]用户未确认选题，Agent 暂停。[/yellow]")
                     self.file_manager.save_progress(
@@ -396,7 +460,11 @@ class ScholarAgent:
                 await self._phase5_generate_outline()
                 self._emit("outline", "complete", "大纲生成完成")
                 self._save_step_output("outline")
-                approved = await self._human_review("论文大纲", "outline.md")
+                approved = await self._request_review(
+                    phase="outline",
+                    title="论文大纲审核",
+                    filename="outline.md",
+                )
                 if not approved:
                     self.console.print("[yellow]用户未确认大纲，Agent 暂停。[/yellow]")
                     self.file_manager.save_progress(
@@ -575,6 +643,7 @@ class ScholarAgent:
 
         # 调用 LLM
         self.console.print("[dim]💭 正在分析研究选题...[/dim]")
+        self._emit("topic_analysis", "progress", "正在调用 LLM 分析研究选题...")
         response = await self.llm.chat(
             messages=ctx.to_messages(),
             model=self.config.default_analysis_model,
@@ -810,6 +879,7 @@ class ScholarAgent:
 
         # ── 中文文献检索：NCPSSD + CNKI 多源降级 ──────────────
         self.console.print("\n[dim]🔍 正在检索中文文献（NCPSSD + CNKI）...[/dim]")
+        self._emit("literature_search", "progress", "正在检索中文文献（NCPSSD + CNKI + 万方）...")
         self.chinese_results = []
 
         try:
@@ -836,6 +906,7 @@ class ScholarAgent:
             self.console.print(
                 f"  [green]合并去重后: {chinese_result.returned_count} 篇中文文献[/green]"
             )
+            self._emit("literature_search", "progress", f"中文文献检索完成: {chinese_result.returned_count} 篇")
         except Exception as e:
             self.console.print(f"  [red]中文文献检索失败: {e}[/red]")
             from scholarpilot.tools.chinese_search import ChineseSearchResult
@@ -846,6 +917,7 @@ class ScholarAgent:
 
         # ── 多源检索：Semantic Scholar + arXiv ──────────────
         self.console.print("\n[dim]🔍 正在并行检索英文文献源（Semantic Scholar + arXiv）...[/dim]")
+        self._emit("literature_search", "progress", "正在并行检索英文文献（Semantic Scholar + arXiv）...")
 
         # 构建 Semantic Scholar 查询（使用英文翻译，与 OpenAlex 一致）
         ss_query = self._build_english_query(topic, region, content)
@@ -878,6 +950,7 @@ class ScholarAgent:
         # 处理 Semantic Scholar 结果
         if isinstance(ss_result, Exception):
             self.console.print(f"  [red]Semantic Scholar 检索失败: {ss_result}[/red]")
+            self._emit("literature_search", "progress", "Semantic Scholar 检索失败，跳过")
             from scholarpilot.mcp.servers.semantic_scholar import SSSearchResult
             self.ss_results = [SSSearchResult(query=ss_query, total_count=0)]
         else:
@@ -886,10 +959,12 @@ class ScholarAgent:
                 f"  [green]Semantic Scholar: 找到 {ss_result.total_count} 篇英文文献"
                 f"（返回 {len(ss_result.papers)} 篇）[/green]"
             )
+            self._emit("literature_search", "progress", f"Semantic Scholar 检索完成: {ss_result.total_count} 篇")
 
         # 处理 arXiv 结果
         if isinstance(arxiv_result, Exception):
             self.console.print(f"  [red]arXiv 检索失败: {arxiv_result}[/red]")
+            self._emit("literature_search", "progress", "arXiv 检索失败，跳过")
             from scholarpilot.mcp.servers.arxiv import ArxivSearchResult
             self.arxiv_results = [ArxivSearchResult(query=arxiv_query, total_count=0)]
         else:
@@ -898,9 +973,11 @@ class ScholarAgent:
                 f"  [green]arXiv: 找到 {arxiv_result.total_count} 篇预印本"
                 f"（返回 {len(arxiv_result.papers)} 篇）[/green]"
             )
+            self._emit("literature_search", "progress", f"arXiv 检索完成: {arxiv_result.total_count} 篇")
 
         # ── OpenAlex 检索（主力英文文献源，免费稳定）────────
         self.console.print("\n[dim]🔍 正在检索 OpenAlex（英文主力源）...[/dim]")
+        self._emit("literature_search", "progress", "正在检索 OpenAlex（英文主力源）...")
         try:
             # 构建英文查询：将中文主题翻译为关键词
             openalex_query = self._build_english_query(topic, region, content)
@@ -917,6 +994,7 @@ class ScholarAgent:
                 f"  [green]OpenAlex: 找到 {openalex_result.total_count} 篇英文文献"
                 f"（返回 {len(openalex_result.papers)} 篇）[/green]"
             )
+            self._emit("literature_search", "progress", f"OpenAlex 检索完成: {openalex_result.total_count} 篇")
             if openalex_result.papers:
                 top = openalex_result.papers[0]
                 self.console.print(
@@ -925,16 +1003,19 @@ class ScholarAgent:
                 )
         except Exception as e:
             self.console.print(f"  [red]OpenAlex 检索失败: {e}[/red]")
+            self._emit("literature_search", "progress", "OpenAlex 检索失败，跳过")
             from scholarpilot.mcp.servers.openalex import OpenAlexSearchResult
             self.openalex_results = [OpenAlexSearchResult(query=ss_query, total_count=0)]
 
         # 关闭英文检索引擎
+        self._emit("literature_search", "progress", "英文文献检索全部完成，正在计算统计...")
         await self.ss_engine.close()
         await self.arxiv_engine.close()
         await self.openalex_engine.close()
 
         # ── 计算 8 维统计（基于中文文献检索结果）────────────
         self.console.print("\n[dim]📊 正在计算 8 维统计数据...[/dim]")
+        self._emit("literature_search", "progress", "正在计算 8 维文献统计数据...")
         # 将 ChineseSearchResult 转为 CNKISearchResult 兼容格式
         cnki_compatible = []
         for cr in self.chinese_results:
@@ -982,10 +1063,15 @@ class ScholarAgent:
             "arxiv_count": arxiv_count,
         })
 
+        self._emit("literature_search", "progress",
+            f"8维统计完成: 中{chinese_count}篇+英{ss_count+openalex_count}篇, "
+            f"可行性{self.feasibility.get('verdict', '?')}")
+
         # 保存文献列表到文件
         papers_summary = self._format_papers_for_display()
 
         # ── 全局文献库入库：跨论文复用 ──────────────────────
+        self._emit("literature_search", "progress", "正在入库全局文献库...")
         all_papers = self._collect_papers_for_library()
         if all_papers:
             new_count, reuse_count = self.library.add_papers_batch(
@@ -995,6 +1081,8 @@ class ScholarAgent:
                 f"[dim]📚 全局文献库入库: 新增 {new_count} 篇，"
                 f"复用 {reuse_count} 篇（共 {new_count + reuse_count} 篇）[/dim]"
             )
+            self._emit("literature_search", "progress",
+                f"文献库入库完成: 新增{new_count}篇, 复用{reuse_count}篇")
 
         bib_path = self.project_dir / "literature" / "references.bib"
         bib_path.write_text(f"% BibTeX references\n% 生成时间: {__import__('datetime').datetime.now()}\n\n", encoding="utf-8")
@@ -1424,6 +1512,7 @@ class ScholarAgent:
                 outline_sections=None,  # 大纲尚未生成，章节映射在 Phase 5 补充
                 batch_size=10,
                 max_papers=30,
+                progress_callback=lambda phase, status, msg: self._emit(phase, status, msg),
             )
         except Exception as e:
             logger.error("证据矩阵构建失败: %s", e, exc_info=True)
@@ -1528,6 +1617,7 @@ class ScholarAgent:
 
         # 调用 LLM 生成 SPEC
         self.console.print("[dim]📝 正在生成论文规格文档...[/dim]")
+        self._emit("spec_generation", "progress", "正在调用 LLM 生成论文规格文档...")
         spec_content = await self.llm.chat(
             messages=ctx.to_messages(),
             model=self.config.default_writing_model,
@@ -1567,6 +1657,7 @@ class ScholarAgent:
 
         # 调用 LLM 生成大纲
         self.console.print("[dim]📋 正在生成论文大纲...[/dim]")
+        self._emit("outline", "progress", "正在调用 LLM 生成论文大纲...")
         outline_content = await self.llm.chat(
             messages=ctx.to_messages(),
             model=self.config.default_writing_model,
@@ -1831,6 +1922,7 @@ class ScholarAgent:
                 logger.error(f"Section writing failed: {e}", exc_info=True)
 
         # 合并所有章节为完整草稿
+        self._emit("section_writing", "progress", "正在合并所有章节为完整草稿...")
         self._merge_draft()
 
         # Phase 7a: 摘要+关键词+分类号生成
@@ -2291,6 +2383,7 @@ class ScholarAgent:
         )
 
         self.console.print("[dim]💭 正在生成中英文摘要...[/dim]")
+        self._emit("section_writing", "progress", "正在生成中英文摘要...")
         try:
             response = await self.llm.chat(
                 messages=[
@@ -2312,6 +2405,7 @@ class ScholarAgent:
             self.console.print(f"  [green]摘要已插入到草稿顶部[/green]")
 
             self.memory.add("abstract", {"path": str(abstract_path), "length": len(response)})
+            self._emit("section_writing", "progress", "中英文摘要生成完成")
 
         except Exception as e:
             self.console.print(f"  [red]摘要生成失败: {e}[/red]")
@@ -2320,6 +2414,7 @@ class ScholarAgent:
     async def _phase7b_citation_management(self) -> None:
         """引用管理：提取正文引用→API验证→格式化参考文献→附加AI声明."""
         self.console.print("\n[bold cyan]━━━ Phase 7b: 引用管理 ━━━[/bold cyan]")
+        self._emit("section_writing", "progress", "正在管理引用: 提取→验证→格式化...")
 
         draft_path = self.project_dir / "draft" / "full_draft.md"
         if not draft_path.exists():
@@ -2373,6 +2468,7 @@ class ScholarAgent:
         # 修改5: 哈希ID清洗（在提取引用之前执行）
         if literature_pool:
             self.console.print("[dim]🔧 正在清洗正文中的哈希ID...[/dim]")
+            self._emit("section_writing", "progress", "引用管理: 清洗正文哈希ID...")
             full_text = self._replace_hash_ids(full_text, literature_pool)
             # 修改6: 替换正文中的虚假作者名 + 清除异常引用标记
             from scholarpilot.tools.citation_manager import replace_fake_authors_in_text
@@ -2384,6 +2480,7 @@ class ScholarAgent:
 
         # 1. 提取引用
         self.console.print("[dim]📖 正在提取正文中的引用...[/dim]")
+        self._emit("section_writing", "progress", "引用管理: 提取正文引用...")
         from scholarpilot.tools.citation_manager import (
             extract_citations_from_text,
             build_citations_from_pool,
@@ -2448,6 +2545,8 @@ class ScholarAgent:
 
         # 3. 验证引用
         self.console.print("[dim]🔍 正在验证引用真实性（文献池 + CNKI + OpenAlex + Semantic Scholar）...[/dim]")
+        self._emit("section_writing", "progress",
+            f"引用管理: 正在验证 {len(citations)} 条引用（CNKI + OpenAlex + Semantic Scholar）...")
         try:
             from scholarpilot.mcp.servers.cnki.aiohttp_engine import CNKIAiohttpEngine
             cnki_engine = CNKIAiohttpEngine()
@@ -2520,6 +2619,8 @@ class ScholarAgent:
             f"  [green]验证完成: {verified_count} 条已验证, "
             f"{unverified_count} 条未验证[/green]"
         )
+        self._emit("section_writing", "progress",
+            f"引用验证完成: {verified_count} 条已验证, {unverified_count} 条未验证")
 
         # 最终语义过滤：使用嵌入语义相似度移除主题不相关引用
         # 第三代方案：智谱 embedding-3 语义向量余弦相似度
@@ -2956,6 +3057,348 @@ class ScholarAgent:
         else:
             return False
 
+    async def _request_review(
+        self,
+        phase: str,
+        title: str,
+        filename: str = "",
+        content_override: str = "",
+    ) -> bool:
+        """请求审核 — 三级审核架构.
+
+        审核流程（优先级从高到低）：
+        1. **自动校验**（Actor-Critic）：Critic 角色自动评估产出质量
+           - score >= 80 且无 critical → 自动通过
+           - score 50-79 → 记录问题后继续（fix 模式）
+           - score < 50 → 升级到人工审核
+        2. **人工审核**（桌面 UI）：通过 ReviewManager 暂停等待用户决策
+        3. **CLI 审核**：回退到 _human_review 的 rich.prompt 交互
+
+        Args:
+            phase: 阶段标识，如 "policy_search"。
+            title: 审核标题，如 "政策背景调研审核"。
+            filename: 要审核的文件名（相对项目目录），为空则用 content_override。
+            content_override: 直接传入审核内容（不读文件）。
+
+        Returns:
+            是否通过审核。
+        """
+        # 读取审核内容
+        content = content_override
+        if not content and filename:
+            file_path = self.project_dir / filename
+            if file_path.exists():
+                content = file_path.read_text(encoding="utf-8")
+
+        # ── Tier 1: 自动校验（Actor-Critic）──
+        if self.auto_verify:
+            result = await self._run_auto_verification(phase, content)
+            if result and result.passed:
+                # 自动通过
+                self.memory.add("verification_history", {
+                    "phase": phase,
+                    "score": result.score,
+                    "decision": "pass",
+                    "critic": result.critic_name,
+                    "summary": result.summary,
+                })
+                return True
+            elif result and result.decision == "fix":
+                # 记录问题但继续
+                self.memory.add("verification_history", {
+                    "phase": phase,
+                    "score": result.score,
+                    "decision": "fix",
+                    "critic": result.critic_name,
+                    "summary": result.summary,
+                    "issues": [i.description for i in result.issues],
+                })
+                self.console.print(
+                    f"[yellow]⚠ 自动校验发现问题（{result.score}分），"
+                    f"已记录但继续执行: {result.summary}[/yellow]"
+                )
+                return True
+            # decision == "human" → 继续到人工审核
+            self.console.print(
+                f"[yellow]⚠ 自动校验未通过（{result.score if result else '?'}分），"
+                f"升级人工审核[/yellow]"
+            )
+
+        # ── Tier 2: 人工审核（桌面 UI 模式）──
+        # 桌面模式下 non_interactive=True（禁用 CLI 交互），
+        # 但 review_manager 存在时仍走 UI 审核
+        if (
+            self.review_manager
+            and self._loop
+        ):
+            review_id = self.review_manager.create_review_id(phase)
+
+            # 发出审核请求事件到前端
+            event = ReviewRequestEvent(
+                review_id=review_id,
+                phase=phase,
+                title=title,
+                content=content[:5000],  # 限制传输大小
+                metadata={"filename": filename} if filename else {},
+            )
+            _cb = getattr(self, "_callback", None)
+            if _cb:
+                try:
+                    _cb.on_review_request(event)
+                except Exception as e:
+                    logger.debug(f"on_review_request 回调失败: {e}")
+
+            # 暂停等待用户响应
+            response = await self.review_manager.wait_for_review(
+                review_id, timeout=3600
+            )
+            self.review_manager.clear(review_id)
+
+            if response is None:
+                return True  # 异常情况，默认通过
+
+            if response.decision == "confirm":
+                self.memory.add("review_history", {
+                    "phase": phase,
+                    "decision": "confirm",
+                    "timestamp": response.timestamp,
+                })
+                self._emit(phase, "progress", f"用户已确认: {title}")
+                return True
+            elif response.decision == "modify":
+                self.memory.add("user_feedback", {
+                    "phase": phase,
+                    "feedback": response.feedback,
+                })
+                self.console.print(
+                    f"[yellow]用户修改意见: {response.feedback}[/yellow]"
+                )
+                # TODO: 基于反馈重新生成（P1 实现）
+                return True
+            elif response.decision == "reject":
+                self.console.print(f"[yellow]用户驳回: {title}[/yellow]")
+                return False
+            return True
+
+        # ── Tier 3: CLI 模式或非交互模式 ──
+        if self.non_interactive:
+            self.console.print(f"  [dim][非交互模式] 自动确认: {title}[/dim]")
+            return True
+        if not filename:
+            return True  # 无文件可审核，直接通过
+        return await self._human_review(title, filename)
+
+    async def _run_auto_verification(
+        self, phase: str, content: str
+    ) -> Any:
+        """执行自动校验（Actor-Critic 模式）.
+
+        Args:
+            phase: 阶段标识。
+            content: 待校验内容。
+
+        Returns:
+            VerificationResult 或 None（校验不可用时）。
+        """
+        if not content:
+            return None
+
+        # 延迟初始化 AutoVerifier
+        if self._auto_verifier is None:
+            try:
+                from scholarpilot.workflow.auto_verifier import AutoVerifier
+
+                self._auto_verifier = AutoVerifier(
+                    llm=self.llm,
+                    callback=self._callback,
+                )
+            except ImportError as e:
+                logger.warning(f"AutoVerifier 不可用: {e}")
+                return None
+
+        discipline = getattr(self, "discipline", "学术研究")
+
+        try:
+            result = await self._auto_verifier.verify(
+                phase=phase,
+                content=content,
+                user_input=self._last_user_input,
+                discipline=discipline,
+            )
+            return result
+        except Exception as e:
+            logger.error(f"自动校验异常 [{phase}]: {e}")
+            return None
+
+    def _format_topic_review(self) -> str:
+        """格式化选题分析结果供审核展示."""
+        if not self.topic_info:
+            return "选题分析结果为空"
+        lines = [
+            f"## 选题分析结果\n",
+            f"- **核心主题**: {self.topic_info.get('topic', '未提取')}",
+            f"- **区域/对象**: {self.topic_info.get('region', '未提取')}",
+            f"- **研究内容**: {self.topic_info.get('content', '未提取')}",
+            f"- **研究类型**: {self.topic_info.get('research_type', '未提取')}",
+            f"- **学科领域**: {self.topic_info.get('discipline', '未提取')}",
+            f"- **时间范围**: {self.topic_info.get('year_start', '?')}-{self.topic_info.get('year_end', '?')}",
+        ]
+        reason = self.topic_info.get("research_type_reason", "")
+        if reason:
+            lines.append(f"- **类型判定理由**: {reason}")
+        analysis = self.topic_info.get("analysis", "")
+        if analysis:
+            lines.append(f"\n### 初步分析\n{analysis}")
+        return "\n".join(lines)
+
+    def _format_literature_review(self) -> str:
+        """格式化文献检索结果供审核展示."""
+        lines = ["## 文献检索结果\n"]
+        cnki_count = len(self.chinese_results)
+        ss_count = len(self.ss_results)
+        arxiv_count = len(self.arxiv_results)
+        openalex_count = len(self.openalex_results)
+        total = cnki_count + ss_count + arxiv_count + openalex_count
+        lines.append(f"- **中文文献**: {cnki_count} 篇")
+        lines.append(f"- **Semantic Scholar**: {ss_count} 篇")
+        lines.append(f"- **arXiv**: {arxiv_count} 篇")
+        lines.append(f"- **OpenAlex**: {openalex_count} 篇")
+        lines.append(f"- **总计**: {total} 篇\n")
+
+        if self.eight_dim_stats:
+            lines.append("### 8维统计分析")
+            lines.append(f"- 竞争程度: {self.eight_dim_stats.get('competition_level', '未知')}")
+            lines.append(f"- 核心刊占比: {self.eight_dim_stats.get('core_journal_ratio', '未知')}")
+            yr = self.eight_dim_stats.get('year_trend', {})
+            lines.append(f"- 年度趋势: {yr.get('trend', '未知')}")
+            lines.append("")
+
+        if self.feasibility:
+            lines.append("### 可行性判定")
+            lines.append(f"- 判定: {self.feasibility.get('verdict', '未知')}")
+            lines.append(f"- 置信度: {self.feasibility.get('confidence', '未知')}")
+            lines.append(f"- 建议: {self.feasibility.get('recommendation', '未知')}")
+
+        # 列出前5篇高相关文献
+        lines.append("\n### 高相关文献（前5篇）")
+        all_papers = list(self.chinese_results[:3]) + list(self.ss_results[:2])
+        for i, p in enumerate(all_papers[:5], 1):
+            title = getattr(p, 'title', '') or ''
+            authors = getattr(p, 'authors', '') or ''
+            year = getattr(p, 'year', '') or ''
+            lines.append(f"{i}. {title} ({authors}, {year})")
+
+        return "\n".join(lines)
+
+    async def _phase0_5_policy_search(self, user_input: str) -> None:
+        """Phase 0.5: 政策/制度背景调研.
+
+        从 VPN 政策数据库检索相关政策法规，提炼社会问题，
+        为选题分析提供现实背景支撑。
+
+        产出: policy_research.md
+        """
+        self.console.print("\n[bold cyan]━━━ Phase 0.5: 政策背景调研 ━━━[/bold cyan]")
+
+        # 1. 从用户输入提取政策关键词
+        self._emit("policy_search", "progress", "正在提取政策关键词...")
+        keywords = await self._extract_policy_keywords(user_input)
+        self.console.print(f"  政策搜索关键词: {keywords}")
+        self._emit("policy_search", "progress", f"政策关键词: {', '.join(keywords[:5])}")
+
+        # 2. 搜索政策数据库
+        self._emit("policy_search", "progress", "正在搜索政策数据库（国研网/北大法宝/一带一路）...")
+        results: list[dict] = []
+        try:
+            from scholarpilot.skills.policy_search import PolicySearchEngine
+            from scholarpilot.tools.database_rag import DatabaseRAG
+
+            rag = DatabaseRAG()
+            engine = PolicySearchEngine(rag)
+            results = await engine.search(keywords, max_results=20)
+            self.console.print(f"  政策数据库检索到 {len(results)} 条结果")
+            self._emit("policy_search", "progress", f"检索到 {len(results)} 条政策文件")
+        except Exception as e:
+            logger.warning(f"政策数据库搜索失败，降级为 LLM 生成: {e}")
+            self.console.print(f"  [yellow]政策数据库搜索失败: {e}[/yellow]")
+            self._emit("policy_search", "progress", "政策数据库搜索失败，使用 LLM 降级分析")
+
+        # 3. LLM 提炼政策背景与社会问题
+        self._emit("policy_search", "progress", "正在分析政策背景与社会问题...")
+        policy_context = await self._analyze_policy_background(user_input, results)
+
+        # 4. 保存结果
+        output_path = self.project_dir / "policy_research.md"
+        output_path.write_text(policy_context, encoding="utf-8")
+        self.console.print(f"  政策背景调研结果已保存: {output_path}")
+
+        # 5. 存入项目记忆
+        self.memory.add("policy_research", {
+            "keywords": keywords,
+            "result_count": len(results),
+            "analysis_preview": policy_context[:500],
+        })
+
+    async def _extract_policy_keywords(self, user_input: str) -> list[str]:
+        """从用户研究想法中提取政策搜索关键词."""
+        from scholarpilot.context.prompts.core import POLICY_KEYWORD_EXTRACTION_PROMPT
+
+        prompt = POLICY_KEYWORD_EXTRACTION_PROMPT.format(user_input=user_input)
+        messages = [
+            {"role": "system", "content": "你是政策分析专家，擅长从研究想法中提取政策检索关键词。"},
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            response = await self.llm.chat(messages, temperature=0.3)
+            import json as _json
+            # 尝试提取 JSON
+            match = re.search(r'\{[^}]+\}', response, re.DOTALL)
+            if match:
+                data = _json.loads(match.group())
+                return data.get("keywords", [])
+        except Exception as e:
+            logger.warning(f"政策关键词提取失败: {e}")
+
+        # 降级：简单分词
+        fallback = re.findall(r'[\u4e00-\u9fff]{2,6}', user_input)
+        return fallback[:5] if fallback else [user_input[:10]]
+
+    async def _analyze_policy_background(
+        self, user_input: str, search_results: list[dict]
+    ) -> str:
+        """基于政策搜索结果，LLM 提炼政策背景与社会问题."""
+        from scholarpilot.context.prompts.core import POLICY_BACKGROUND_ANALYSIS_PROMPT
+
+        # 格式化搜索结果
+        if search_results:
+            results_text = "\n\n".join(
+                f"### {r.get('title', '未知标题')}\n"
+                f"- 来源: {r.get('source', '未知')}\n"
+                f"- 日期: {r.get('date', '未知')}\n"
+                f"- 摘要: {r.get('summary', '无摘要')}"
+                for r in search_results[:15]
+            )
+        else:
+            results_text = "（政策数据库未检索到直接相关结果，以下分析基于通用知识，请研究者补充真实政策文件）"
+
+        prompt = POLICY_BACKGROUND_ANALYSIS_PROMPT.format(
+            user_input=user_input,
+            search_results=results_text,
+        )
+        messages = [
+            {
+                "role": "system",
+                "content": "你是政策分析专家和学术研究顾问，擅长将政策背景转化为学术研究问题。",
+            },
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            response = await self.llm.chat(messages, temperature=0.4)
+            return response
+        except Exception as e:
+            logger.error(f"政策背景分析失败: {e}")
+            return f"# 政策背景调研\n\n（分析生成失败: {e}）\n\n请研究者手动补充政策背景。"
+
     # ===== 辅助方法 =====
 
     @staticmethod
@@ -3027,6 +3470,7 @@ class ScholarAgent:
 
         self.console.print("\n[bold cyan]━━━ Phase 7c: 实证表格模板生成 ━━━[/bold cyan]")
         self.console.print("[dim]📊 正在从 SPEC 提取变量定义...[/dim]")
+        self._emit("section_writing", "progress", "正在生成实证表格模板...")
 
         # 从 SPEC 提取变量和模型信息
         variables, model_specs = self._extract_variables_from_spec(spec_text)
@@ -4559,6 +5003,7 @@ class ScholarAgent:
             return
 
         self.console.print(f"  [dim]读取源文件: {source_label}[/dim]")
+        self._emit("post_processing", "progress", f"Claim 校准: 正在从 {source_label} 提取核心结论...")
 
         # 收集参考文献信息（用于校准时交叉验证）
         references: list[dict[str, Any]] = []

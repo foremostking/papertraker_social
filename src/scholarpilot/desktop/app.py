@@ -61,9 +61,10 @@ class DesktopApp:
 
                 # 所有可能的阶段（与 ScholarAgent 实际 emit 的阶段名一致）
                 all_phases = [
-                    "topic_analysis", "literature_search", "evidence_matrix",
-                    "spec_generation", "outline", "data_collection",
-                    "section_writing", "post_processing", "claim_calibration",
+                    "policy_search", "topic_analysis", "literature_search",
+                    "evidence_matrix", "spec_generation", "outline",
+                    "data_collection", "section_writing", "post_processing",
+                    "claim_calibration",
                 ]
 
                 # 文件一致性校验：只有阶段标记为完成且对应文件存在才算真正完成
@@ -224,6 +225,32 @@ class DesktopApp:
         except Exception as e:
             return json.dumps({"error": str(e)}, ensure_ascii=False)
 
+    def submit_review(self, review_id: str, decision: str, feedback: str = "") -> str:
+        """提交用户审核决策，唤醒等待中的工作流.
+
+        当前端审核模态框收到用户决策后调用此方法，
+        将决策传递给后台线程中暂停等待的 ScholarAgent。
+
+        Args:
+            review_id: 审核唯一标识（由 review_request 事件携带）。
+            decision: 用户决策 "confirm" | "modify" | "reject"。
+            feedback: 修改意见（decision=modify 时填写）。
+
+        Returns:
+            JSON 格式的提交结果
+        """
+        try:
+            if not self._controller:
+                return json.dumps({"error": "没有活跃的工作流"}, ensure_ascii=False)
+
+            success = self._controller.submit_review(review_id, decision, feedback)
+            if success:
+                return json.dumps({"success": True, "message": f"审核决策已提交: {decision}"}, ensure_ascii=False)
+            return json.dumps({"error": "审核 ID 不存在或已过期"}, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"提交审核失败: {e}", exc_info=True)
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
+
     def get_generation_status(self) -> str:
         """获取当前生成状态.
 
@@ -253,6 +280,7 @@ class DesktopApp:
             completed_phases = progress.get("completed_phases", [])
 
             all_steps = [
+                {"id": "policy_search", "name": "政策调研", "icon": "🏛️"},
                 {"id": "topic_analysis", "name": "选题分析", "icon": "🎯"},
                 {"id": "literature_search", "name": "文献检索", "icon": "📚"},
                 {"id": "evidence_matrix", "name": "证据矩阵", "icon": "🔍"},
@@ -680,18 +708,25 @@ class DesktopApp:
         pywebview 的 evaluate_js 是线程安全的。
 
         Args:
-            event_type: 事件类型 "progress" | "step_complete" | "error"
+            event_type: 事件类型 "progress" | "step_complete" | "error" | "review_request"
             data: 事件数据字典
         """
         if not self._window:
+            logger.warning("_update_ui: window 未初始化，事件丢弃")
             return
 
         try:
             js_data = json.dumps(data, ensure_ascii=False)
             js_code = f"window.app && window.app.onEvent('{event_type}', {js_data});"
             self._window.evaluate_js(js_code)
+            # 每 10 次事件输出一次 INFO 日志，避免刷屏
+            if not hasattr(self, "_event_count"):
+                self._event_count = 0
+            self._event_count += 1
+            if self._event_count % 10 == 0:
+                logger.info(f"已推送 {self._event_count} 个 UI 事件到前端")
         except Exception as e:
-            logger.debug(f"evaluate_js 失败: {e}")
+            logger.error(f"evaluate_js 失败 [{event_type}]: {e}")
 
     # ── 辅助方法 ──────────────────────────────────
 
@@ -707,6 +742,7 @@ class DesktopApp:
         3. 文件不含 "（待填写）" 占位标记
         """
         file_map = {
+            "policy_search": ("policy_research.md", 200),
             "topic_analysis": ("SPEC.md", 200),
             "literature_search": ("literature/review.md", 500),
             "evidence_matrix": ("literature/evidence_matrix.md", 300),
@@ -759,6 +795,7 @@ class DesktopApp:
         当 .scholar/steps/ 缓存不存在时，直接读取对应文件。
         """
         file_map = {
+            "policy_search": "policy_research.md",
             "topic_analysis": "SPEC.md",
             "literature_search": "literature/review.md",
             "evidence_matrix": "literature/evidence_matrix.md",
@@ -790,6 +827,13 @@ def main() -> None:
     """启动 ScholarPilot 桌面应用."""
     import webview
 
+    # 配置 logging，确保 ERROR 级别日志可见
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
     app = DesktopApp()
 
     html_path = Path(__file__).parent / "web" / "index.html"
@@ -802,7 +846,7 @@ def main() -> None:
         url=url,
         width=1280,
         height=800,
-        min_size=(960, 600),
+        min_size=(720, 480),
         js_api=app,
         background_color="#0D1117",
     )
