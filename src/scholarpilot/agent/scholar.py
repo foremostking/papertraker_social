@@ -864,6 +864,30 @@ class ScholarAgent:
             topic = raw_topic[:50]
         self.console.print(f"  [dim]检索关键词: topic='{topic}', content='{content}'[/dim]")
 
+        # ── 数据库推荐：根据主题推荐文献检索数据库 ──────────────
+        self.database_recommendations = []
+        try:
+            from scholarpilot.skills.vpn_database_access import DatabaseSelector
+            selector = DatabaseSelector()
+            self.database_recommendations = selector.recommend_for_literature_search(topic)
+            integrated_recs = [d for d in self.database_recommendations
+                               if d.integration_status == "integrated"]
+            self.console.print(
+                f"  [dim]📡 根据主题推荐文献检索数据库："
+                f"{len(self.database_recommendations)} 个候选"
+                f"（其中 {len(integrated_recs)} 个已集成可直接访问）[/dim]"
+            )
+            if integrated_recs:
+                names = "、".join(f"{d.name}" for d in integrated_recs[:6])
+                self._emit("literature_search", "progress",
+                           f"推荐文献数据库: {names}")
+            else:
+                self._emit("literature_search", "progress",
+                           "无已集成的补充文献数据库，使用默认检索源")
+        except Exception as e:
+            logger.warning(f"数据库推荐失败，使用默认检索源: {e}")
+            self.database_recommendations = []
+
         # ── 全局文献库查重：先看已有多少可复用 ──────────────────
         existing_papers = self.library.search(keyword=topic, limit=200)
         if existing_papers:
@@ -1062,6 +1086,22 @@ class ScholarAgent:
             "openalex_count": openalex_count,
             "arxiv_count": arxiv_count,
         })
+
+        # 保存数据库推荐结果到项目记忆（供后续章节引用）
+        if getattr(self, "database_recommendations", None):
+            rec_records = [
+                {
+                    "name": db.name,
+                    "key": db.key,
+                    "category": db.research_category,
+                    "subcategory": db.research_subcategory,
+                    "integrated": db.integration_status == "integrated",
+                    "language": db.language,
+                    "description": getattr(db, "content_description", "")[:200],
+                }
+                for db in self.database_recommendations
+            ]
+            self.memory.add("database_recommendations", rec_records)
 
         self._emit("literature_search", "progress",
             f"8维统计完成: 中{chinese_count}篇+英{ss_count+openalex_count}篇, "
@@ -2016,6 +2056,76 @@ class ScholarAgent:
         guide_path = self.project_dir / "data_collection_guide.md"
         guide_path.write_text(guide_content, encoding="utf-8")
         self.console.print(f"  [green]数据采集指南已保存: {guide_path}[/green]")
+
+        # 追加 VPN 实证数据库推荐（基于 DatabaseSelector）
+        try:
+            topic = self.topic_info.get("topic", "")
+            methodology = self.topic_info.get("methodology", "")
+            from scholarpilot.skills.vpn_database_access import DatabaseSelector
+            selector = DatabaseSelector()
+            emp_dbs = selector.recommend_for_empirical_data(topic, methodology)
+            integrated_emp = [d for d in emp_dbs if d.integration_status == "integrated"]
+            if emp_dbs:
+                rec_lines = ["\n\n## VPN 实证数据库推荐\n"]
+                rec_lines.append(
+                    f"> 根据主题「{topic}」自动推荐 {len(emp_dbs)} 个实证数据库"
+                    f"（其中 {len(integrated_emp)} 个已集成可直接访问）。\n"
+                )
+                lang_label = {"zh": "中文", "en": "外文", "mixed": "中英"}
+                for db in emp_dbs:
+                    status = "已集成" if db.integration_status == "integrated" else "待开通"
+                    lang = lang_label.get(getattr(db, "language", ""), "")
+                    rec_lines.append(
+                        f"- **{db.name}** [{status} | {lang}]"
+                        f"{getattr(db, 'content_description', '')}"
+                    )
+                guide_content += "\n".join(rec_lines)
+                guide_path.write_text(guide_content, encoding="utf-8")
+                names = "、".join(d.name for d in integrated_emp[:6])
+                self.console.print(
+                    f"  [dim]📡 VPN实证数据库推荐已追加: "
+                    f"{len(integrated_emp)} 个已集成（{names}）[/dim]"
+                )
+        except Exception as e:
+            logger.warning(f"VPN实证数据库推荐追加失败: {e}")
+
+        # ── 实证数据指标搜索（EmpiricalDataEngine 两层架构）──────
+        try:
+            topic = self.topic_info.get("topic", "")
+            from scholarpilot.skills.empirical_data import EmpiricalDataEngine
+            emp_engine = EmpiricalDataEngine()
+            # 从 SPEC 提取数据需求关键词
+            spec_keywords = self._extract_data_keywords(spec_content)
+            if not spec_keywords:
+                spec_keywords = self._extract_policy_keywords(topic)[:3]
+            self.console.print(
+                f"  [dim]🔍 正在搜索实证数据指标: {', '.join(spec_keywords[:5])}...[/dim]"
+            )
+            self._emit("data_collection", "progress",
+                       f"正在搜索实证数据指标: {', '.join(spec_keywords[:5])}")
+
+            # 搜索直连层（始终可用）
+            emp_results = await emp_engine.search(spec_keywords, max_results=15, use_vpn=True)
+            if emp_results:
+                formatted = emp_engine.format_results(emp_results)
+                guide_content += "\n\n" + formatted
+                guide_path.write_text(guide_content, encoding="utf-8")
+                self.console.print(
+                    f"  [green]📊 实证数据指标搜索完成: {len(emp_results)} 条[/green]"
+                )
+                self._emit("data_collection", "progress",
+                           f"实证数据指标搜索完成: {len(emp_results)} 条")
+                # 存入项目记忆供后续章节引用
+                self.memory.add("empirical_data_indicators", emp_results)
+            else:
+                self.console.print("  [dim]未搜索到匹配的实证数据指标[/dim]")
+
+            # 数据库摘要
+            db_summary = emp_engine.get_database_summary()
+            self.memory.add("empirical_db_summary", db_summary)
+            await emp_engine.close()
+        except Exception as e:
+            logger.warning(f"实证数据指标搜索失败: {e}")
 
         # 修改9: 将 RAG 推荐结果注入 memory，供后续章节撰写时 LLM 引用
         if rag_recommendations and rag_recommendations.get("rag_active"):
@@ -3314,15 +3424,44 @@ class ScholarAgent:
         self.console.print(f"  政策搜索关键词: {keywords}")
         self._emit("policy_search", "progress", f"政策关键词: {', '.join(keywords[:5])}")
 
-        # 2. 搜索政策数据库
-        self._emit("policy_search", "progress", "正在搜索政策数据库（中国经济信息网/国研网/北大法宝）...")
+        # 2. 数据库推荐 + 搜索政策数据库
+        self._emit("policy_search", "progress", "正在根据主题推荐政策数据库...")
+        extra_databases = {}
+        topic_for_search = self._extract_search_keywords(user_input)
+        try:
+            from scholarpilot.skills.vpn_database_access import DatabaseSelector
+            selector = DatabaseSelector()
+            policy_recs = selector.recommend_for_policy_search(topic_for_search)
+            integrated_recs = [d for d in policy_recs if d.integration_status == "integrated"]
+            if integrated_recs:
+                from scholarpilot.skills.policy_search import PolicySearchEngine
+                extra_databases = PolicySearchEngine.convert_database_configs(integrated_recs)
+                names = "、".join(
+                    d.name for d in integrated_recs[:6]
+                )
+                self.console.print(
+                    f"  [dim]📡 根据主题推荐政策数据库: "
+                    f"{len(policy_recs)} 个候选"
+                    f"（其中 {len(integrated_recs)} 个已集成: {names}）[/dim]"
+                )
+                self._emit("policy_search", "progress",
+                           f"推荐政策数据库: {names}")
+            else:
+                self._emit("policy_search", "progress",
+                           "无已集成的补充政策数据库")
+        except Exception as e:
+            logger.warning(f"政策数据库推荐失败，使用默认源: {e}")
+
+        self._emit("policy_search", "progress",
+                   "正在搜索政策数据库（中国经济信息网/国研网/北大法宝"
+                   + ("+" + str(len(extra_databases)) + "个推荐库" if extra_databases else "") + "）...")
         results: list[dict] = []
         try:
             from scholarpilot.skills.policy_search import PolicySearchEngine
             from scholarpilot.tools.database_rag import DatabaseRAG
 
             rag = DatabaseRAG()
-            engine = PolicySearchEngine(rag)
+            engine = PolicySearchEngine(rag, extra_databases=extra_databases if extra_databases else None)
             results = await engine.search(keywords, max_results=20)
             self.console.print(f"  政策数据库检索到 {len(results)} 条结果")
             self._emit("policy_search", "progress", f"检索到 {len(results)} 条政策文件")
@@ -3347,6 +3486,14 @@ class ScholarAgent:
             "analysis_preview": policy_context[:500],
         })
 
+        # 保存政策数据库推荐结果
+        if extra_databases:
+            rec_records = [
+                {"name": cfg["name"], "dimension": cfg.get("dimension", "")}
+                for cfg in extra_databases.values()
+            ]
+            self.memory.add("policy_database_recommendations", rec_records)
+
     async def _extract_policy_keywords(self, user_input: str) -> list[str]:
         """从用户研究想法中提取政策搜索关键词."""
         from scholarpilot.context.prompts.core import POLICY_KEYWORD_EXTRACTION_PROMPT
@@ -3370,6 +3517,70 @@ class ScholarAgent:
         # 降级：简单分词
         fallback = re.findall(r'[\u4e00-\u9fff]{2,6}', user_input)
         return fallback[:5] if fallback else [user_input[:10]]
+
+    def _extract_data_keywords(self, spec_content: str) -> list[str]:
+        """从 SPEC 内容中提取实证数据搜索关键词.
+
+        从 SPEC 中解析变量定义、数据来源说明，提取可用于实证数据库搜索的关键词。
+        不依赖 LLM，纯规则提取。
+
+        Args:
+            spec_content: SPEC JSON 或 Markdown 内容。
+
+        Returns:
+            实证数据搜索关键词列表（如 ["GDP", "财政收入", "碳排放"]）。
+        """
+        import json as _json
+        keywords: list[str] = []
+
+        # 尝试解析 JSON
+        try:
+            data = _json.loads(spec_content)
+        except Exception:
+            data = {}
+
+        # 从变量定义中提取
+        variables = data.get("variables", [])
+        if isinstance(variables, list):
+            for var in variables:
+                if isinstance(var, dict):
+                    name = var.get("name", "") or var.get("variable", "")
+                    if name:
+                        keywords.append(name)
+                elif isinstance(var, str):
+                    keywords.append(var)
+
+        # 从数据来源中提取
+        data_sources = data.get("data_sources", [])
+        if isinstance(data_sources, list):
+            for ds in data_sources:
+                if isinstance(ds, dict):
+                    desc = ds.get("description", "") or ds.get("name", "")
+                    if desc:
+                        # 提取中文关键词
+                        found = re.findall(r'[\u4e00-\u9fff]{2,6}', desc)
+                        keywords.extend(found[:3])
+
+        # 降级：从 Markdown 中提取常见数据指标
+        if not keywords:
+            common_indicators = [
+                "GDP", "财政收入", "财政支出", "债务", "人口", "就业",
+                "碳排放", "能源", "专利", "研发投入", "企业利润",
+                "固定资产投资", "进出口", "CPI", "M2", "利率",
+                "城镇化率", "人均收入", "教育经费", "医疗支出",
+            ]
+            for ind in common_indicators:
+                if ind.lower() in spec_content.lower():
+                    keywords.append(ind)
+
+        # 去重
+        seen = set()
+        result = []
+        for kw in keywords:
+            if kw not in seen:
+                seen.add(kw)
+                result.append(kw)
+        return result[:10]
 
     async def _analyze_policy_background(
         self, user_input: str, search_results: list[dict]

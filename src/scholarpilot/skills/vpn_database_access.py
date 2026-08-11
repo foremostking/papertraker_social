@@ -352,14 +352,15 @@ DATABASES: dict[str, DatabaseConfig] = {
         key="tws",
         name="TWS台湾学术期刊在线数据库",
         platform="TWS",
-        original_url="https://www.tws.edu.cn/",
-        vpn_url=build_vpn_url("https://www.tws.edu.cn/"),
+        original_url="http://www.twscholar.com/",
+        vpn_url="http://www-twscholar-com-s.vpn.lzufe.edu.cn:8118/",
         access_method="browser",
+        search_url_template="/",
         research_category="literature_retrieval",
         research_subcategory="chinese_journal",
-        content_description="台湾地区学术期刊全文",
-        strengths=["台湾学术期刊", "地区补充"],
-        integration_status="not_integrated",
+        content_description="台湾地区学术期刊全文（涵盖台湾期刊出版总量85%以上）",
+        strengths=["台湾学术期刊", "地区补充", "全学科覆盖"],
+        integration_status="integrated",
         language="zh",
     ),
 
@@ -580,14 +581,15 @@ DATABASES: dict[str, DatabaseConfig] = {
         key="xinxueshu_thesis",
         name="新学术全球学位论文精选整合平台",
         platform="XINXUESHU",
-        original_url="https://www.xinxueshu.com/",
-        vpn_url=build_vpn_url("https://www.xinxueshu.com/"),
+        original_url="http://dissertation.newacademic.net",
+        vpn_url="http://dissertation-newacademic-net-s.vpn.lzufe.edu.cn:8118/",
         access_method="browser",
+        search_url_template="/",
         research_category="literature_retrieval",
         research_subcategory="thesis",
-        content_description="国外名校学位论文精选",
-        strengths=["国外学位论文", "精选整合"],
-        integration_status="not_integrated",
+        content_description="全球2000+重点高校博硕士论文精选（覆盖全球排名前1000高校85%以上）",
+        strengths=["国外学位论文", "精选整合", "覆盖150+国家"],
+        integration_status="integrated",
         language="en",
     ),
 
@@ -822,13 +824,14 @@ DATABASES: dict[str, DatabaseConfig] = {
         name="读秀学术搜索",
         platform="DUXIU",
         original_url="https://www.duxiu.com/",
-        vpn_url=build_vpn_url("https://www.duxiu.com/"),
+        vpn_url="http://www-duxiu-com-s.vpn.lzufe.edu.cn:8118/",
         access_method="browser",
+        search_url_template="/search?sw={keyword}",
         research_category="general_reference",
         research_subcategory="general_search",
-        content_description="综合学术搜索平台",
-        strengths=["综合搜索", "图书/期刊/报纸整合"],
-        integration_status="not_integrated",
+        content_description="综合学术搜索平台（图书/期刊/报纸/学位论文/会议论文/专利/标准/视频九频道检索）",
+        strengths=["综合搜索", "图书/期刊/报纸整合", "全文检索", "文献传递"],
+        integration_status="integrated",
         language="zh",
     ),
 
@@ -898,7 +901,7 @@ class DatabaseSelector:
         "预算": ["macro_economy", "public_data", "policy_text"],
         "债务": ["macro_economy", "financial_market", "public_data", "policy_analysis"],
         "专项债": ["macro_economy", "financial_market", "policy_practice"],
-        "地方政府债务": ["macro_economy", "financial_market", "public_data", "policy_text", "policy_analysis"],
+        "地方政府债务": ["macro_economy", "financial_market", "public_data", "policy_text", "policy_analysis", "policy_practice"],
         # 金融/货币类
         "货币": ["macro_economy", "financial_market", "policy_analysis"],
         "利率": ["financial_market", "macro_economy"],
@@ -908,6 +911,13 @@ class DatabaseSelector:
         "债券": ["financial_market", "macro_economy"],
         "基金": ["financial_market"],
         "金融风险": ["financial_market", "macro_economy", "policy_analysis"],
+        "货币政策": ["financial_market", "macro_economy", "policy_analysis"],
+        "绿色金融": ["financial_market", "macro_economy", "policy_analysis"],
+        "碳排放": ["macro_economy", "regional_data", "policy_practice"],
+        "碳交易": ["financial_market", "macro_economy", "policy_practice"],
+        "环境规制": ["macro_economy", "microenterprise", "policy_text"],
+        "全要素生产率": ["microenterprise", "macro_economy"],
+        "生产率": ["microenterprise", "macro_economy"],
         # 企业/公司类
         "企业": ["microenterprise", "chinese_journal", "english_journal"],
         "上市公司": ["microenterprise", "financial_market"],
@@ -1088,17 +1098,17 @@ class DatabaseSelector:
             cat_dbs = self.get_by_category(cat)
 
             if all_subcats:
-                # 有匹配的子分类：优先返回匹配的数据库
+                # 精准匹配：只返回研究子分类命中的数据库
                 matched_dbs = [
                     db for db in cat_dbs
                     if db.research_subcategory in all_subcats
                 ]
-                # 补充该大类下已集成但未匹配的数据库
-                matched_keys = {db.key for db in matched_dbs}
-                for db in cat_dbs:
-                    if db.key not in matched_keys and db.integration_status == "integrated":
-                        matched_dbs.append(db)
-                        matched_keys.add(db.key)
+                # 兜底：该大类无任何命中时，返回全部已集成数据库（避免丢失可选库）
+                if not matched_dbs:
+                    matched_dbs = [
+                        db for db in cat_dbs
+                        if db.integration_status == "integrated"
+                    ]
                 result[cat] = matched_dbs
             else:
                 # 无匹配：返回该大类下所有数据库（已集成优先）
@@ -1204,14 +1214,44 @@ class VpnDatabaseAccess:
         self.timeout = timeout
         self._client: httpx.AsyncClient | None = None
         self._eps_sid: str | None = None  # EPS会话ID
+        self._vpn_cookie: str | None = None  # VPN TWFID Cookie
 
     async def _get_client(self) -> httpx.AsyncClient:
-        """获取或创建httpx异步客户端."""
+        """获取或创建httpx异步客户端.
+
+        自动注入 VPN TWFID Cookie 用于 *.vpn.lzufe.edu.cn 资源访问。
+        Cookie 由 VPNSessionManager 管理，首次访问时自动获取并缓存。
+        """
+        # 首次访问时获取 VPN Cookie
+        if self._vpn_cookie is None:
+            try:
+                from scholarpilot.utils.vpn import get_vpn_session_manager
+                mgr = get_vpn_session_manager()
+                self._vpn_cookie = await mgr.get_cookie_header()
+                if self._vpn_cookie:
+                    logger.debug(f"VPN Cookie 已注入 (TWFID={self._vpn_cookie[:30]}...)")
+            except Exception as e:
+                logger.debug(f"获取 VPN Cookie 失败: {e}")
+
+        # 构建 headers（注入 Cookie）
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        }
+        if self._vpn_cookie:
+            headers["Cookie"] = self._vpn_cookie
+
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
                 timeout=self.timeout,
                 follow_redirects=True,
                 verify=False,  # VPN代理可能使用自签名证书
+                trust_env=False,  # 绕过系统代理 127.0.0.1:8080
+                proxy=None,
+                headers=headers,
             )
         return self._client
 

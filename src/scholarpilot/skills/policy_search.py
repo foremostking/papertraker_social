@@ -114,15 +114,43 @@ class PolicySearchEngine:
         "Connection": "keep-alive",
     }
 
-    def __init__(self, rag: Any = None) -> None:
+    def __init__(self, rag: Any = None, extra_databases: dict[str, dict] | None = None) -> None:
         """初始化搜索引擎.
 
         Args:
             rag: DatabaseRAG 实例（可选，用于查询数据库覆盖信息）。
+            extra_databases: 额外VPN数据库配置字典，格式与 VPN_DATABASES 一致。
+                key 为数据库标识，value 含 name/vpn_host/search_path/dimension。
+                由 DatabaseSelector 推荐生成，会与内置 VPN_DATABASES 合并。
         """
         self.rag = rag
         self._timeout = 20.0
         self._cei_session_cookie: str | None = None
+        self._extra_databases = extra_databases or {}
+        self._vpn_cookie: str | None = None  # VPN TWFID Cookie 缓存
+
+    async def _get_vpn_cookie(self) -> str:
+        """获取 VPN TWFID Cookie（带缓存）.
+
+        首次调用时从 VPNSessionManager 获取，后续复用缓存。
+        Cookie 过期后自动刷新。
+
+        Returns:
+            Cookie 字符串，无 VPN 时返回空字符串.
+        """
+        if self._vpn_cookie is None:
+            try:
+                from scholarpilot.utils.vpn import get_vpn_session_manager
+                mgr = get_vpn_session_manager()
+                self._vpn_cookie = await mgr.get_cookie_header()
+            except Exception as e:
+                logger.debug(f"获取 VPN Cookie 失败: {e}")
+                self._vpn_cookie = ""
+        return self._vpn_cookie or ""
+
+    def _get_all_vpn_databases(self) -> dict[str, dict]:
+        """获取合并后的全部VPN数据库配置."""
+        return {**self.VPN_DATABASES, **self._extra_databases}
 
     # ═══════════════════════════════════════════════════════════════════
     #  公开接口
@@ -197,16 +225,17 @@ class PolicySearchEngine:
                 except Exception as e:
                     logger.warning(f"CEI搜索失败[macro/date/{kw}]: {e}")
 
-        # ── 2. VPN数据库搜索（补充）────────────────────────────────
+        # ── 2. VPN数据库搜索（补充，含内置+推荐）────────────────
+        all_vpn = self._get_all_vpn_databases()
         if len(all_results) < max_results:
-            for db_key in self.VPN_DATABASES:
+            for db_key, db_config in all_vpn.items():
                 if len(all_results) >= max_results:
                     break
                 for kw in keywords:
                     if len(all_results) >= max_results:
                         break
                     try:
-                        results = await self._search_vpn_database(db_key, kw)
+                        results = await self._search_vpn_database(db_key, db_config, kw)
                         for r in results:
                             title = r.get("title", "")
                             if title and title not in seen_titles:
@@ -215,7 +244,8 @@ class PolicySearchEngine:
                                 if len(all_results) >= max_results:
                                     break
                     except Exception as e:
-                        logger.debug(f"VPN数据库搜索失败 [{db_key}/{kw}]: {e}")
+                        vpn_name = db_config.get("name", db_key)
+                        logger.debug(f"VPN数据库搜索失败 [{vpn_name}/{kw}]: {e}")
 
         # ── 3. 为所有结果标注维度 ──────────────────────────────────
         for r in all_results:
@@ -421,26 +451,40 @@ class PolicySearchEngine:
     #  VPN 数据库搜索（drcnet/pkulaw/ydyl_drc）
     # ═══════════════════════════════════════════════════════════════════
 
-    def _build_vpn_url(self, db_key: str, keyword: str) -> str | None:
-        """构建 VPN 搜索 URL."""
-        db = self.VPN_DATABASES.get(db_key)
-        if not db:
-            return None
-        host = db["vpn_host"]
-        path = db["search_path"].format(keyword=quote(keyword, safe=""))
+    def _build_vpn_url(self, db_config: dict, keyword: str) -> str | None:
+        """构建 VPN 搜索 URL.
+
+        Args:
+            db_config: 数据库配置字典（含 vpn_host/search_path）。
+            keyword: 搜索关键词。
+        """
+        host = db_config["vpn_host"]
+        path = db_config["search_path"].format(keyword=quote(keyword, safe=""))
         return f"http://{host}{self.VPN_BASE}{path}"
 
     async def _search_vpn_database(
-        self, db_key: str, keyword: str
+        self, db_key: str, db_config: dict, keyword: str
     ) -> list[dict[str, Any]]:
-        """搜索单个VPN数据库."""
-        url = self._build_vpn_url(db_key, keyword)
+        """搜索单个VPN数据库.
+
+        Args:
+            db_key: 数据库标识键。
+            db_config: 数据库配置字典（含 name/vpn_host/search_path/dimension）。
+            keyword: 搜索关键词。
+        """
+        url = self._build_vpn_url(db_config, keyword)
         if not url:
             return []
 
-        db_config = self.VPN_DATABASES[db_key]
         db_name = db_config["name"]
         dimension = db_config.get("dimension", "")
+
+        # 获取 VPN TWFID Cookie
+        vpn_cookie = await self._get_vpn_cookie()
+
+        headers = dict(self.HTTP_HEADERS)
+        if vpn_cookie:
+            headers["Cookie"] = vpn_cookie
 
         try:
             async with httpx.AsyncClient(
@@ -449,7 +493,7 @@ class PolicySearchEngine:
                 trust_env=False,
                 follow_redirects=True,
             ) as client:
-                resp = await client.get(url, headers=self.HTTP_HEADERS)
+                resp = await client.get(url, headers=headers)
                 if resp.status_code != 200:
                     logger.debug(f"{db_name} 返回 {resp.status_code}")
                     return []
@@ -460,7 +504,7 @@ class PolicySearchEngine:
                     return []
 
                 return self._parse_vpn_html_results(
-                    resp.text, db_key, db_name, keyword, dimension
+                    resp.text, db_key, db_name, keyword, dimension, db_config
                 )
         except Exception as e:
             logger.debug(f"{db_name} 搜索异常: {e}")
@@ -473,6 +517,7 @@ class PolicySearchEngine:
         db_name: str,
         keyword: str,
         dimension: str = "",
+        db_config: dict | None = None,
     ) -> list[dict[str, Any]]:
         """解析VPN数据库HTML搜索结果（通用正则提取）."""
         results: list[dict[str, Any]] = []
@@ -501,8 +546,8 @@ class PolicySearchEngine:
 
             # 构建完整 URL
             if url.startswith("/"):
-                db = self.VPN_DATABASES.get(db_key, {})
-                url = f"http://{db.get('vpn_host', '')}{self.VPN_BASE}{url}"
+                vpn_host = (db_config or {}).get("vpn_host", "")
+                url = f"http://{vpn_host}{self.VPN_BASE}{url}"
             elif not url.startswith("http"):
                 continue
 
@@ -613,3 +658,68 @@ class PolicySearchEngine:
                 dim = "policy_practice"
             groups[dim].append(r)
         return groups
+
+    @staticmethod
+    def convert_database_configs(
+        db_configs: list[Any],
+    ) -> dict[str, dict]:
+        """将 DatabaseConfig 对象列表转换为 VPN 数据库配置字典.
+
+        从 DatabaseSelector.recommend_for_policy_search() 返回的
+        DatabaseConfig 对象中提取 VPN 搜索所需字段，转换为与
+        VPN_DATABASES 兼容的字典格式。
+
+        Args:
+            db_configs: DatabaseConfig 对象列表。
+
+        Returns:
+            VPN 数据库配置字典，key 为数据库标识，value 为:
+            {name, vpn_host, search_path, dimension}
+            仅包含 access_method 为 vpn_url_rewrite 或 browser 的数据库。
+        """
+        from urllib.parse import urlparse as _urlparse
+
+        result: dict[str, dict] = {}
+        # 子分类到维度的映射
+        subcat_to_dimension = {
+            "policy_text": "policy_text",
+            "policy_practice": "policy_practice",
+            "policy_analysis": "policy_analysis",
+        }
+        # 已内置的数据库 key，避免重复添加
+        builtin_keys = {"drcnet", "pkulaw", "ydyl_drc"}
+
+        for db in db_configs:
+            if db.key in builtin_keys:
+                continue  # 跳过已内置的数据库
+            if db.integration_status != "integrated":
+                continue  # 跳过未集成的数据库
+            if db.access_method not in ("vpn_url_rewrite", "browser"):
+                continue  # 仅支持 VPN 或浏览器访问
+
+            # 从 vpn_url 提取 vpn_host
+            vpn_url = getattr(db, "vpn_url", "")
+            vpn_host = ""
+            if vpn_url:
+                parsed = _urlparse(vpn_url)
+                vpn_host = parsed.netloc or parsed.path.split("/")[0]
+                # 去除端口号（VPN_BASE 统一追加）
+                vpn_host = vpn_host.rsplit(":", 1)[0]
+
+            # 从 search_url_template 提取 search_path
+            search_path = getattr(db, "search_url_template", "")
+            if not search_path:
+                search_path = "/search?keyword={keyword}"
+
+            # 维度映射
+            subcat = getattr(db, "research_subcategory", "")
+            dimension = subcat_to_dimension.get(subcat, "policy_practice")
+
+            result[db.key] = {
+                "name": db.name,
+                "vpn_host": vpn_host,
+                "search_path": search_path,
+                "dimension": dimension,
+            }
+
+        return result

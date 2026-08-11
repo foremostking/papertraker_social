@@ -785,3 +785,304 @@ async def check_vpn_status(
     """
     detector = get_vpn_detector()
     return await detector.check_vpn(databases=databases)
+
+
+# ===== VPN Web 会话管理 (TWFID Cookie) =====
+
+
+class VPNSessionManager:
+    """EasyConnect VPN Web 会话管理器.
+
+    EasyConnect 的 L3VPN 隧道（虚拟网卡）建立后，访问 *.vpn.lzufe.edu.cn
+    的 Web 代理资源仍需要 TWFID Cookie 认证。本类负责：
+
+    1. 检测 EasyConnect 隧道是否已建立（虚拟网卡 Up）
+    2. 检查本地缓存的 TWFID Cookie 是否有效
+    3. 若无效，通过 Playwright 启动浏览器让用户完成 Web 登录
+    4. 登录成功后自动提取 TWFID Cookie 并缓存
+    5. 提供 get_cookie_header() 供 httpx 注入
+
+    Cookie 缓存路径: .scholar/vpn_session.json
+    Cookie 有效期: 约 2 小时（可配置），过期后自动重新获取
+
+    Usage::
+        mgr = VPNSessionManager()
+        cookie = await mgr.get_cookie_header()
+        # cookie = "TWFID=de0103851a2ec145; language=zh_CN"
+        headers = {"Cookie": cookie, ...}
+        async with httpx.AsyncClient(headers=headers, ...) as c:
+            resp = await c.get("http://www-pkulaw-com-s.vpn.lzufe.edu.cn:8118/...")
+    """
+
+    VPN_PORTAL = "https://vpn.lzufe.edu.cn:8444/"
+    VPN_COOKIE_CACHE = ".scholar/vpn_session.json"
+    CHROME_PROFILE = r"C:\Users\xuxiaobing\.trae-cn\work\vpn_chrome_profile"
+    CHROME_EXE = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+
+    # TWFID 有效期约 2 小时，保守设为 100 分钟
+    COOKIE_TTL = 6000  # 秒
+
+    def __init__(self, project_root: str = ".") -> None:
+        self._project_root = project_root
+        self._cookie_cache: dict[str, Any] | None = None
+        self._cache_time: float = 0.0
+        self._twfid: str | None = None
+        self._full_cookie_str: str | None = None
+
+    def _cookie_path(self) -> str:
+        import os
+        return os.path.join(self._project_root, self.VPN_COOKIE_CACHE)
+
+    def _check_tunnel_up(self) -> bool:
+        """检查 EasyConnect 隧道是否可用.
+
+        通过尝试 TCP 连接 VPN 网关判断隧道状态，
+        不依赖系统命令（netsh/powershell 在某些环境不可用）。
+        """
+        import socket
+        try:
+            sock = socket.create_connection(
+                (VPN_SERVER_IP, VPN_SERVER_PORT), timeout=3,
+            )
+            sock.close()
+            return True
+        except Exception:
+            return False
+
+    def _load_cached_cookie(self) -> dict[str, Any] | None:
+        """从本地文件加载缓存的 Cookie."""
+        import json
+        import os
+        path = self._cookie_path()
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data
+        except Exception:
+            return None
+
+    def _save_cookie_cache(self, cookies: list[dict], twfid: str) -> None:
+        """保存 Cookie 到本地缓存文件."""
+        import json
+        import os
+        path = self._cookie_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        data = {
+            "twfid": twfid,
+            "cookies": cookies,
+            "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "timestamp": time.time(),
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        logger.info(f"VPN Cookie 已缓存到 {path}")
+
+    def _is_cache_valid(self) -> bool:
+        """检查缓存的 Cookie 是否仍在有效期内."""
+        if self._cookie_cache is None:
+            return False
+        ts = self._cookie_cache.get("timestamp", 0)
+        return (time.time() - ts) < self.COOKIE_TTL
+
+    def _build_cookie_str(self, cookies: list[dict]) -> str:
+        """从 Cookie 列表构建 Cookie 字符串（仅 vpn.lzufe.edu.cn 域）."""
+        parts = []
+        for c in cookies:
+            domain = c.get("domain", "")
+            if "vpn.lzufe.edu.cn" in domain or "lzufe" in domain:
+                parts.append(f"{c['name']}={c['value']}")
+        return "; ".join(parts)
+
+    async def _verify_twfid(self, twfid: str) -> bool:
+        """验证 TWFID 是否有效（发起测试请求）."""
+        import httpx
+        test_url = "http://www-pkulaw-com-s.vpn.lzufe.edu.cn:8118/law/chl"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Cookie": f"TWFID={twfid}",
+        }
+        try:
+            async with httpx.AsyncClient(
+                timeout=10, follow_redirects=False, verify=False,
+                trust_env=False, headers=headers,
+            ) as c:
+                r = await c.get(test_url)
+                # 200 = 有效，302 到 8444 = 无效
+                return r.status_code == 200
+        except Exception:
+            return False
+
+    async def _login_via_browser(self) -> tuple[str, list[dict]] | None:
+        """通过 Playwright 启动浏览器完成 Web 登录，提取 TWFID.
+
+        流程:
+        1. 启动 Chrome（有头模式，持久化 profile）
+        2. 打开 VPN 门户
+        3. 等待用户手动登录（检测 URL 从 #!/login 变为 #!/service）
+        4. 提取 TWFID Cookie
+
+        Returns:
+            (twfid, cookies_list) 或 None（失败/超时）
+        """
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            logger.error("Playwright 未安装，无法自动登录 VPN Web 门户")
+            return None
+
+        import os
+        os.makedirs(self.CHROME_PROFILE, exist_ok=True)
+
+        async with async_playwright() as p:
+            ctx = await p.chromium.launch_persistent_context(
+                user_data_dir=self.CHROME_PROFILE,
+                executable_path=self.CHROME_EXE,
+                headless=False,
+                ignore_https_errors=True,
+                args=["--disable-blink-features=AutomationControlled"],
+                no_viewport=True,
+            )
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+
+            await page.goto(self.VPN_PORTAL, wait_until="domcontentloaded", timeout=20000)
+            await page.wait_for_timeout(2000)
+
+            if "#!/login" in page.url:
+                logger.info("VPN 门户需要登录，请在浏览器窗口中完成登录...")
+                # 等待登录（最多 5 分钟）
+                for i in range(300):
+                    await page.wait_for_timeout(1000)
+                    try:
+                        if "#!/service" in page.url or "#!/user_setting" in page.url:
+                            logger.info("VPN Web 登录成功")
+                            break
+                    except Exception:
+                        pass
+                else:
+                    logger.warning("VPN Web 登录超时（5分钟）")
+                    await ctx.close()
+                    return None
+
+            await page.wait_for_timeout(3000)
+
+            # 提取 Cookie
+            cookies = await ctx.cookies()
+            twfid = None
+            for c in cookies:
+                if c["name"].upper() == "TWFID":
+                    twfid = c["value"]
+                    break
+
+            # 测试访问目标数据库（可能触发更多 Cookie 设置）
+            if twfid:
+                try:
+                    await page.goto(
+                        "http://www-pkulaw-com-s.vpn.lzufe.edu.cn:8118/law/chl",
+                        wait_until="domcontentloaded", timeout=20000,
+                    )
+                    await page.wait_for_timeout(2000)
+                    cookies = await ctx.cookies()  # 获取更新后的完整 Cookie
+                except Exception:
+                    pass
+
+            await ctx.close()
+
+            if twfid:
+                return twfid, cookies
+            logger.error("登录后未找到 TWFID Cookie")
+            return None
+
+    async def get_cookie_header(self, force_refresh: bool = False) -> str:
+        """获取 VPN Web 会话 Cookie 字符串.
+
+        优先使用缓存，缓存无效时自动启动浏览器登录。
+
+        Args:
+            force_refresh: 强制刷新（忽略缓存）.
+
+        Returns:
+            Cookie 字符串（如 "TWFID=xxx; language=zh_CN"），无 VPN 时返回空字符串.
+        """
+        # 检查隧道
+        if not self._check_tunnel_up():
+            logger.warning("EasyConnect 虚拟网卡未 Up，VPN 隧道未建立")
+            return ""
+
+        # 检查缓存
+        if not force_refresh and self._is_cache_valid() and self._full_cookie_str:
+            # 快速验证 TWFID 是否仍然有效
+            if self._twfid and await self._verify_twfid(self._twfid):
+                return self._full_cookie_str
+            logger.info("缓存的 TWFID 已失效，需要重新获取")
+
+        # 从文件加载缓存
+        if not force_refresh:
+            cached = self._load_cached_cookie()
+            if cached:
+                ts = cached.get("timestamp", 0)
+                if (time.time() - ts) < self.COOKIE_TTL:
+                    twfid = cached.get("twfid", "")
+                    cookies = cached.get("cookies", [])
+                    if twfid and await self._verify_twfid(twfid):
+                        self._cookie_cache = cached
+                        self._cache_time = ts
+                        self._twfid = twfid
+                        self._full_cookie_str = self._build_cookie_str(cookies)
+                        logger.info(f"VPN Cookie 从缓存恢复（TWFID={twfid}）")
+                        return self._full_cookie_str
+                    logger.info("缓存的 TWFID 验证失败，需要重新登录")
+
+        # 启动浏览器登录
+        logger.info("启动浏览器进行 VPN Web 登录...")
+        result = await self._login_via_browser()
+        if result is None:
+            return ""
+
+        twfid, cookies = result
+        self._twfid = twfid
+        self._full_cookie_str = self._build_cookie_str(cookies)
+        self._cookie_cache = {
+            "twfid": twfid,
+            "cookies": cookies,
+            "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "timestamp": time.time(),
+        }
+        self._cache_time = time.time()
+        self._save_cookie_cache(cookies, twfid)
+
+        logger.info(f"VPN Cookie 获取成功（TWFID={twfid}）")
+        return self._full_cookie_str
+
+    async def get_twfid(self, force_refresh: bool = False) -> str:
+        """获取 TWFID 值（便捷方法）.
+
+        Args:
+            force_refresh: 强制刷新.
+
+        Returns:
+            TWFID 字符串，无 VPN 时返回空字符串.
+        """
+        if not self._twfid or force_refresh:
+            await self.get_cookie_header(force_refresh=force_refresh)
+        return self._twfid or ""
+
+
+# 全局单例
+_session_manager: VPNSessionManager | None = None
+
+
+def get_vpn_session_manager(project_root: str = ".") -> VPNSessionManager:
+    """获取全局 VPNSessionManager 单例.
+
+    Args:
+        project_root: 项目根目录（用于定位 .scholar/ 缓存目录）.
+
+    Returns:
+        VPNSessionManager 实例.
+    """
+    global _session_manager
+    if _session_manager is None:
+        _session_manager = VPNSessionManager(project_root=project_root)
+    return _session_manager
