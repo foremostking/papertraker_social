@@ -3132,6 +3132,7 @@ class ScholarAgent:
             and self._loop
         ):
             review_id = self.review_manager.create_review_id(phase)
+            logger.info(f"审核请求创建: phase={phase}, review_id={review_id}")
 
             # 发出审核请求事件到前端
             event = ReviewRequestEvent(
@@ -3145,13 +3146,16 @@ class ScholarAgent:
             if _cb:
                 try:
                     _cb.on_review_request(event)
+                    logger.info(f"审核请求已发送到前端: {review_id}")
                 except Exception as e:
-                    logger.debug(f"on_review_request 回调失败: {e}")
+                    logger.error(f"on_review_request 回调失败: {e}")
 
             # 暂停等待用户响应
+            logger.info(f"开始等待用户审核: {review_id}")
             response = await self.review_manager.wait_for_review(
                 review_id, timeout=3600
             )
+            logger.info(f"审核等待结束: {review_id}, decision={response.decision if response else 'None'}")
             self.review_manager.clear(review_id)
 
             if response is None:

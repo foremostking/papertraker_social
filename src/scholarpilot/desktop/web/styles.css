@@ -1240,6 +1240,25 @@ body.resizing-row * { cursor: row-resize !important; user-select: none !importan
   text-align: center;
 }
 
+.bottom-panel-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+}
+
+.bottom-panel-actions .btn {
+  padding: 2px 8px;
+  font-size: 11px;
+}
+
+.bottom-panel-actions .btn span {
+  display: none;  /* 只显示图标，节省空间 */
+}
+
+.bottom-panel-actions .btn:hover span {
+  display: inline;  /* hover 时显示文字 */
+}
+
 .bottom-panel-chevron {
   color: var(--text-tertiary);
   transition: transform var(--transition);
@@ -1265,6 +1284,14 @@ body.resizing-row * { cursor: row-resize !important; user-select: none !importan
   font-family: var(--font-code);
   font-size: 12px;
   line-height: 1.6;
+  user-select: text;  /* 允许选中文本复制 */
+  -webkit-user-select: text;
+  cursor: text;
+}
+
+/* 日志条目选中高亮 */
+.log-entry::selection {
+  background: rgba(108, 92, 231, 0.3);
 }
 
 /* 日志区域滚动条 — 加粗显示，确保可见 */

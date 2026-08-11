@@ -1084,12 +1084,19 @@
 
     var data = State.progressData;
     var isRunning = State.generating;
-    var currentPhase = data ? data.phase : '';
-    var message = data ? (data.message || '') : '';
-    var progressPct = data ? (data.progress_pct || 0) : 0;
+    var currentPhase = '';
+    var message = '';
+    var progressPct = 0;
 
-    // 如果没有实时数据，从步骤列表计算
-    if (!data && State.steps.length) {
+    // 工作流运行中：使用实时数据
+    if (isRunning && data) {
+      currentPhase = data.phase || '';
+      message = data.message || '';
+      progressPct = data.progress_pct || 0;
+    }
+
+    // 工作流未运行或无实时数据：从步骤列表计算
+    if ((!isRunning || !data) && State.steps.length) {
       var completedCount = State.steps.filter(function (s) { return s.completed; }).length;
       progressPct = Math.round((completedCount / State.steps.length) * 100);
       var currentStep = State.steps.find(function (s) { return !s.completed; });
@@ -1147,10 +1154,10 @@
       return;
     }
 
-    // 确定当前进行中的步骤
+    // 确定当前进行中的步骤（仅在工作流运行时才标记 in_progress）
     var currentPhase = State.progressData ? State.progressData.phase : '';
     var inProgressIndex = -1;
-    if (currentPhase && PHASE_MAP[currentPhase]) {
+    if (currentPhase && PHASE_MAP[currentPhase] && State.generating) {
       inProgressIndex = PHASE_MAP[currentPhase].index;
     }
 
@@ -1159,7 +1166,7 @@
       var status = 'pending';
       if (step.completed) {
         status = 'completed';
-      } else if (i === inProgressIndex || (inProgressIndex === -1 && !step.completed && State.steps.slice(0, i).every(function (s) { return s.completed; }))) {
+      } else if (State.generating && (i === inProgressIndex || (inProgressIndex === -1 && !step.completed && State.steps.slice(0, i).every(function (s) { return s.completed; })))) {
         status = 'in_progress';
       }
 
@@ -1880,6 +1887,47 @@
         logResizer.style.display = State.bottomPanelCollapsed ? 'none' : 'block';
       }
     });
+
+    // 复制日志按钮
+    var copyBtn = document.getElementById('copy-logs-btn');
+    if (copyBtn) {
+      copyBtn.addEventListener('click', function (e) {
+        e.stopPropagation();  // 阻止冒泡触发折叠
+        var logStream = document.getElementById('log-stream');
+        if (!logStream) return;
+        var text = logStream.innerText || logStream.textContent || '';
+        if (!text.trim()) {
+          showToast('warning', '暂无日志可复制');
+          return;
+        }
+        // 优先用 Clipboard API
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(function () {
+            showToast('success', '已复制 ' + text.split('\n').length + ' 行日志');
+          }).catch(function () {
+            fallbackCopy(text);
+          });
+        } else {
+          fallbackCopy(text);
+        }
+      });
+    }
+  }
+
+  function fallbackCopy(text) {
+    var textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    try {
+      document.execCommand('copy');
+      showToast('success', '已复制日志');
+    } catch (e) {
+      showToast('error', '复制失败，请手动选中日志文本复制');
+    }
+    document.body.removeChild(textarea);
   }
 
   /* ════════════════════════════════════════════════════════════════
@@ -2046,6 +2094,7 @@
       buttons: [
         {
           text: '驳回', type: 'btn-danger',
+          closeOnClick: false,  // 等 API 成功后再关闭
           onClick: function (modal, ov) {
             overlay = ov;
             submitReviewDecision(reviewId, 'reject', '', ov);
@@ -2074,6 +2123,7 @@
         },
         {
           text: '确认通过', type: 'btn-primary',
+          closeOnClick: false,  // 等 API 成功后再关闭
           onClick: function (modal, ov) {
             overlay = ov;
             submitReviewDecision(reviewId, 'confirm', '', ov);

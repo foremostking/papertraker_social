@@ -246,7 +246,20 @@ class DesktopApp:
             success = self._controller.submit_review(review_id, decision, feedback)
             if success:
                 return json.dumps({"success": True, "message": f"审核决策已提交: {decision}"}, ensure_ascii=False)
-            return json.dumps({"error": "审核 ID 不存在或已过期"}, ensure_ascii=False)
+
+            # 诊断：列出当前 pending 的 review_id
+            pending_ids = []
+            if self._controller and self._controller._review_manager:
+                pending_ids = self._controller._review_manager.get_pending_review_ids()
+            logger.warning(
+                f"审核提交失败: review_id={review_id}, "
+                f"pending_ids={pending_ids}, "
+                f"decision={decision}"
+            )
+            return json.dumps({
+                "error": f"审核 ID 不存在或已过期",
+                "hint": f"当前待审核: {pending_ids}" if pending_ids else "无待审核项",
+            }, ensure_ascii=False)
         except Exception as e:
             logger.error(f"提交审核失败: {e}", exc_info=True)
             return json.dumps({"error": str(e)}, ensure_ascii=False)
