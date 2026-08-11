@@ -3132,6 +3132,10 @@ class ScholarAgent:
             and self._loop
         ):
             review_id = self.review_manager.create_review_id(phase)
+            # 关键：必须在 wait_for_review 之前调用 create_review 注册到 _pending，
+            # 否则 wait_for_review 找不到该 ID 会立即返回默认 confirm，
+            # 且前端 submit_review 也会因 ID 不存在而失败
+            self.review_manager.create_review(review_id)
             logger.info(f"审核请求创建: phase={phase}, review_id={review_id}")
 
             # 发出审核请求事件到前端
@@ -3311,7 +3315,7 @@ class ScholarAgent:
         self._emit("policy_search", "progress", f"政策关键词: {', '.join(keywords[:5])}")
 
         # 2. 搜索政策数据库
-        self._emit("policy_search", "progress", "正在搜索政策数据库（国研网/北大法宝/一带一路）...")
+        self._emit("policy_search", "progress", "正在搜索政策数据库（中国经济信息网/国研网/北大法宝）...")
         results: list[dict] = []
         try:
             from scholarpilot.skills.policy_search import PolicySearchEngine
@@ -3373,15 +3377,34 @@ class ScholarAgent:
         """基于政策搜索结果，LLM 提炼政策背景与社会问题."""
         from scholarpilot.context.prompts.core import POLICY_BACKGROUND_ANALYSIS_PROMPT
 
-        # 格式化搜索结果
+        # 格式化搜索结果（按维度分组）
         if search_results:
-            results_text = "\n\n".join(
-                f"### {r.get('title', '未知标题')}\n"
-                f"- 来源: {r.get('source', '未知')}\n"
-                f"- 日期: {r.get('date', '未知')}\n"
-                f"- 摘要: {r.get('summary', '无摘要')}"
-                for r in search_results[:15]
-            )
+            dim_labels = {
+                "policy_text": "政策文本（法规/通知/意见等原文）",
+                "policy_practice": "政策实践（实施案例/试点报道/新闻动态）",
+                "policy_analysis": "政策分析（解读/评估/学术研究）",
+            }
+            # 按维度分组
+            dim_groups: dict[str, list] = {}
+            for r in search_results[:20]:
+                dim = r.get("dimension", "policy_practice")
+                dim_groups.setdefault(dim, []).append(r)
+
+            sections = []
+            for dim, label in dim_labels.items():
+                items = dim_groups.get(dim, [])
+                if not items:
+                    continue
+                item_lines = "\n".join(
+                    f"  - **{r.get('title', '未知标题')}**\n"
+                    f"    来源: {r.get('source', '未知')} | "
+                    f"日期: {r.get('date', '未知')}\n"
+                    f"    摘要: {r.get('summary', '无摘要')}"
+                    for r in items[:8]
+                )
+                sections.append(f"#### {label}（{len(items)}条）\n{item_lines}")
+
+            results_text = "\n\n".join(sections) if sections else ""
         else:
             results_text = "（政策数据库未检索到直接相关结果，以下分析基于通用知识，请研究者补充真实政策文件）"
 

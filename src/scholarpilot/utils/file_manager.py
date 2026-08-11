@@ -744,6 +744,7 @@ class FileManager:
 
     # Agent 执行阶段定义（按顺序）
     PHASE_ORDER = [
+        "policy_search",       # 政策/制度背景调研（Phase 0.5）
         "topic_analysis",      # 选题分析
         "literature_search",   # 文献检索
         "evidence_matrix",     # 证据矩阵构建（Phase 2.5）
@@ -840,13 +841,16 @@ class FileManager:
 
         phase = progress.get("current_phase", "")
         phase_labels = {
+            "policy_search": "政策调研",
             "topic_analysis": "选题分析",
             "literature_search": "文献检索",
+            "evidence_matrix": "证据矩阵",
             "spec_generation": "规格生成",
             "outline": "大纲生成",
             "data_collection": "数据采集",
             "section_writing": "逐章撰写",
             "post_processing": "摘要与引用",
+            "claim_calibration": "Claim校准",
             "completed": "已完成",
         }
         phase_label = phase_labels.get(phase, phase)

@@ -640,13 +640,16 @@ def progress(
     total_sections = progress_info.get("total_sections", 0)
 
     phase_labels = {
+        "policy_search": "政策调研",
         "topic_analysis": "选题分析",
         "literature_search": "文献检索",
+        "evidence_matrix": "证据矩阵",
         "spec_generation": "规格生成",
         "outline": "大纲生成",
         "data_collection": "数据采集",
         "section_writing": "逐章撰写",
         "post_processing": "摘要与引用",
+        "claim_calibration": "Claim校准",
         "completed": "已完成",
     }
 
