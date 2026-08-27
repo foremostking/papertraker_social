@@ -102,23 +102,45 @@ class BrowserAuthRefresher:
         return None
 
     # ─────────────────────────────────────────────────────────────
-    #  2. 调试 Edge 生命周期
+    #  2. 调试浏览器生命周期
     # ─────────────────────────────────────────────────────────────
 
-    def ensure_debug_edge(self) -> bool:
-        """确保带调试端口的 Edge 已启动.
+    @staticmethod
+    def _find_browser_exe() -> str | None:
+        """定位本机可用的 Chrome / Edge 可执行文件."""
+        candidates = [
+            os.environ.get("SCHOLARPILOT_BROWSER"),
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
+            os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe"),
+        ]
+        for c in candidates:
+            if c and os.path.exists(c):
+                return c
+        return None
 
-        若端口已有调试服务则复用；否则启动独立临时配置的 Edge。
+    def ensure_debug_edge(self) -> bool:
+        """确保带调试端口的浏览器已启动.
+
+        若端口已有调试服务则复用；否则启动独立临时配置的浏览器。
         """
         if self._is_debug_port_ready():
             logger.info(f"调试端口 {self._port} 已就绪，复用")
             return True
-        # 启动独立 Edge（临时 user-data-dir，不污染用户配置）
+        # 定位可用的浏览器可执行文件（Chrome 优先，其次 Edge）
+        browser_exe = self._find_browser_exe()
+        if not browser_exe:
+            logger.warning("未找到 Chrome/Edge 可执行文件")
+            return False
+        # 启动独立浏览器（临时 user-data-dir，不污染用户配置）
         user_data = os.path.join(tempfile.gettempdir(), "edge_debug_auth")
         try:
             self._edge_proc = subprocess.Popen(
                 [
-                    "msedge",
+                    browser_exe,
                     f"--remote-debugging-port={self._port}",
                     f"--user-data-dir={user_data}",
                     "--no-first-run",

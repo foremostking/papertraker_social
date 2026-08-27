@@ -41,6 +41,16 @@ from scholarpilot.mcp.servers.cnki.server import (
 logger = logging.getLogger(__name__)
 
 
+def _urlencode_body(payload: dict[str, str]) -> str:
+    """将参数字典序列化为 CNKI 接受的原始表单体.
+
+    与已验证的 httpx 直连方案保持一致的编码：QueryJson 内中文不预编码
+    （CNKI 该接口对 aiohttp 默认 urlencode 编码不兼容，会报
+    "pageSize 校验失败"）。直接用 "k=v&k=v" 原始拼接，保留 UTF-8 中文。
+    """
+    return "&".join(f"{k}={v}" for k, v in payload.items())
+
+
 # ===== CNKI 来源类别映射 =====
 # 来源: papertracker_rich/literature_fetcher/engines/cnki.py 已验证的映射
 # CNKI 高级检索页面 "来源类别" 复选框对应的 QueryJson 字段
@@ -58,6 +68,13 @@ SOURCE_CATEGORY_MAPPING: dict[str, dict[str, str]] = {
 DEFAULT_SOURCE_CATEGORIES: list[str] = [
     "SCI", "北大核心", "CSSCI", "EI", "CSCD", "AMI", "WJCI",
 ]
+
+# CNKI 学术期刊库 productStr (来源: 浏览器真实检索请求实测, 2026-08-27)
+CNKI_JOURNAL_PRODUCT_STR = (
+    "YSTT4HG0,LSTPFY1C,RMJLXHZ3,JQIRZIYA,EMRPGLPA,J708GVCE,JUP3MUPD,"
+    "1UR4K4HZ,BPBAFJ5S,MPMFIG1A,WQ0UVIAA,NB3BWEHK,XVLO76FD,HR1YT1Z9,"
+    "BLZOG7CK,PWFIRAGL,NN3FJMUV,NLBO1Z6R,"
+)
 
 
 # ===== CNKI aiohttp 引擎 =====
@@ -116,20 +133,31 @@ class CNKIAiohttpEngine:
             cookies: Cookie 字典。
             cookie_str: Cookie 字符串（如 "key1=val1; key2=val2"）。
             timeout: 请求超时秒数。
-            vpn_mode: VPN 机构访问模式。启用后依赖机构 IP 自动认证,
-                      不强制加载 Cookie（CNKI 会自动发放 Session Cookie）。
+            vpn_mode: VPN 机构访问模式。启用后通过 VPN 代理主机访问
+                      CNKI，并加载已验证的机构窄 Cookie 集合 + 实时 TWFID。
         """
         self._cookies: dict[str, str] = {}
         self.timeout = timeout
         self.vpn_mode = vpn_mode
+        self._lib_checked: bool = False  # 统一入口本次进程是否已探活
+
+        # URL 主机：VPN 模式切到机构代理主机
+        self._brief_grid_url = self.BRIEF_GRID_URL
+        self._adv_search_url = self.ADV_SEARCH_URL
+        self._group_result_url = self.GROUP_RESULT_URL
 
         if vpn_mode:
-            # VPN 模式: 机构 IP 认证 + FALLBACK_COOKIE 客户端标识
-            # FALLBACK_COOKIE 提供客户端标识(Ecp_ClientId 等),
-            # 预热时获取 VPN 机构的 Session Cookie(SID_kns_new)
-            self._cookies = dict(self.FALLBACK_COOKIE)
+            # VPN 模式: 机构代理主机 + 已验证窄 Cookie 集合(TWFID合并)
+            # 优先加载 .scholar/empirical_auth.json 中 cnki_vpn 凭据，
+            # 缺失时回退到 FALLBACK_COOKIE + 实时 TWFID。
+            from scholarpilot.skills.vpn_database_access import build_vpn_url
+            self._brief_grid_url = build_vpn_url(self.BRIEF_GRID_URL)
+            self._adv_search_url = build_vpn_url(self.ADV_SEARCH_URL)
+            self._group_result_url = build_vpn_url(self.GROUP_RESULT_URL)
+            self._cookies = self._load_vpn_credential()
             logger.info(
-                "CNKI engine in VPN mode (institutional IP + fallback cookie)"
+                "CNKI engine in VPN mode: host=%s, cookie_keys=%s",
+                self.host, list(self._cookies.keys()),
             )
         elif cookies:
             self._cookies = cookies
@@ -138,6 +166,83 @@ class CNKIAiohttpEngine:
         else:
             # 尝试从缓存加载
             self.load_cookie_from_cache()
+
+    # ===== VPN 凭据加载 =====
+
+    @property
+    def host(self) -> str:
+        """当前使用的服务主机（含协议）."""
+        match = re.match(r"https?://[^/]+", self._brief_grid_url)
+        return match.group(0) if match else "https://kns.cnki.net"
+
+    @staticmethod
+    def _find_project_root() -> Path | None:
+        """向上定位含 .scholar/empirical_auth.json 的项目根目录."""
+        candidates = [
+            Path.cwd(),
+            Path(__file__).resolve().parent,
+        ]
+        # 从包路径向上逐级探测
+        p = Path(__file__).resolve()
+        for _ in range(8):
+            p = p.parent
+            if p.joinpath(".scholar").exists():
+                candidates.append(p)
+        seen: set[Path] = set()
+        for cand in candidates:
+            cand = cand.resolve()
+            if cand in seen:
+                continue
+            seen.add(cand)
+            auth = cand / ".scholar" / "empirical_auth.json"
+            if auth.exists():
+                return cand
+        return None
+
+    def _load_vpn_credential(self) -> dict[str, str]:
+        """加载已验证的 CNKI VPN 窄 Cookie 集合 + 实时 TWFID.
+
+        优先从 .scholar/empirical_auth.json 的 cnki_vpn 项读取；
+        若 ECAgent 可用则读取实时 TWFID 并覆盖。均不可用时回退 FALLBACK_COOKIE。
+        """
+        cookies: dict[str, str] = {}
+
+        project_root = self._find_project_root()
+        auth_path = (
+            project_root / ".scholar" / "empirical_auth.json"
+            if project_root else None
+        )
+        if auth_path and auth_path.exists():
+            try:
+                data = json.loads(auth_path.read_text(encoding="utf-8"))
+                entry = data.get("databases", {}).get("cnki_vpn") or data.get("cnki_vpn")
+                if entry:
+                    cookies = dict(entry.get("cookies", {}))
+                    logger.info(
+                        "Loaded CNKI VPN credential from %s: %s",
+                        auth_path.name, list(cookies.keys()),
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to load CNKI VPN credential: {e}")
+
+        if not cookies:
+            # 回退到 FALLBACK_COOKIE（客户端标识）
+            cookies = dict(self.FALLBACK_COOKIE)
+            logger.info("Using fallback CNKI VPN cookie (no stored credential)")
+
+        # 合并实时 TWFID（VPN 网关会话凭证，代理层必需）
+        try:
+            from scholarpilot.utils.browser_auth_refresher import (
+                BrowserAuthRefresher,
+            )
+            twfid = BrowserAuthRefresher().read_realtime_twfid()
+            if twfid:
+                cookies["TWFID"] = twfid
+                logger.info("Merged real-time TWFID into CNKI VPN cookie")
+        except Exception as e:
+            logger.warning(f"Failed to merge real-time TWFID: {e}")
+
+        return cookies
 
     @staticmethod
     def _parse_cookie_string(cookie_str: str) -> dict[str, str]:
@@ -615,6 +720,56 @@ class CNKIAiohttpEngine:
         return json.dumps(query_json, ensure_ascii=False)
 
     @staticmethod
+    def _build_v2_query(
+        keyword: str,
+        year_start: str,
+        year_end: str,
+    ) -> str:
+        """构建 SearchType=2 极简检索 QueryJson（经验证可返回数据的格式）.
+
+        关键差异 vs build_query_json：
+        - SearchType=2（不是 4）
+        - 主题项用 TOPRANK 简洁格式直接放关键词（非 DEXPERT 检索式）
+        - 年份通过第二个 QGroup 的 ControlGroup(.tit-startend-yearbox) 表达
+
+        实测（2026-08-27）：极简返回 70,644 条；+Control年份返回 3,795 条。
+
+        Args:
+            keyword: 检索关键词（原始词）。
+            year_start: 起始年份。
+            year_end: 结束年份。
+        """
+        subject = {
+            "Key": "Subject", "Title": "", "Logic": 0,
+            "Items": [{
+                "Field": "SU", "Value": keyword,
+                "Operator": "TOPRANK", "Logic": 0, "Title": "主题",
+            }],
+            "ChildItems": [],
+        }
+        year_cc = {
+            "Key": ".tit-startend-yearbox", "Title": "", "Logic": 0,
+            "Items": [{
+                "Key": ".tit-startend-yearbox", "Title": "出版年度",
+                "Logic": 0, "Field": "YE", "Operator": 7,
+                "Value": year_start, "Value2": year_end,
+            }],
+            "ChildItems": [],
+        }
+        q_group = [subject, {
+            "Key": "ControlGroup", "Title": "", "Logic": 0,
+            "Items": [], "ChildItems": [year_cc],
+        }]
+        query_json = {
+            "Platform": "", "Resource": "JOURNAL", "Classid": "YSTT4HG0",
+            "Products": "", "QNode": {"QGroup": q_group},
+            "ExScope": 1, "SimpTrad": "0", "SearchType": 2,
+            "Rlang": "CHINESE", "KuaKuCode": "", "Expands": {},
+            "View": "changeDBCh", "SearchFrom": 1,
+        }
+        return json.dumps(query_json, ensure_ascii=False)
+
+    @staticmethod
     def _build_search_from(
         year_start: str,
         year_end: str,
@@ -664,7 +819,7 @@ class CNKIAiohttpEngine:
         Args:
             session: aiohttp ClientSession 对象.
         """
-        warmup_url = self.ADV_SEARCH_URL
+        warmup_url = self._adv_search_url
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -787,12 +942,7 @@ class CNKIAiohttpEngine:
         )
         logger.debug("[CNKI search] 构建的检索式: %s", search_query)
 
-        query_json = self.build_query_json(
-            search_query, year_start, year_end,
-            author=author, journal=journal,
-            affiliation=affiliation, min_citations=min_citations,
-            source_categories=source_categories,
-        )
+        query_json = self._build_v2_query(query, year_start, year_end)
 
         # 打印 QueryJson 关键结构（DEBUG 级别）
         try:
@@ -846,43 +996,67 @@ class CNKIAiohttpEngine:
             "QueryJson": query_json,
             "pageNum": str(page),
             "pageSize": str(min(limit, 50)),
-            "sortField": sort_field,
-            "sortType": "DESC",
             "dstyle": "listmode",
-            "boolSortSearch": "false",
-            "aside": f"({search_query})",
-            "searchFrom": search_from,
+            "productStr": CNKI_JOURNAL_PRODUCT_STR,
+            "aside": f"(主题：{query})",
+            "searchFrom": "资源范围：学术期刊",
             "subject": "",
-            "turnpage": "",
-            "language": "uniplatform",
+            "language": "",
+            "uniplatform": "",
             "CurPage": str(page),
         }
+
+        # 结果页 Referer（与浏览器真实请求对齐，需 URL 编码中文）
+        try:
+            from urllib.parse import quote
+            referer = (
+                f"{self.host}/kns8s/defaultresult/index"
+                f"?kw={quote(query)}&korder=SU&dbcode=CJFQ"
+            )
+        except Exception:
+            referer = self._adv_search_url
 
         headers = {
             "Accept": "*/*",
             "Accept-Language": "zh-CN,zh;q=0.9",
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "Origin": "https://kns.cnki.net",
-            "Referer": self.ADV_SEARCH_URL,
+            "Referer": referer,
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/144.0.0.0 Safari/537.36"
+                "Chrome/151.0.0.0 Safari/537.36"
             ),
             "X-Requested-With": "XMLHttpRequest",
         }
+        grid_url = self._brief_grid_url + "?sf_request_type=ajax"
 
         logger.info(
             "[CNKI search] 发送请求: URL=%s, pageNum=%s, pageSize=%s, "
-            "sortField=%s, vpn_mode=%s, cookie_keys=%s",
-            self.BRIEF_GRID_URL,
+            "vpn_mode=%s, cookie_keys=%s",
+            grid_url,
             post_data["pageNum"], post_data["pageSize"],
-            post_data["sortField"], self.vpn_mode,
+            self.vpn_mode,
             list(self._cookies.keys())[:5] if self._cookies else "none",
         )
 
         try:
             configure_no_proxy()
+            # 统一入口探活：操作前先经图书馆门户建立会话上下文（一次进程内缓存）
+            if self.vpn_mode and not self._lib_checked:
+                try:
+                    from scholarpilot.skills.vpn_database_access import (
+                        verify_library_entry,
+                    )
+                    probe = verify_library_entry()
+                    self._lib_checked = True
+                    if probe["ok"]:
+                        logger.info("[CNKI VPN] 统一入口就绪 (TWFID=%s...)",
+                                    probe.get("twfid", "")[:6])
+                    else:
+                        logger.warning("[CNKI VPN] 统一入口探活失败: %s",
+                                       probe.get("error"))
+                except Exception as e:
+                    logger.warning(f"[CNKI VPN] 统一入口探活异常: {e}")
             async with aiohttp.ClientSession(trust_env=False) as session:
                 # VPN 模式预热: 访问 AdvSearch 页面获取机构 Session Cookie
                 if self.vpn_mode:
@@ -890,8 +1064,8 @@ class CNKIAiohttpEngine:
                     await self._warmup_session(session)
 
                 async with session.post(
-                    self.BRIEF_GRID_URL,
-                    data=post_data,
+                    grid_url,
+                    data=_urlencode_body(post_data),
                     headers=headers,
                     cookies=self._cookies,
                     timeout=aiohttp.ClientTimeout(total=self.timeout),

@@ -45,12 +45,16 @@ __all__ = [
     "DatabaseSelector",
     "VpnDatabaseAccess",
     "build_vpn_url",
+    "verify_library_entry",
     "DATABASES",
     "VPN_HOST_TEMPLATE",
     "RESEARCH_CATEGORIES",
 ]
 
 VPN_HOST_TEMPLATE = "{domain}-s.vpn.lzufe.edu.cn:8118"
+
+# 统一认证入口：所有 VPN 资源操作前先经图书馆门户建立会话上下文
+LIBRARY_ENTRY = "http://library-lzufe-edu-cn.vpn.lzufe.edu.cn:8118/"
 
 # ===== 研究分类常量 =====
 
@@ -109,6 +113,54 @@ def build_vpn_url(original_url: str) -> str:
     vpn_domain = domain.replace(".", "-")
     vpn_host = VPN_HOST_TEMPLATE.format(domain=vpn_domain)
     return f"http://{vpn_host}{path}"
+
+
+def verify_library_entry(timeout: int = 15) -> dict:
+    """统一入口 TWFID 探活：先经图书馆门户建立会话上下文.
+
+    所有 VPN 数据库操作前先调用本函数，确认 VPN 隧道 + 实时 TWFID
+    可编程访问统一入口，避免直接跳到单个库 API 后因会话缺失失败。
+
+    Returns:
+        {"ok": bool, "status": int, "url": str, "twfid": str, "error": str}
+    """
+    result: dict = {"ok": False, "status": 0, "url": LIBRARY_ENTRY,
+                    "twfid": "", "error": ""}
+    try:
+        import json
+        from scholarpilot.utils.browser_auth_refresher import BrowserAuthRefresher
+        twfid = BrowserAuthRefresher().read_realtime_twfid()
+        result["twfid"] = twfid or ""
+        if not twfid:
+            result["error"] = "无法读取实时 TWFID，请确认 EasyConnect 已登录"
+            return result
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        }
+        with httpx.Client(timeout=timeout, verify=False, trust_env=False,
+                          proxy=None, follow_redirects=False, headers=headers) as c:
+            r = c.get(LIBRARY_ENTRY, cookies={"TWFID": twfid})
+            result["status"] = r.status_code
+            loc = r.headers.get("location", "")
+            redirected = "8444/portal" in loc or "8444/portal" in r.text
+            result["ok"] = (r.status_code == 200 and not redirected
+                            and len(r.text) > 200)
+            if not result["ok"]:
+                result["error"] = (f"HTTP {r.status_code}, "
+                                   f"重定向到登录门户" if redirected
+                                   else f"HTTP {r.status_code}")
+            else:
+                logger.info("VPN 统一入口可达 (HTTP %d, TWFID=%s...)",
+                            r.status_code, twfid[:6])
+    except Exception as e:
+        result["error"] = str(e)
+    return result
 
 
 @dataclass
