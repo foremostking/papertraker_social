@@ -110,12 +110,12 @@ class BrowserAuthRefresher:
         """定位本机可用的 Chrome / Edge 可执行文件."""
         candidates = [
             os.environ.get("SCHOLARPILOT_BROWSER"),
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
             os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
             os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
             os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe"),
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
         ]
         for c in candidates:
             if c and os.path.exists(c):
@@ -130,7 +130,7 @@ class BrowserAuthRefresher:
         if self._is_debug_port_ready():
             logger.info(f"调试端口 {self._port} 已就绪，复用")
             return True
-        # 定位可用的浏览器可执行文件（Chrome 优先，其次 Edge）
+        # 定位可用的浏览器可执行文件（Edge 优先，其次 Chrome）
         browser_exe = self._find_browser_exe()
         if not browser_exe:
             logger.warning("未找到 Chrome/Edge 可执行文件")
