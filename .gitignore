@@ -44,3 +44,6 @@ mcp-servers/
 
 # CNKI 运行时凭据（不检入版本库，见 ADR-002）
 src/scholarpilot/mcp/servers/cnki/cnki_cookie_cache.json
+
+# Auto push script
+auto_push.ps1
