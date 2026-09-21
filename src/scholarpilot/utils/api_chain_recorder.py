@@ -84,18 +84,21 @@ class ApiChainRecorder:
         self._sessions[session_id] = {"targetId": target_id}
 
     async def _auto_attach(self):
-        """自动附加到新标签页(无需暂停/等调试器), 各自开启 Network."""
+        """自动附加到新标签页(无需暂停/等调试器), page+iframe 各自开启 Network."""
         await self._cmd("Target.setAutoAttach", {
             "autoAttach": True,
             "waitForDebuggerOnStart": False,
             "flatten": True,
+            "filter": [{"type": "page", "exclude": False},
+                       {"type": "iframe", "exclude": False},
+                       {"type": "webview", "exclude": False}],
         })
 
     async def _attach_existing(self):
-        """附加到已存在的 page target 并开启 Network."""
+        """附加到已存在的 page target 并开启 Network(同源 iframe 由 auto-attach 覆盖)."""
         targets = (await self._cmd("Target.getTargets")).get("targetInfos", [])
         for t in targets:
-            if t.get("type") != "page":
+            if t.get("type") not in ("page", "iframe"):
                 continue
             try:
                 resp = await self._cmd(
@@ -177,7 +180,7 @@ class ApiChainRecorder:
                 sid = raw.get("sessionId")
                 if method == "Target.attachedToTarget":
                     info = par.get("targetInfo", {})
-                    if sid and info.get("type") == "page":
+                    if sid and info.get("type") in ("page", "iframe", "webview"):
                         asyncio.create_task(
                             self._enable_network(sid, info.get("targetId", "")))
                 elif method == "Network.requestWillBeSent":
