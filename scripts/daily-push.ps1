@@ -1,62 +1,32 @@
-# ScholarPilot Daily Auto-Push to GitHub
-# Silent: skip when no changes, only log on push failure
+﻿$ErrorActionPreference = 'Continue'
 
-$ProjectDir = Split-Path -Parent $PSScriptRoot
-$Branch = "scholarpilot"
-$LogFile = Join-Path $ProjectDir ".git\auto-push.log"
+$projectDir = 'd:\副业\2026\AI论文自动化工程\scholarpilot'
+$branch = 'scholarpilot'
 
-function Write-Log {
-    param([string]$Message)
-    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    "$timestamp  $Message" | Out-File -FilePath $LogFile -Append -Encoding UTF8
-}
+Set-Location $projectDir
 
-try {
-    Set-Location $ProjectDir
-} catch {
-    Write-Log "Cannot set location to $ProjectDir : $_"
-    exit 1
-}
-
-# Stage all changes (.gitignore excludes .venv, .env, __pycache__, etc.)
-# Use 2>$null to suppress git warnings (e.g. LF/CRLF) from stderr
 git add -A 2>$null
-if ($LASTEXITCODE -ne 0) {
-    Write-Log "git add failed (exit code: $LASTEXITCODE)"
-    exit 1
-}
+$status = git status --short
 
-# Check for changes
-$status = git status --short 2>$null
 if ([string]::IsNullOrWhiteSpace($status)) {
-    # No changes, exit silently
     exit 0
 }
 
-# Commit changes
 $commitMsg = "auto sync: $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
 git commit -m $commitMsg 2>$null
-if ($LASTEXITCODE -ne 0) {
-    Write-Log "git commit failed (exit code: $LASTEXITCODE)"
-    exit 1
-}
 
-# Push to remote
-git push origin $Branch 2>$null
+$pushed = $false
+git push origin $branch 2>$null | Out-Null
 if ($LASTEXITCODE -eq 0) {
-    Write-Log "Push OK: $commitMsg"
-    exit 0
+    $pushed = $true
 }
 
-# First push failed, wait 10s and retry once
-Write-Log "First push failed (exit code: $LASTEXITCODE), retrying in 10s..."
-Start-Sleep -Seconds 10
-git push origin $Branch 2>$null
-if ($LASTEXITCODE -eq 0) {
-    Write-Log "Retry push OK: $commitMsg"
-    exit 0
+if (-not $pushed) {
+    Start-Sleep -Seconds 10
+    git push origin $branch 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        $time = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        Write-Error "[$time] ScholarPilot push failed. git push exit code: $LASTEXITCODE"
+        exit 1
+    }
 }
-
-# Retry also failed
-Write-Log "Push FAILED after retry (exit code: $LASTEXITCODE): $commitMsg"
-exit 1
